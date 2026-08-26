@@ -9,7 +9,6 @@ import {
 import Header from './Header';
 import Telemetry from './Telemetry';
 import CommandGrid from './CommandGrid';
-import NotesTodo from './NotesTodo';
 import CoreSphere from './CoreSphere';
 import PhonePanel from './PhonePanel';
 import { useVoice } from './hooks/useVoice';
@@ -93,10 +92,6 @@ export default function App() {
   const [pendingDocument, setPendingDocument] = useState(null)
   const [extracting, setExtracting] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
-  const [notes, setNotes] = useState([])
-  const [todos, setTodos] = useState([])
-  const [newNote, setNewNote] = useState('')
-  const [newTodo, setNewTodo] = useState('')
   const [timerData, setTimerData] = useState(null)
   const [booting, setBooting] = useState(true)
   const [activeView, setActiveView] = useState('core')
@@ -163,9 +158,7 @@ export default function App() {
       if (data.timer_data) setTimerData(data.timer_data)
       if (data.refresh_files) refreshFiles()
       const logLines = data.logs || []
-      if (logLines.some(l => l.includes('Note added') || l.includes('Todo added'))) {
-        refreshNotes(); refreshTodos()
-      }
+
     } catch {
       setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
     } finally {
@@ -233,24 +226,14 @@ export default function App() {
     } catch { }
   }, [])
 
-  const refreshNotes = useCallback(async () => {
-    try { const r = await fetch('/api/notes'); if (r.ok) { const d = await r.json(); setNotes(d.notes || []) } } catch { }
-  }, [])
-
-  const refreshTodos = useCallback(async () => {
-    try { const r = await fetch('/api/todos'); if (r.ok) { const d = await r.json(); setTodos(d.todos || []) } } catch { }
-  }, [])
-
   useEffect(() => {
     refreshStatus()
     refreshStats()
     refreshFiles()
-    refreshNotes()
-    refreshTodos()
     const statusTimer = setInterval(refreshStatus, 8000)
     const statsTimer = setInterval(refreshStats, 4000)
     return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
-  }, [refreshStatus, refreshStats, refreshFiles, refreshNotes, refreshTodos])
+  }, [refreshStatus, refreshStats, refreshFiles])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -328,9 +311,7 @@ export default function App() {
       if (data.timer_data) setTimerData(data.timer_data)
       if (data.refresh_files) refreshFiles()
       const logLines = data.logs || []
-      if (logLines.some(l => l.includes('Note added') || l.includes('Todo added'))) {
-        refreshNotes(); refreshTodos()
-      }
+
     } catch {
       setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
     } finally {
@@ -563,24 +544,6 @@ export default function App() {
     } catch { }
   }
 
-  async function addNote() {
-    if (!newNote.trim()) return
-    try {
-      const r = await fetch('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: newNote }) })
-      if (r.ok) { setNewNote(''); refreshNotes() }
-    } catch { }
-  }
-  async function deleteNote(id) { try { await fetch(`/api/notes/${id}`, { method: 'DELETE' }); refreshNotes() } catch { } }
-  async function addTodo() {
-    if (!newTodo.trim()) return
-    try {
-      const r = await fetch('/api/todos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: newTodo }) })
-      if (r.ok) { setNewTodo(''); refreshTodos() }
-    } catch { }
-  }
-  async function toggleTodo(id) { try { await fetch(`/api/todos/${id}`, { method: 'PATCH' }); refreshTodos() } catch { } }
-  async function deleteTodo(id) { try { await fetch(`/api/todos/${id}`, { method: 'DELETE' }); refreshTodos() } catch { } }
-
   const quickActions = [
     { label: 'Screenshot', icon: Camera, cmd: 'take a screenshot' },
     { label: 'PC Health', icon: Activity, cmd: 'check pc health' },
@@ -760,19 +723,6 @@ export default function App() {
         {/* ΓöÇΓöÇ RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ΓöÇΓöÇ */}
         <div className="hud-right">
           <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} />
-          <NotesTodo
-            notes={notes}
-            todos={todos}
-            newNote={newNote}
-            setNewNote={setNewNote}
-            addNote={addNote}
-            deleteNote={deleteNote}
-            newTodo={newTodo}
-            setNewTodo={setNewTodo}
-            addTodo={addTodo}
-            deleteTodo={deleteTodo}
-            toggleTodo={toggleTodo}
-          />
           <PhonePanel />
         </div>
       </div>
