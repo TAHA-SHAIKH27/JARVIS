@@ -41,7 +41,7 @@ export default function CoreSphere({ state = 'idle' }) {
       const fallback = .08 + (Math.sin(t * 3.2) * .5 + .5) * .04
       smoothed += ((input > .015 ? input : fallback) - smoothed) * .14
       const color = COLORS[state] || COLORS.idle
-      const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .28
+      const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
       const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
       const rotation = t * (state === 'processing' ? 1.35 : .42)
       t += state === 'idle' ? .012 : .026
@@ -85,6 +85,7 @@ export default function CoreSphere({ state = 'idle' }) {
       drawOrbit(base * 1.18, base * .74, -1.06, -rotation * .25, .3, [1, 7])
       drawOrbit(base * 1.42, base * .3, -.55, rotation * .16, .25, [2, 12])
       drawOrbit(base * 1.08, base * .96, .8, -rotation * .42, .2, [1, 15])
+      drawOrbit(base * .46, base * .2, -.72, rotation * .9, .62, [2, 5])
 
       sparks.forEach((p) => {
         const a = p.a + t * p.speed
@@ -107,6 +108,6 @@ export default function CoreSphere({ state = 'idle' }) {
   }, [state])
 
   const color = COLORS[state] || COLORS.idle
-  return <div className={`core-container core-${state}`} style={{ '--core-color': color }}><div className="core-glow" /><div className="core-crosshair" /><canvas ref={canvasRef} className="core-canvas" aria-label="Audio reactive JARVIS 3D core" /></div>
+  return <div className={`core-container core-${state}`} style={{ '--core-color': color }}><canvas ref={canvasRef} className="core-canvas" aria-label="Audio reactive JARVIS 3D core" /></div>
 }
 
