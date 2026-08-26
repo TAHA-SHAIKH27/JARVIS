@@ -98,6 +98,13 @@ export default function App() {
   const [newNote, setNewNote] = useState('')
   const [newTodo, setNewTodo] = useState('')
   const [timerData, setTimerData] = useState(null)
+  const [booting, setBooting] = useState(true)
+  const [activeView, setActiveView] = useState('core')
+
+  useEffect(() => {
+    const timer = setTimeout(() => setBooting(false), 1800)
+    return () => clearTimeout(timer)
+  }, [])
 
   // New voice system
   const voiceHook = useVoice({
@@ -597,7 +604,16 @@ export default function App() {
   const sphereState = ttsSpeaking ? 'speaking' : (busy || isProcessing) ? 'processing' : (voiceActive || isPushToTalkActive) ? 'listening' : isWakeDetected ? 'wake' : 'idle'
 
   return (
-    <div className="jarvis-root">
+    <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      {booting && (
+        <div className="boot-screen" role="status" aria-live="polite">
+          <div className="boot-mark">J</div>
+          <p className="boot-kicker">STARK INDUSTRIES // SYSTEM STARTUP</p>
+          <h1>J.A.R.V.I.S.</h1>
+          <div className="boot-progress"><span /></div>
+          <p className="boot-status">INITIALIZING NEURAL CORE <span>OK</span></p>
+        </div>
+      )}
       {/* TOP BAR */}
       <Header
         online={online}
@@ -613,7 +629,12 @@ export default function App() {
       />
 
       {/* MAIN 3-COLUMN GRID */}
-      <div className="hud-grid">
+      <nav className="module-rail" aria-label="JARVIS modules">
+        <button className={activeView === 'core' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('core')}><Activity size={16} /><span>CORE</span></button>
+        <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
+        <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
+      </nav>
+      <div className={`hud-grid view-${activeView}`}>
 
         {/* ΓöÇΓöÇ LEFT COLUMN: Chat + File Bay ΓöÇΓöÇ */}
         <div className="hud-left">
