@@ -227,326 +227,7 @@ def voice_command(req: VoiceCommandRequest):
     return process_command(command_req)
 
 
-_GLOBAL_WAKE_MODEL = None
-_GLOBAL_WHISPER_MODEL = None
 
-def get_wake_model():
-    global _GLOBAL_WAKE_MODEL
-    if _GLOBAL_WAKE_MODEL is None:
-        try:
-            from openwakeword import Model
-            _GLOBAL_WAKE_MODEL = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-        except Exception as e:
-            print(f"[Voice WS] openWakeWord init failed: {e}")
-    return _GLOBAL_WAKE_MODEL
-
-def get_whisper_model():
-    global _GLOBAL_WHISPER_MODEL
-    if _GLOBAL_WHISPER_MODEL is None:
-        try:
-            from faster_whisper import WhisperModel
-            _GLOBAL_WHISPER_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
-        except Exception as e:
-            print(f"[Voice WS] faster-whisper init failed: {e}")
-    return _GLOBAL_WHISPER_MODEL
-
-
-# ── WebSocket for Real-time Wake Word Detection (Push-to-Wake) ───────────────
-@app.websocket("/api/voice/stream")
-async def voice_stream(ws: WebSocket):
-    """
-    Real-time audio streaming for wake word detection.
-    Browser sends 16kHz mono PCM chunks (1280 samples = 80ms).
-    Returns: {"type": "wake", "score": 0.85} or {"type": "transcript", "text": "..."}
-    """
-    await ws.accept()
-    
-    import struct
-    import tempfile
-    import wave
-    
-    wake_model = get_wake_model()
-    if wake_model is None:
-        await ws.send_json({"type": "error", "message": "Wake word model unavailable"})
-        await ws.close()
-        return
-    
-    sample_rate = 16000
-    chunk_size = 1280  # 80ms at 16kHz
-    wake_threshold = 0.5
-    
-    # Recording state
-    recording = False
-    recorded_frames = []
-    silence_frames = 0
-    silence_threshold = 300  # More sensitive
-    max_silence_frames = int(0.7 * sample_rate / chunk_size)  # Stop after 0.7s silence
-    min_record_frames = int(0.5 * sample_rate / chunk_size)   # Min 0.5s recording
-    
-    try:
-        await ws.send_json({"type": "ready"})
-        
-        while True:
-            # Receive text (base64) or binary
-            try:
-                data = await ws.receive_text()
-                is_text = True
-            except:
-                data = await ws.receive_bytes()
-                is_text = False
-            
-            # Decode base64
-            try:
-                if is_text:
-                    pcm_bytes = base64.b64decode(data)
-                else:
-                    # Try base64 decode on binary too
-                    pcm_bytes = base64.b64decode(data)
-            except:
-                pcm_bytes = data if not is_text else b''
-            
-            # Convert to numpy int16 array
-            if len(pcm_bytes) < chunk_size * 2:
-                continue
-                
-            audio_chunk = np.frombuffer(pcm_bytes[:chunk_size * 2], dtype=np.int16)
-            
-            if not recording:
-                # Wake word detection
-                prediction = wake_model.predict(audio_chunk)
-                score = prediction.get("hey_jarvis", 0)
-                
-                if score >= wake_threshold:
-                    recording = True
-                    recorded_frames = [pcm_bytes[:chunk_size * 2]]
-                    silence_frames = 0
-                    await ws.send_json({"type": "wake", "score": float(score)})
-                    # Send beep signal to frontend
-                    await ws.send_json({"type": "beep"})
-            else:
-                # Recording mode
-                recorded_frames.append(pcm_bytes[:chunk_size * 2])
-                
-                # Simple VAD
-                audio_data = struct.unpack_from("h" * chunk_size, pcm_bytes[:chunk_size * 2])
-                energy = sum(abs(x) for x in audio_data) / len(audio_data)
-                
-                if energy < silence_threshold:
-                    silence_frames += 1
-                else:
-                    silence_frames = 0
-                
-                # Stop on silence
-                if (silence_frames >= max_silence_frames and 
-                    len(recorded_frames) >= min_record_frames):
-                    recording = False
-                    
-                    # Save to temp WAV
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                        wf = wave.open(f.name, 'wb')
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(sample_rate)
-                        wf.writeframes(b''.join(recorded_frames))
-                        wf.close()
-                        wav_path = f.name
-                    
-                    try:
-                        # Transcribe using Groq STT API first (ultra-fast), fallback to local Whisper
-                        text = ""
-                        groq_key = os.getenv("GROQ_API_KEY", "") or load_config().get("groq_api_key", "")
-                        if groq_key:
-                            try:
-                                from groq import Groq
-                                groq_client = Groq(api_key=groq_key)
-                                with open(wav_path, "rb") as f:
-                                    transcript = groq_client.audio.transcriptions.create(
-                                        file=(os.path.basename(wav_path), f.read()),
-                                        model="whisper-large-v3-turbo",
-                                        language="en",
-                                        response_format="text",
-                                        temperature=0.0
-                                    )
-                                text = transcript.strip() if isinstance(transcript, str) else getattr(transcript, 'text', '').strip()
-                                print(f"[Voice WS] Groq STT success: '{text}'")
-                            except Exception as ge:
-                                print(f"[Voice WS] Groq STT error: {ge}, falling back to local Whisper")
-
-                        if not text:
-                            # Local Whisper fallback (whisper.cpp first, then faster-whisper)
-                            text = transcribe_with_whisper_cpp(wav_path)
-                            if not text:
-                                try:
-                                    wm = get_whisper_model()
-                                    if wm:
-                                        segments, info = wm.transcribe(
-                                            wav_path, language="en", beam_size=1,
-                                            vad_filter=False
-                                        )
-                                        text = " ".join([seg.text for seg in segments]).strip()
-                                except Exception as e:
-                                    print(f"[Voice WS] Local STT failed: {e}")
-
-                        if text:
-                            await ws.send_json({"type": "transcript", "text": text})
-                            
-                            # Process command directly (avoid HTTP self-call deadlock)
-                            try:
-                                from main import process_command
-                                from main import CommandRequest
-                                command_req = CommandRequest(prompt=text, apiKey=None)
-                                result = await process_command(command_req)
-                                await ws.send_json({"type": "response", "speak": result.get("speak", ""), "logs": result.get("logs", [])})
-                            except Exception as e:
-                                await ws.send_json({"type": "error", "message": f"Backend error: {e}"})
-                        else:
-                            await ws.send_json({"type": "error", "message": "Could not understand"})
-                    finally:
-                        import os
-                        try:
-                            os.remove(wav_path)
-                        except:
-                            pass
-                    
-                    # Reset wake model
-                    wake_model.reset()
-                    
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        try:
-            await ws.send_json({"type": "error", "message": str(e)})
-        except:
-            pass
-    finally:
-        try:
-            await ws.close()
-        except:
-            pass
-
-
-def transcribe_with_whisper_cpp(wav_path: str) -> str:
-    """Transcribe audio using compiled whisper.cpp binary if available."""
-    try:
-        cli_exe = os.path.join(os.path.dirname(__file__), "whisper.cpp", "build", "bin", "Release", "whisper-cli.exe")
-        model_path = os.path.join(os.path.dirname(__file__), "whisper.cpp", "models", "ggml-base.en.bin")
-        if os.path.exists(cli_exe) and os.path.exists(model_path):
-            import subprocess
-            cmd = [cli_exe, "-m", model_path, "-f", wav_path, "-nt", "-np"]
-            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
-    except Exception as e:
-        print(f"[whisper.cpp] Transcription error: {e}")
-    return ""
-
-
-# ── Push-to-Talk Transcription Endpoint ──────────────────────────────────────
-@app.post("/api/voice/transcribe")
-async def transcribe_push_to_talk(audio: UploadFile = File(...)):
-    """
-    Accepts audio file (webm/mp4/wav) from push-to-talk recording,
-    returns transcribed text using Groq STT (fast) or local Whisper fallback.
-    """
-    try:
-        # Read audio file
-        audio_bytes = await audio.read()
-        
-        # Save to temp file for Whisper
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_bytes)
-            wav_path = f.name
-        
-        try:
-            # Try Groq STT first (ultra-fast)
-            text = ""
-            groq_key = os.getenv("GROQ_API_KEY", "") or load_config().get("groq_api_key", "")
-            if groq_key:
-                try:
-                    from groq import Groq
-                    groq_client = Groq(api_key=groq_key)
-                    with open(wav_path, "rb") as f:
-                        transcript = groq_client.audio.transcriptions.create(
-                            file=(os.path.basename(wav_path), f.read()),
-                            model="whisper-large-v3-turbo",
-                            language="en",
-                            response_format="text",
-                            temperature=0.0
-                        )
-                    text = transcript.strip() if isinstance(transcript, str) else getattr(transcript, 'text', '').strip()
-                    print(f"[Push-to-Talk] Groq STT success: '{text}'")
-                except Exception as ge:
-                    print(f"[Push-to-Talk] Groq STT error: {ge}, falling back to local Whisper")
-
-            if not text:
-                # Local Whisper fallback (whisper.cpp first, then faster-whisper)
-                text = transcribe_with_whisper_cpp(wav_path)
-                if not text:
-                    try:
-                        from faster_whisper import WhisperModel
-                        whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
-                        segments, info = whisper_model.transcribe(
-                            wav_path, language="en", beam_size=1, vad_filter=False
-                        )
-                        text = " ".join([seg.text for seg in segments]).strip()
-                    except Exception as e:
-                        print(f"[Push-to-Talk] Local STT failed: {e}")
-
-            if text:
-                return {"status": "success", "text": text}
-            else:
-                return {"status": "error", "message": "Could not understand audio"}
-        finally:
-            try:
-                os.remove(wav_path)
-            except:
-                pass
-                
-    except Exception as e:
-        return {"status": "error", "message": f"Transcription failed: {str(e)}"}
-
-
-# ── HTTP STT Endpoint (for localhost development) ────────────────────────────
-@app.post("/api/stt/transcribe")
-async def transcribe_http(audio: UploadFile = File(...)):
-    """
-    HTTP endpoint for STT transcription (localhost development fallback).
-    Accepts audio file, returns transcribed text using local faster-whisper.
-    This is a fallback for localhost development when Electron IPC is not available.
-    """
-    try:
-        audio_bytes = await audio.read()
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_bytes)
-            wav_path = f.name
-        
-        try:
-            text = transcribe_with_whisper_cpp(wav_path)
-            if not text:
-                # Use local faster-whisper fallback
-                try:
-                    from faster_whisper import WhisperModel
-                    whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
-                    segments, info = whisper_model.transcribe(
-                        wav_path, language="en", beam_size=1, vad_filter=False
-                    )
-                    text = " ".join([seg.text for seg in segments]).strip()
-                except Exception as e:
-                    print(f"[HTTP STT] Local STT failed: {e}")
-            
-            if text:
-                return {"status": "success", "text": text}
-            else:
-                return {"status": "error", "message": "Could not understand audio"}
-        finally:
-            try:
-                os.remove(wav_path)
-            except:
-                pass
-                
-    except Exception as e:
-        return {"status": "error", "message": f"Transcription failed: {str(e)}"}
 
 
 # ── Notes endpoints ───────────────────────────────────────────────────────
@@ -977,44 +658,44 @@ async def process_command(req: CommandRequest):
             res = get_clipboard()
             execution_logs.append("ACTION: Reading clipboard")
             execution_logs.append(f"RESULT: {res['message']}")
+            # Always override speak_text with actual clipboard content
+            speak_text = res["message"]
 
         elif act_type == "clipboard_write":
             text = action.get("text", "")
             res = set_clipboard(text)
             execution_logs.append(f"ACTION: Writing to clipboard")
             execution_logs.append(f"RESULT: {res['message']}")
+            speak_text = res["message"]
 
         elif act_type == "battery":
             res = get_battery_info()
             execution_logs.append("ACTION: Checking battery")
             execution_logs.append(f"RESULT: {res['message']}")
-            card_data = res.get("battery")
-            if card_data:
-                speak_text = speak_text or res["message"]
+            # Always override with actual battery data
+            speak_text = res["message"]
 
         elif act_type == "network_info":
             res = get_network_info()
             execution_logs.append("ACTION: Getting network info")
             execution_logs.append(f"RESULT: {res['message']}")
-            if res["status"] == "success" and not speak_text:
-                speak_text = res["message"]
+            # Always override with actual network data
+            speak_text = res["message"]
 
         elif act_type == "weather":
             city = action.get("city", "London")
             execution_logs.append(f"ACTION: Fetching weather for {city}")
             res = get_weather(city)
             execution_logs.append(f"RESULT: {res['message']}")
-            if res["status"] == "success":
-                weather_data = res.get("weather")
-                if not speak_text:
-                    speak_text = res["message"]
+            # Always override with actual weather data (replaces any prior 'retrieving' placeholder)
+            speak_text = res["message"]
 
         elif act_type == "datetime_info":
             res = get_datetime_info()
             execution_logs.append("ACTION: Getting date/time")
             execution_logs.append(f"RESULT: {res['message']}")
-            if not speak_text:
-                speak_text = res["message"]
+            # Always override with actual datetime data
+            speak_text = res["message"]
 
         elif act_type == "open_url":
             url = action.get("url", "")

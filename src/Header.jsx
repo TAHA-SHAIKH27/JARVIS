@@ -25,7 +25,7 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
         <button
           className={`icon-btn mic-btn ${voiceActive ? 'active' : ''}`}
           onClick={toggleVoice}
-          title={voiceActive ? 'Stop listening (mic ON)' : 'Start listening (mic OFF)'}
+          title={voiceActive ? 'Disable Wake Word (listening)' : 'Enable Wake Word (offline)'}
         >
           {voiceActive ? <Mic size={15} /> : <MicOff size={15} />}
         </button>

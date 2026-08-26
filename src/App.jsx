@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
   Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
@@ -100,6 +100,19 @@ export default function App() {
   const [timerData, setTimerData] = useState(null)
 
   // New voice system
+  const voiceHook = useVoice({
+    onTranscript: (event) => {
+      // onTranscript only adds the user bubble — actual command execution
+      // happens via runVoiceCommand (set on _setExecuteCommand below)
+      if (event.type === 'final') {
+        setMessages(m => [...m, { role: 'user', text: event.text }]);
+      }
+    },
+    onError: (error) => {
+      setMessages(m => [...m, { role: 'jarvis', text: `Voice error: ${error}` }]);
+    },
+  });
+
   const {
     isListening: voiceActive,
     isWakeDetected,
@@ -111,29 +124,62 @@ export default function App() {
     startListening,
     stopListening,
     toggleListening,
-  } = useVoice({
-    onTranscript: (event) => {
-      if (event.type === 'final') {
-        setMessages(m => [...m, { role: 'user', text: event.text }]);
-      } else {
-        // Could show partial in UI
+    isPushToTalkActive,
+    startPushToTalk,
+    stopPushToTalk,
+    _setExecuteCommand,
+  } = voiceHook;
+
+  // runVoiceCommand: like runCommand but does NOT add a user bubble
+  // (the voice hook already adds it via onTranscript)
+  async function runVoiceCommand(text) {
+    if (!text.trim() || busy) return
+    setBusy(true)
+    try {
+      const res = await fetch('/api/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: text })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
+        setBusy(false)
+        return
       }
-    },
-    onAction: (action) => {
-      if (action.type === 'action') {
-        // Execute action immediately
-        runCommandRef.current?.(JSON.stringify(action.action));
-      } else if (action.type === 'speak') {
-        // TTS handled by hook
+      const data = await res.json()
+      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
+      speak(data.speak)
+      setLogs(data.logs || [])
+      setFileData(data.file_data || null)
+      setImageData(data.image_data || null)
+      if (data.timer_data) setTimerData(data.timer_data)
+      if (data.refresh_files) refreshFiles()
+      const logLines = data.logs || []
+      if (logLines.some(l => l.includes('Note added') || l.includes('Todo added'))) {
+        refreshNotes(); refreshTodos()
       }
-    },
-    onError: (error) => {
-      setMessages(m => [...m, { role: 'jarvis', text: `Voice error: ${error}` }]);
-    },
-    onLatency: (metrics) => {
-      console.log('[Latency]', metrics);
+    } catch {
+      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
+    } finally {
+      setBusy(false)
     }
-  });
+  }
+
+  // Wire the execute command ref in the hook so auto-silence PTT can execute commands
+  useEffect(() => {
+    _setExecuteCommand?.(runVoiceCommand);
+  })
+
+  async function togglePushToTalk() {
+    if (isPushToTalkActive) {
+      // stopPushToTalk fires onTranscript (user bubble) + executeCommandRef (JARVIS reply)
+      // We just stop it — execution is handled inside the hook via executeCommandRef
+      await stopPushToTalk();
+    } else {
+      await startPushToTalk();
+    }
+  }
 
   const chatEndRef = useRef(null)
   const fileInputRef = useRef(null)
@@ -548,7 +594,7 @@ export default function App() {
     { label: 'Clear Chat', icon: RotateCcw, cmd: 'clear chat' },
   ]
 
-  const sphereState = ttsSpeaking ? 'speaking' : busy ? 'processing' : isProcessing ? 'listening' : isWakeDetected ? 'wake' : voiceActive ? 'listening' : 'idle'
+  const sphereState = ttsSpeaking ? 'speaking' : (busy || isProcessing) ? 'processing' : (voiceActive || isPushToTalkActive) ? 'listening' : isWakeDetected ? 'wake' : 'idle'
 
   return (
     <div className="jarvis-root">
@@ -618,11 +664,19 @@ export default function App() {
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image or document">
                 <ImagePlus size={15} />
               </button>
-<input
+              <button
+                className={`icon-btn ptt-btn ${isPushToTalkActive ? 'active-recording' : ''}`}
+                onClick={togglePushToTalk}
+                title={isPushToTalkActive ? 'Click to stop recording' : 'Click to talk (Push-to-Talk)'}
+                style={{ color: isPushToTalkActive ? 'var(--neon-red, #ff3b30)' : 'inherit' }}
+              >
+                {isPushToTalkActive ? <Mic className="pulsing" size={15} /> : <Mic size={15} />}
+              </button>
+              <input
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-placeholder={chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
+                placeholder={chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
                 disabled={busy}
               />
               <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument)}>

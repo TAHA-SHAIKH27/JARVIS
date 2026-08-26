@@ -6,8 +6,6 @@ dependencies:
   - python=3.11
   - pip
   - numpy
-  - pyaudio
-  - onnxruntime
   - ffmpeg
   - pip:
     - fastapi==0.111.0
@@ -23,6 +21,3 @@ dependencies:
     - python-multipart==0.0.9
     - huggingface_hub==0.34.0
     - Pillow==10.4.0
-    - faster-whisper==1.0.3
-    - groq==0.5.0
-    - openwakeword==0.5.2

@@ -1,646 +1,603 @@
 // useVoice.ts
-// Main React hook for JARVIS voice pipeline
-// Coordinates: AudioWorklet -> Wake Word -> STT -> Gemini -> TTS
+// Standard browser Web Speech API voice pipeline hook for JARVIS.
+// Coordinates SpeechRecognition, speechSynthesis, and Web Audio API mic-level visualization.
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { 
-  AudioChunk, 
-  WakeWordResult, 
-  STTResult, 
-  LatencyMetrics, 
-  VoiceConfig, 
-  DEFAULT_VOICE_CONFIG,
-  TranscriptEvent,
-  CommandStreamEvent
-} from '../../voice/types';
 
-interface UseVoiceOptions {
-  config?: Partial<VoiceConfig>;
-  onTranscript?: (event: TranscriptEvent) => void;
-  onAction?: (action: CommandStreamEvent) => void;
-  onError?: (error: string) => void;
-  onLatency?: (metrics: Partial<LatencyMetrics>) => void;
+declare global {
+  interface Window {
+    jarvisAudioLevel?: number;
+  }
 }
 
-interface UseVoiceReturn {
-  isListening: boolean;
-  isWakeDetected: boolean;
-  isProcessing: boolean;
-  isSpeaking: boolean;
-  transcript: string;
-  partialTranscript: string;
-  latency: Partial<LatencyMetrics>;
-  startListening: () => Promise<void>;
-  stopListening: () => void;
-  toggleListening: () => Promise<void>;
+export interface UseVoiceReturn {
+  isListening: boolean; // Continuous wake word listening active
+  isWakeDetected: boolean; // Wake word detected state (flashes green in UI)
+  isProcessing: boolean; // Transcribing/executing command
+  isSpeaking: boolean; // TTS speaking state
+  transcript: string; // Final transcript of the last utterance
+  partialTranscript: string; // Interim results
+  latency: Record<string, number>; // Compatibility placeholder
+  startListening: () => Promise<void>; // Begin continuous listening
+  stopListening: () => void; // End continuous listening
+  toggleListening: () => Promise<void>; // Toggle continuous mode
+  isPushToTalkActive: boolean; // Push-to-Talk active
+  startPushToTalk: () => Promise<void>; // Start PTT
+  stopPushToTalk: () => Promise<string>; // Stop PTT and return final transcript
+  _setExecuteCommand: (fn: (text: string) => void) => void; // Connect command executor
+}
+
+interface UseVoiceOptions {
+  onTranscript?: (event: { type: 'final'; text: string; timestamp: number }) => void;
+  onError?: (error: string) => void;
 }
 
 export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
-  const {
-    config = DEFAULT_VOICE_CONFIG,
-    onTranscript,
-    onAction,
-    onError,
-    onLatency,
-  } = options;
-  
-  // Merged config
-  const mergedConfig: VoiceConfig = { ...DEFAULT_VOICE_CONFIG, ...config };
-  
-  // State
+  // ---------- State ----------
   const [isListening, setIsListening] = useState(false);
   const [isWakeDetected, setIsWakeDetected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [partialTranscript, setPartialTranscript] = useState('');
-  const [latency, setLatency] = useState<Partial<LatencyMetrics>>({});
-  
-  // Refs
+  const [isPushToTalkActive, setIsPushToTalkActive] = useState(false);
+
+  // ---------- Refs for stable callback execution ----------
+  const isListeningRef = useRef(false);
+  const isPushToTalkActiveRef = useRef(false);
+  const isMutedForTTSRef = useRef(false);
+  const awaitingFinalPttRef = useRef(false);
+  const executeCommandRef = useRef<((text: string) => void) | null>(null);
+
+  // Keep a ref of partialTranscript to read the latest state in async callbacks safely
+  const partialTranscriptRef = useRef('');
+  useEffect(() => {
+    partialTranscriptRef.current = partialTranscript;
+  }, [partialTranscript]);
+
+  // ---------- Speech Recognition instances ----------
+  const recognitionRef = useRef<any>(null);
+  const pttRecognitionRef = useRef<any>(null);
+  const silenceTimerRef = useRef<any>(null);
+
+  // ---------- Audio context refs for level visualizer ----------
   const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<AudioWorkletNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const wakeWorkerRef = useRef<Worker | null>(null);
-  const ringBufferRef = useRef<Float32Array | null>(null);
-  const isRecordingRef = useRef(false);
-  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const utteranceStartRef = useRef<number>(0);
-  const lastPartialRef = useRef<string>('');
-  const sttResultCleanupRef = useRef<() => void | null>(null);
-  const sttErrorCleanupRef = useRef<() => void | null>(null);
-  const latencyRef = useRef<LatencyMetrics>({
-    micStart: 0,
-    wakeDetected: 0,
-    sttFirstPartial: 0,
-    sttFinal: 0,
-    geminiStart: 0,
-    geminiFirstToken: 0,
-    actionStart: 0,
-    ttsStart: 0,
-    ttsFirstAudio: 0,
-    actionComplete: 0,
-  });
-  
-  // Configuration
-  const porcupineAccessKey = import.meta.env.VITE_PORCUPINE_ACCESS_KEY || '';
-  
-  // Initialize latency reporting
-  const reportLatency = useCallback((metrics: Partial<LatencyMetrics>) => {
-    setLatency(prev => ({ ...prev, ...metrics }));
-    onLatency?.(metrics);
-  }, [onLatency]);
-  
-  // Initialize wake word worker
-  const initWakeWorker = useCallback(async (): Promise<boolean> => {
-    if (wakeWorkerRef.current) return true;
-    
-    if (!porcupineAccessKey) {
-      console.warn('[Voice] Porcupine AccessKey not configured. Set VITE_PORCUPINE_ACCESS_KEY in .env. Wake word detection will be disabled.');
-      // Don't error - just disable wake word
-      return true;
-    }
-    
-    const worker = new Worker(
-      new URL('../wake-worker.ts', import.meta.url),
-      { type: 'module' }
-    );
-    
-    worker.onmessage = (event) => {
-      const { type, keyword, score, error } = event.data;
-      
-      switch (type) {
-        case 'READY':
-          console.log('[Voice] Wake word engine ready:', keyword);
-          break;
-        case 'DETECTED':
-          console.log('[Voice] Wake word detected:', keyword, 'score:', score);
-          handleWakeDetected(keyword || 'jarvis', score || 0);
-          break;
-        case 'ERROR':
-          console.error('[Voice] Wake worker error:', error);
-          onError?.(error);
-          break;
-        case 'KEY_MISSING':
-          console.warn('[Voice] Porcupine AccessKey missing:', error);
-          break;
-      }
-    };
-    
-    worker.onerror = (error) => {
-      console.error('[Voice] Wake worker error:', error);
-      onError?.('Wake word worker error');
-    };
-    
-    // Initialize Porcupine
-    worker.postMessage({
-      type: 'INIT',
-      accessKey: porcupineAccessKey,
-      keywords: ['jarvis']
-    });
-    
-    wakeWorkerRef.current = worker;
-    return true;
-  }, [porcupineAccessKey, onError]);
-  
-  // Handle wake word detection
-  const handleWakeDetected = useCallback((keyword: string, score: number) => {
-    const now = performance.now();
-    latencyRef.current.wakeDetected = now;
-    reportLatency({ wakeDetected: now - latencyRef.current.micStart });
-    
-    setIsWakeDetected(true);
-    
-    // Visual feedback
-    playWakeBeep();
-    
-    // Start STT recording from ring buffer
-    startSTTRecording();
-    
-    // Reset wake detection after short delay
-    setTimeout(() => setIsWakeDetected(false), 500);
-  }, [reportLatency]);
-  
-  // Play wake beep
-  const playWakeBeep = useCallback(() => {
+  const animationFrameRef = useRef<number | null>(null);
+
+  // ---------- Audio beep helper ----------
+  const playBeep = useCallback((freq = 800) => {
     try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
-      osc.frequency.value = 800;
+      osc.frequency.value = freq;
       gain.gain.setValueAtTime(0.3, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.12);
       osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.1);
-    } catch (e) {
-      console.warn('[Voice] Could not play beep:', e);
-    }
+      osc.stop(ctx.currentTime + 0.12);
+    } catch {}
   }, []);
-  
-  // Start STT recording from ring buffer
-  const startSTTRecording = useCallback(async () => {
-    if (isRecordingRef.current) return;
-    
-    // Get ring buffer from AudioWorklet
-    if (processorRef.current) {
-      processorRef.current.port.postMessage({ type: 'STT_START' });
-      processorRef.current.port.postMessage({ type: 'GET_BUFFER' });
-    }
-    
-    isRecordingRef.current = true;
-    utteranceStartRef.current = performance.now();
-    setIsProcessing(true);
-    lastPartialRef.current = '';
-  }, []);
-  
-  // Handle ring buffer response from AudioWorklet
-  const handleRingBuffer = useCallback((buffer: Float32Array, validSamples: number) => {
-    if (!isRecordingRef.current) return;
-    
-    // Send to STT (whisper.cpp subprocess via Electron IPC or HTTP)
-    sendToSTT(buffer.subarray(0, validSamples));
-  }, []);
-  
-  // Send audio to whisper.cpp subprocess via Electron IPC or HTTP fallback
-  const sendToSTT = useCallback(async (audio: Float32Array) => {
-    // Convert Float32 to 16-bit PCM
-    const pcm = new Int16Array(audio.length);
-    for (let i = 0; i < audio.length; i++) {
-      const s = Math.max(-1, Math.min(1, audio[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    
-    if (window.voiceAPI) {
-      // Electron mode: send via IPC
-      try {
-        await window.voiceAPI.writeSTT(Array.from(pcm));
-      } catch (error) {
-        console.error('[Voice] Failed to send audio to STT via IPC:', error);
-      }
-    } else {
-      // Localhost mode: send via HTTP to /api/stt/transcribe
-      try {
-        const formData = new FormData();
-        const blob = new Blob([new Int16Array(pcm).buffer], { type: 'audio/wav' });
-        formData.append('audio', blob, 'recording.wav');
-        
-        const response = await fetch('/api/stt/transcribe', {
-          method: 'POST',
-          body: formData
-        });
-        
-        const data = await response.json();
-        if (data.status === 'success' && data.text) {
-          handleSTTFinal(data.text);
-        } else if (data.status === 'error') {
-          console.warn('[Voice] HTTP STT error:', data.message);
-        }
-      } catch (error) {
-        console.error('[Voice] Failed to send audio to STT via HTTP:', error);
-      }
-    }
-  }, []);
-  
-  // VAD/Silence detection for finalizing STT
-  const checkSilence = useCallback(() => {
-    if (!isRecordingRef.current) return;
-    
-    const now = performance.now();
-    const elapsed = now - utteranceStartRef.current;
-    
-    // Check if we've exceeded max utterance duration
-    if (elapsed > 30000) { // 30 seconds max
-      console.log('[Voice] Max utterance duration reached, finalizing');
-      finalizeSTT();
-      return;
-    }
-    
-    // Check for silence (no partial updates for a while)
-    // This would be triggered by STT partial results
-    // For now, we rely on the STT engine's VAD
-    
-    // Reschedule check
-    silenceTimerRef.current = setTimeout(checkSilence, 500);
-  }, []);
-  
-  // Handle STT partial results
-  const handleSTTPartial = useCallback((text: string) => {
-    if (!isRecordingRef.current) return;
-    
-    setPartialTranscript(text);
-    lastPartialRef.current = text;
-    
-    // Report first partial latency
-    if (latencyRef.current.sttFirstPartial === 0) {
-      latencyRef.current.sttFirstPartial = performance.now();
-      reportLatency({ 
-        sttFirstPartial: latencyRef.current.sttFirstPartial - latencyRef.current.wakeDetected 
-      });
-    }
-    
-    // Reset silence timer on new partial
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-    }
-    
-    // Command mode: shorter silence threshold (400ms)
-    // Conversation mode: longer silence threshold (800ms)
-    const silenceThreshold = 400; // ms
-    
-    silenceTimerRef.current = setTimeout(() => {
-      console.log('[Voice] Silence detected, finalizing STT');
-      finalizeSTT();
-    }, silenceThreshold);
-  }, [reportLatency]);
-  
-  // Handle STT final result
-  const handleSTTFinal = useCallback((text: string) => {
-    console.log('[Voice] STT Final:', text);
-    
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    
-    latencyRef.current.sttFinal = performance.now();
-    reportLatency({ 
-      sttFinal: latencyRef.current.sttFinal - latencyRef.current.sttFirstPartial 
-    });
-    
-    finalizeSTT(text);
-  }, [reportLatency]);
-  
-  // Finalize STT and send to Gemini
-  const finalizeSTT = useCallback(async (finalText?: string) => {
-    const text = finalText || lastPartialRef.current;
-    console.log('[Voice] STT Final:', text);
-    
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    
-    isRecordingRef.current = false;
-    setIsProcessing(false);
-    setPartialTranscript('');
-    
-    if (!text.trim()) return;
-    
-    setTranscript(text);
-    onTranscript?.({ type: 'final', text, timestamp: Date.now() });
-    
-    // Send to Gemini streaming endpoint
-    await sendToGemini(text);
-  }, [onTranscript]);
-  
-  // Send transcript to Gemini streaming endpoint
-  const sendToGemini = useCallback(async (text: string) => {
-    const now = performance.now();
-    latencyRef.current.geminiStart = now;
-    reportLatency({ geminiStart: now - latencyRef.current.micStart });
-    
+
+  // ---------- Web Audio Analyser for Level Visualization ----------
+  const initAudioVisualizer = useCallback(async () => {
+    if (audioContextRef.current) return;
+
     try {
-      const response = await fetch('/api/command/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
-      });
-      
-      if (!response.ok || !response.body) {
-        throw new Error('Gemini stream failed');
-      }
-      
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let actionBuffer = '';
-      
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        const chunk = decoder.decode(value, { stream: true });
-        actionBuffer += chunk;
-        
-        // Process SSE events
-        const lines = actionBuffer.split('\n');
-        actionBuffer = lines.pop() || '';
-        
-        for (const line of lines) {
-          if (!line.startsWith('data:')) continue;
-          
-          const dataStr = line.slice(5).trim();
-          if (!dataStr || dataStr === '[DONE]') continue;
-          
-          try {
-            const event: CommandStreamEvent = JSON.parse(dataStr);
-            
-            if (event.type === 'action') {
-              latencyRef.current.actionStart = performance.now();
-              reportLatency({ 
-                actionStart: latencyRef.current.actionStart - latencyRef.current.geminiStart 
-              });
-              onAction?.(event);
-            } else if (event.type === 'speak') {
-              latencyRef.current.ttsStart = performance.now();
-              reportLatency({ 
-                ttsStart: latencyRef.current.ttsStart - latencyRef.current.geminiStart 
-              });
-              await speakText(event.text);
-            }
-          } catch (e) {
-            console.warn('[Voice] Failed to parse SSE event:', e);
-          }
-        }
-      }
-    } catch (error) {
-      console.error('[Voice] Gemini error:', error);
-      onError?.('Failed to get response from JARVIS');
-    }
-  }, [onAction, reportLatency]);
-  
-  // TTS queue
-  const ttsQueueRef = useRef<string[]>([]);
-  const ttsSpeakingRef = useRef(false);
-  
-  const speakText = useCallback(async (text: string): Promise<void> => {
-    return new Promise((resolve) => {
-      // Split into sentences for streaming TTS
-      const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-      ttsQueueRef.current.push(...sentences);
-      
-      const processQueue = () => {
-        if (ttsSpeakingRef.current || ttsQueueRef.current.length === 0) {
-          resolve();
-          return;
-        }
-        
-        ttsSpeakingRef.current = true;
-        setIsSpeaking(true);
-        
-        const sentence = ttsQueueRef.current.shift()!;
-        const utterance = new SpeechSynthesisUtterance(sentence);
-        utterance.rate = 1.0;
-        utterance.pitch = 0.85;
-        
-        const voices = window.speechSynthesis.getVoices();
-        utterance.voice = voices.find(v => v.lang.startsWith('en')) || voices[0];
-        
-        utterance.onstart = () => {
-          if (latencyRef.current.ttsFirstAudio === 0) {
-            latencyRef.current.ttsFirstAudio = performance.now();
-            reportLatency({ 
-              ttsFirstAudio: latencyRef.current.ttsFirstAudio - latencyRef.current.ttsStart 
-            });
-          }
-        };
-        
-        utterance.onend = () => {
-          ttsSpeakingRef.current = false;
-          setIsSpeaking(ttsQueueRef.current.length > 0);
-          processQueue();
-        };
-        
-        utterance.onerror = () => {
-          ttsSpeakingRef.current = false;
-          setIsSpeaking(ttsQueueRef.current.length > 0);
-          processQueue();
-        };
-        
-        window.speechSynthesis.speak(utterance);
-      };
-      
-      if (!ttsSpeakingRef.current) {
-        processQueue();
-      }
-    });
-  }, [reportLatency]);
-  
-  // Start listening
-  const startListening = useCallback(async () => {
-    if (isListening) return;
-    
-    try {
-      // Initialize wake word engine
-      const wakeReady = await initWakeWorker();
-      if (!wakeReady) return;
-      
-      // Create AudioContext
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const audioContext = new AudioCtx({ sampleRate: mergedConfig.sampleRate });
-      audioContextRef.current = audioContext;
-      
-      // Verify actual sample rate
-      console.log('[Voice] AudioContext sample rate:', audioContext.sampleRate);
-      
-      // Load AudioWorklet
-      await audioContext.audioWorklet.addModule('/voice-processor.js');
-      
-      // Get microphone
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: mergedConfig.sampleRate,
-          channelCount: mergedConfig.channels,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
       streamRef.current = stream;
-      
-      // Create processor
-      const processor = new AudioWorkletNode(audioContext, 'voice-processor');
-      processorRef.current = processor;
-      
-      // Handle messages from AudioWorklet
-      processor.port.onmessage = (event) => {
-        const { type, buffer, validSamples, rms, timestamp } = event.data;
-        
-        switch (type) {
-          case 'AUDIO':
-            // Forward to wake word worker
-            if (wakeWorkerRef.current) {
-              wakeWorkerRef.current.postMessage(
-                { type: 'AUDIO', buffer },
-                [buffer.buffer]
-              );
-            }
-            break;
-          case 'RING_BUFFER':
-            handleRingBuffer(buffer, validSamples);
-            break;
-          case 'VOLUME':
-            // Could update UI volume meter
-            break;
-        }
-      };
-      
-      // Connect audio graph
+
+      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioCtx();
+      audioContextRef.current = audioContext;
+
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      analyserRef.current = analyser;
+
       const source = audioContext.createMediaStreamSource(stream);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      // Start wake word detection
-      if (wakeWorkerRef.current) {
-        wakeWorkerRef.current.postMessage({ type: 'INIT' });
-      }
-      
-      // Start silence checking
-      checkSilence();
-      
-      // Start latency tracking
-      latencyRef.current.micStart = performance.now();
-      reportLatency({ micStart: 0 });
-      
-      setIsListening(true);
-      console.log('[Voice] Listening started');
-      
-    } catch (error) {
-      console.error('[Voice] Failed to start listening:', error);
-      onError?.('Microphone access denied or unavailable');
-      stopListening();
+      source.connect(analyser);
+
+      const bufferLength = analyser.fftSize;
+      const dataArray = new Float32Array(bufferLength);
+
+      const getMicLevel = () => {
+        if (!analyserRef.current || !streamRef.current) {
+          window.jarvisAudioLevel = 0;
+          return;
+        }
+
+        analyserRef.current.getFloatTimeDomainData(dataArray);
+
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          sum += dataArray[i] * dataArray[i];
+        }
+        const rms = Math.sqrt(sum / bufferLength);
+
+        // Map RMS to jarvisAudioLevel (0.0 - 1.0)
+        window.jarvisAudioLevel = Math.min(1.0, rms * 12.0); // Amplified for pulsing visual feedback
+
+        animationFrameRef.current = requestAnimationFrame(getMicLevel);
+      };
+
+      animationFrameRef.current = requestAnimationFrame(getMicLevel);
+      console.log('[Voice] Web Audio API visualizer started.');
+    } catch (err) {
+      console.warn('[Voice] Failed to get microphone for level visualizer:', err);
     }
-  }, [mergedConfig, initWakeWorker, handleRingBuffer, reportLatency, onError]);
-  
-  // Stop listening
-  const stopListening = useCallback(() => {
-    // Stop wake word worker
-    if (wakeWorkerRef.current) {
-      wakeWorkerRef.current.postMessage({ type: 'STOP' });
-      wakeWorkerRef.current.terminate();
-      wakeWorkerRef.current = null;
+  }, []);
+
+  const releaseAudioVisualizer = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
     }
-    
-    // Stop AudioWorklet
-    if (processorRef.current) {
-      processorRef.current.port.postMessage({ type: 'PORCUPINE_STOP' });
-      processorRef.current.port.postMessage({ type: 'STT_STOP' });
-      processorRef.current.disconnect();
-      processorRef.current = null;
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
-    
-    // Close audio context
+
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
+
+    analyserRef.current = null;
+    window.jarvisAudioLevel = 0;
+    console.log('[Voice] Web Audio API visualizer stopped.');
+  }, []);
+
+  // ---------- Muting/Pausing STT during TTS to prevent feedback loop ----------
+  const pauseRecognition = useCallback(() => {
+    console.log('[Voice] Pausing recognition for TTS playback');
+    isMutedForTTSRef.current = true;
     
-    // Stop media stream
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
     }
+    if (pttRecognitionRef.current) {
+      try {
+        pttRecognitionRef.current.stop();
+      } catch {}
+    }
+  }, []);
+
+  const resumeRecognition = useCallback(() => {
+    console.log('[Voice] Resuming recognition after TTS playback');
+    isMutedForTTSRef.current = false;
     
-    // Cleanup STT listeners
-    if (sttResultCleanupRef.current) {
-      sttResultCleanupRef.current();
-      sttResultCleanupRef.current = null;
+    if (isListeningRef.current) {
+      try {
+        recognitionRef.current?.start();
+      } catch (e) {
+        console.warn('[Voice] Failed to restart continuous recognition:', e);
+      }
     }
-    if (sttErrorCleanupRef.current) {
-      sttErrorCleanupRef.current();
-      sttErrorCleanupRef.current = null;
-    }
+  }, []);
+
+  // ---------- Command Execution Wrapper ----------
+  const executeCommand = useCallback(async (text: string) => {
+    const cleanText = text.trim();
+    if (!cleanText) return;
+
+    console.log('[Voice] Executing command text:', cleanText);
+    setIsProcessing(true);
     
-    // Stop STT engine
-    if (window.voiceAPI) {
-      window.voiceAPI.stopSTT().catch(() => {});
+    if (executeCommandRef.current) {
+      try {
+        // Await the command execution so we can reset isProcessing accurately
+        await executeCommandRef.current(cleanText);
+      } catch (err) {
+        console.error('[Voice] Error executing voice command:', err);
+      }
     }
-    
-    // Cancel any pending timers
+    setIsProcessing(false);
+  }, []);
+
+  // ---------- TTS Interceptor (Synchronizes states and prevents echo) ----------
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+
+    const originalSpeak = window.speechSynthesis.speak;
+
+    window.speechSynthesis.speak = function (utterance: SpeechSynthesisUtterance) {
+      const originalOnStart = utterance.onstart;
+      const originalOnEnd = utterance.onend;
+      const originalOnError = utterance.onerror;
+
+      utterance.onstart = function (e) {
+        setIsSpeaking(true);
+        pauseRecognition();
+        if (originalOnStart) originalOnStart.call(this, e);
+      };
+
+      const handleSpeechEnd = (e: any, originalCb: any) => {
+        setIsSpeaking(false);
+        resumeRecognition();
+        if (originalCb) originalCb.call(this, e);
+      };
+
+      utterance.onend = function (e) {
+        handleSpeechEnd.call(this, e, originalOnEnd);
+      };
+
+      utterance.onerror = function (e) {
+        handleSpeechEnd.call(this, e, originalOnError);
+      };
+
+      originalSpeak.call(window.speechSynthesis, utterance);
+    };
+
+    return () => {
+      window.speechSynthesis.speak = originalSpeak;
+    };
+  }, [pauseRecognition, resumeRecognition]);
+
+  // ---------- Continuous Wake-Word Mode ----------
+  const initRecognition = useCallback(() => {
+    if (recognitionRef.current) return recognitionRef.current;
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn('[Voice] Web Speech API SpeechRecognition not supported in this browser.');
+      return null;
+    }
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-US';
+
+    // State tracks whether we are WAKING ('hey jarvis') or capturing a COMMAND ('Yes?' response)
+    let listenState: 'WAKE' | 'COMMAND' = 'WAKE';
+
+    rec.onresult = (event: any) => {
+      if (isMutedForTTSRef.current) return;
+
+      let interimText = '';
+      let finalText = '';
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const seg = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalText += seg;
+        } else {
+          interimText += seg;
+        }
+      }
+
+      const currentSegment = finalText || interimText;
+      console.log(`[Voice] Continuous Recognition [State: ${listenState}] | Interim: "${interimText}" | Final: "${finalText}"`);
+      
+      setPartialTranscript(interimText || finalText);
+
+      // Reset silence detection timeout
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      
+      if (currentSegment.trim()) {
+        silenceTimerRef.current = setTimeout(() => {
+          console.log('[Voice] Silence detected. Stopping to force finalization.');
+          try {
+            rec.stop();
+          } catch {}
+        }, 900);
+      }
+
+      const fullText = currentSegment.trim().toLowerCase();
+
+      if (listenState === 'WAKE') {
+        if (fullText.includes('jarvis')) {
+          // Check for "Jarvis, do X" (one sentence trigger)
+          const parts = fullText.split('jarvis');
+          const commandText = parts[1] ? parts[1].replace(/^[,\s]+|[,\s]+$/g, '').trim() : '';
+
+          if (commandText.length > 1) {
+            // One-sentence flow: wait for final result
+            if (event.results[event.results.length - 1].isFinal || !interimText) {
+              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+              
+              console.log('[Voice] One-sentence wake word + command parsed:', commandText);
+              
+              setIsWakeDetected(true);
+              setTimeout(() => setIsWakeDetected(false), 1200);
+              playBeep(900);
+
+              setTranscript(commandText);
+              setPartialTranscript('');
+              options.onTranscript?.({ type: 'final', text: commandText, timestamp: Date.now() });
+
+              executeCommand(commandText);
+            }
+          } else {
+            // "Jarvis" -> "Yes?" -> command flow
+            if (event.results[event.results.length - 1].isFinal || !interimText) {
+              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+              console.log('[Voice] Wake word detected alone. Transitioning to COMMAND state.');
+              
+              setIsWakeDetected(true);
+              setTimeout(() => setIsWakeDetected(false), 1200);
+              
+              listenState = 'COMMAND';
+
+              // Play beep and output "Yes?"
+              playBeep(850);
+              const utter = new SpeechSynthesisUtterance('Yes?');
+              utter.rate = 1.0;
+              utter.pitch = 0.85;
+              window.speechSynthesis.speak(utter);
+            }
+          }
+        }
+      } else if (listenState === 'COMMAND') {
+        // Capture next command in COMMAND state
+        if (fullText && (event.results[event.results.length - 1].isFinal || !interimText)) {
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          
+          console.log('[Voice] Captured follow-up command:', currentSegment);
+          listenState = 'WAKE'; // Revert back to wake word mode
+
+          setTranscript(currentSegment);
+          setPartialTranscript('');
+          options.onTranscript?.({ type: 'final', text: currentSegment, timestamp: Date.now() });
+
+          executeCommand(currentSegment);
+        }
+      }
+    };
+
+    rec.onerror = (err: any) => {
+      console.error('[Voice] Continuous SpeechRecognition error:', err.error);
+      if (err.error === 'not-allowed') {
+        options.onError?.('Microphone permission denied.');
+        stopListening();
+      }
+    };
+
+    rec.onend = () => {
+      console.log('[Voice] Continuous SpeechRecognition ended.');
+      if (isListeningRef.current && !isMutedForTTSRef.current) {
+        try {
+          rec.start();
+        } catch (e) {
+          console.warn('[Voice] Failed to restart SpeechRecognition:', e);
+        }
+      }
+    };
+
+    recognitionRef.current = rec;
+    return rec;
+  }, [options, executeCommand, playBeep]);
+
+  const startListening = useCallback(async () => {
+    if (isListeningRef.current) return;
+
+    try {
+      const rec = initRecognition();
+      if (!rec) throw new Error('SpeechRecognition initialization failed');
+
+      isListeningRef.current = true;
+      setIsListening(true);
+      playBeep(800);
+
+      await initAudioVisualizer();
+
+      try {
+        rec.start();
+      } catch (e) {
+        console.warn('[Voice] SpeechRecognition already started or error starting:', e);
+      }
+      console.log('[Voice] Continuous wake word listening started');
+    } catch (err) {
+      console.error('[Voice] Failed to start continuous listening:', err);
+      isListeningRef.current = false;
+      setIsListening(false);
+      options.onError?.('Failed to start continuous speech recognizer.');
+    }
+  }, [initRecognition, initAudioVisualizer, playBeep, options]);
+
+  const stopListening = useCallback(() => {
+    if (!isListeningRef.current) return;
+
+    isListeningRef.current = false;
+    setIsListening(false);
+    setIsWakeDetected(false);
+    setPartialTranscript('');
+
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    
-    // Cancel TTS
-    window.speechSynthesis.cancel();
-    ttsQueueRef.current = [];
-    ttsSpeakingRef.current = false;
-    
-    isRecordingRef.current = false;
-    setIsListening(false);
-    setIsWakeDetected(false);
-    setIsProcessing(false);
-    setIsSpeaking(false);
-    setPartialTranscript('');
-    
-    console.log('[Voice] Listening stopped');
-  }, []);
-  
-  // Toggle listening
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+    }
+
+    if (!isPushToTalkActiveRef.current) {
+      releaseAudioVisualizer();
+    }
+    console.log('[Voice] Continuous wake word listening stopped');
+  }, [releaseAudioVisualizer]);
+
   const toggleListening = useCallback(async () => {
-    if (isListening) {
+    if (isListeningRef.current) {
       stopListening();
     } else {
       await startListening();
     }
-  }, [isListening, startListening, stopListening]);
-  
-  // Expose STT handlers for Electron IPC
-  useEffect(() => {
-    if (!window.voiceAPI) return;
+  }, [startListening, stopListening]);
+
+  // ---------- Push-to-Talk Mode ----------
+  const startPushToTalk = useCallback(async () => {
+    if (isPushToTalkActiveRef.current) return;
+
+    console.log('[Voice] Starting Push-to-Talk recognition');
     
-    const handlePartial = (text: string) => handleSTTPartial(text);
-    const handleFinal = (text: string) => handleSTTFinal(text);
-    
-    const cleanupPartial = window.voiceAPI.onSTTPartial(handlePartial);
-    const cleanupFinal = window.voiceAPI.onSTTFinal(handleFinal);
-    
-    return () => {
-      cleanupPartial();
-      cleanupFinal();
+    // Stop continuous recognition if running
+    if (isListeningRef.current && recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+    }
+
+    isPushToTalkActiveRef.current = true;
+    setIsPushToTalkActive(true);
+    playBeep(800);
+
+    await initAudioVisualizer();
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      options.onError?.('SpeechRecognition not supported in this browser.');
+      return;
+    }
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-US';
+
+    rec.onresult = (event: any) => {
+      let interimText = '';
+      let finalText = '';
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const seg = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalText += seg;
+        } else {
+          interimText += seg;
+        }
+      }
+
+      const currentSegment = finalText || interimText;
+      setPartialTranscript(interimText || finalText);
+
+      // Timing safe finalize: if PTT was released, execute on first final result
+      if (!isPushToTalkActiveRef.current && awaitingFinalPttRef.current) {
+        if (event.results[event.results.length - 1].isFinal || !interimText) {
+          awaitingFinalPttRef.current = false;
+          executePTTCommand(currentSegment);
+        }
+      }
     };
-  }, [handleSTTPartial, handleSTTFinal]);
-  
-  // Cleanup on unmount
+
+    const executePTTCommand = (text: string) => {
+      const cleanText = text.trim();
+      setPartialTranscript('');
+      
+      if (cleanText) {
+        setTranscript(cleanText);
+        options.onTranscript?.({ type: 'final', text: cleanText, timestamp: Date.now() });
+        executeCommand(cleanText);
+      }
+    };
+
+    rec.onerror = (err: any) => {
+      console.error('[Voice] PTT recognition error:', err);
+    };
+
+    rec.onend = () => {
+      console.log('[Voice] PTT recognition ended.');
+      
+      // Safety finalize if no finalized events fired
+      if (awaitingFinalPttRef.current) {
+        awaitingFinalPttRef.current = false;
+        executePTTCommand(partialTranscriptRef.current);
+      }
+
+      if (!isListeningRef.current) {
+        releaseAudioVisualizer();
+      } else {
+        // Resume continuous listening
+        if (!isMutedForTTSRef.current) {
+          try {
+            recognitionRef.current?.start();
+          } catch (e) {
+            console.warn('[Voice] Failed to restart continuous recognition:', e);
+          }
+        }
+      }
+    };
+
+    pttRecognitionRef.current = rec;
+    try {
+      rec.start();
+    } catch (e) {
+      console.error('[Voice] Failed to start PTT recognition:', e);
+    }
+  }, [playBeep, initAudioVisualizer, executeCommand, releaseAudioVisualizer, options]);
+
+  const stopPushToTalk = useCallback(async (): Promise<string> => {
+    if (!isPushToTalkActiveRef.current) return '';
+
+    console.log('[Voice] Stopping Push-to-Talk recording');
+    isPushToTalkActiveRef.current = false;
+    setIsPushToTalkActive(false);
+    playBeep(600);
+
+    awaitingFinalPttRef.current = true;
+
+    if (pttRecognitionRef.current) {
+      try {
+        pttRecognitionRef.current.stop();
+      } catch {}
+    }
+
+    return '';
+  }, [playBeep]);
+
+  // ---------- Cleanup on unmount ----------
   useEffect(() => {
     return () => {
-      stopListening();
+      isListeningRef.current = false;
+      isPushToTalkActiveRef.current = false;
+
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+
+      if (pttRecognitionRef.current) {
+        try {
+          pttRecognitionRef.current.stop();
+        } catch {}
+      }
+
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
+
+      window.jarvisAudioLevel = 0;
     };
-  }, [stopListening]);
-  
+  }, []);
+
   return {
     isListening,
     isWakeDetected,
@@ -648,16 +605,15 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     isSpeaking,
     transcript,
     partialTranscript,
-    latency,
+    latency: {},
     startListening,
     stopListening,
     toggleListening,
-  };
-}
-
-// Helper to ensure voices are loaded
-if (typeof window !== 'undefined' && window.speechSynthesis) {
-  window.speechSynthesis.onvoiceschanged = () => {
-    // Voices loaded
+    isPushToTalkActive,
+    startPushToTalk,
+    stopPushToTalk,
+    _setExecuteCommand: (fn: (text: string) => void) => {
+      executeCommandRef.current = fn;
+    },
   };
 }

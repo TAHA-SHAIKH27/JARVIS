@@ -19,7 +19,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: 'index.html',
-        'wake-worker': 'src/wake-worker.ts',
       },
     },
   },

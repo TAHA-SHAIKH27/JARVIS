@@ -12,8 +12,6 @@
     "electron": "electron ."
   },
   "dependencies": {
-    "@picovoice/porcupine-web": "^4.0.1",
-    "@picovoice/web-voice-processor": "^4.0.10",
     "lucide-react": "^0.395.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

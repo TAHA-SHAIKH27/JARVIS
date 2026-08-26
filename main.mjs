@@ -5,8 +5,7 @@ import { spawn, ChildProcess } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-let pythonBackend: ChildProcess | null = null;
-let sttProcess: ChildProcess | null = null;
+let pythonBackend = null;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -120,216 +119,10 @@ function stopPythonBackend(): void {
   }
 }
 
-// --- STT (whisper.cpp subprocess) Management -------------------------------
-function startSTTProcess(config: { model?: string; language?: string; threads?: number } = {}): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (sttProcess) {
-      console.log("[STT] Process already running");
-      resolve();
-      return;
-    }
-    
-    // Find whisper-cli executable
-    const possiblePaths = [
-      path.join(__dirname, "..", "resources", "bin", "whisper-cli"),
-      path.join(__dirname, "..", "resources", "bin", "whisper-cli.exe"),
-      path.join(process.cwd(), "whisper-cli"),
-      path.join(process.cwd(), "whisper-cli.exe"),
-      path.join(process.resourcesPath || "", "bin", "whisper-cli"),
-      path.join(process.resourcesPath || "", "bin", "whisper-cli.exe"),
-      "whisper-cli", // In PATH
-    ];
-    
-    let whisperCli = null;
-    for (const p of possiblePaths) {
-      try {
-        if (require("fs").existsSync(p)) {
-          whisperCli = p;
-          break;
-        }
-      } catch {}
-    }
-    
-    if (!whisperCli) {
-      // Check if in PATH
-      try {
-        require("child_process").execSync("which whisper-cli", { stdio: "ignore" });
-        whisperCli = "whisper-cli";
-      } catch {}
-      
-      try {
-        require("child_process").execSync("where whisper-cli", { stdio: "ignore" });
-        whisperCli = "whisper-cli.exe";
-      } catch {}
-    }
-    
-    if (!whisperCli) {
-      reject(new Error("whisper-cli not found. Please build whisper.cpp or install via package manager."));
-      return;
-    }
-    
-    // Find model
-    const modelName = config.model || "base.en";
-    const modelPaths = [
-      path.join(__dirname, "..", "resources", "models", `${modelName}.ggml`),
-      path.join(__dirname, "..", "resources", "models", `${modelName}.bin`),
-      path.join(process.cwd(), "models", `${modelName}.ggml`),
-      path.join(process.cwd(), "models", `${modelName}.bin`),
-      path.join(process.resourcesPath || "", "models", `${modelName}.ggml`),
-      path.join(process.resourcesPath || "", "models", `${modelName}.bin`),
-    ];
-    
-    let modelPath = null;
-    for (const p of modelPaths) {
-      try {
-        if (require("fs").existsSync(p)) {
-          modelPath = p;
-          break;
-        }
-      } catch {}
-    }
-    
-    if (!modelPath) {
-      reject(new Error(`Whisper model not found: ${modelName}. Please download model to resources/models/`));
-      return;
-    }
-    
-    console.log("[STT] Starting whisper.cpp:", whisperCli, "with model:", modelPath);
-    
-    // whisper.cpp command for streaming
-    const args = [
-      '-m', modelPath,
-      '-t', String(config.threads || 4),
-      '-l', config.language || 'en',
-      '--step', '500',        // Process every 500 ms
-      '--length', '5000',     // 5 second context
-      '-vth', '0.6',          // VAD threshold
-      '-f', '-',              // Read from stdin
-      '-otxt',                // Output text
-    ];
-    
-    sttProcess = spawn(whisperCli, args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
-      windowsHide: true,
-    });
-    
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
-    
-    sttProcess.stdout?.on("data", (data: Buffer) => {
-      const text = data.toString("utf8");
-      stdoutBuffer += text;
-      
-      // Process lines
-      const lines = stdoutBuffer.split("\n");
-      stdoutBuffer = lines.pop() || "";
-      
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        
-        // Check if it's a partial or final result
-        // whisper.cpp outputs: [start --> end] text
-        const match = trimmed.match(/^\[[\d:.]+ --> [\d:. ]+\]\s*(.+)$/);
-        if (match) {
-          const text = match[1].trim();
-          if (text) {
-            // Send to all renderer windows
-            const windows = BrowserWindow.getAllWindows();
-            windows.forEach((win) => {
-              if (!win.isDestroyed()) {
-                win.webContents.send("stt:partial", text);
-              }
-            });
-          }
-        }
-      }
-    });
-    
-    sttProcess.stderr?.on("data", (data: Buffer) => {
-      stderrBuffer += data.toString("utf8");
-    });
-    
-    sttProcess.on("error", (err) => {
-      console.error("[STT] Process error:", err);
-      reject(err);
-    });
-    
-    sttProcess.on("exit", (code) => {
-      console.log("[STT] Process exited with code:", code);
-      sttProcess = null;
-      if (code !== 0 && code !== null) {
-        const windows = BrowserWindow.getAllWindows();
-        windows.forEach((win) => {
-          if (!win.isDestroyed()) {
-            win.webContents.send("stt:error", `whisper.cpp exited with code ${code}: ${stderrBuffer}`);
-          }
-        });
-      }
-    });
-    
-    // Give it a moment to start
-    setTimeout(() => resolve(), 500);
-  });
-}
 
-function stopSTTProcess(): void {
-  if (sttProcess) {
-    sttProcess.kill("SIGTERM");
-    sttProcess = null;
-  }
-}
 
 // --- IPC Handlers -----------------------------------------------------------
 function registerIPC() {
-  // STT handlers
-  ipcMain.handle("stt:start", async (_event, config) => {
-    try {
-      await startSTTProcess(config);
-      return { success: true };
-    } catch (error) {
-      console.error("[STT] Failed to start:", error);
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : "Failed to start STT" 
-      };
-    }
-  });
-  
-  ipcMain.handle("stt:write", async (_event, audioData: number[]) => {
-    if (!sttProcess || !sttProcess.stdin?.writable) {
-      return { success: false, error: "STT process not running" };
-    }
-    
-    try {
-      const pcm = new Int16Array(audioData);
-      sttProcess.stdin?.write(Buffer.from(pcm.buffer));
-      return { success: true };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error.message : "Failed to write audio" 
-      };
-    }
-  });
-  
-  ipcMain.handle("stt:end-segment", async () => {
-    if (sttProcess) {
-      sttProcess.stdin?.end();
-    }
-    return { success: true };
-  });
-  
-  ipcMain.handle("stt:stop", async () => {
-    stopSTTProcess();
-    return { success: true };
-  });
-  
-  ipcMain.handle("stt:status", async () => {
-    return { running: !!sttProcess };
-  });
-  
   // Voice command proxy to Python backend
   ipcMain.handle("voice:command", async (_event, prompt: string) => {
     try {
@@ -408,13 +201,11 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   stopPythonBackend();
-  stopSTTProcess();
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
   stopPythonBackend();
-  stopSTTProcess();
 });
 
 // --- Security: Prevent navigation to external URLs -------------------------
