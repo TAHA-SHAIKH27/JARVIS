@@ -1,134 +1,113 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useEffect, useRef } from 'react'
 
-// Color map based on J.A.R.V.I.S. states
-const STATE_COLORS = {
-  idle:      'rgba(46, 214, 255, 1)',    // Cyan/Blue - mic off
-  listening: 'rgba(46, 214, 255, 1)',    // Blue - mic on, waiting for wake word
-  wake:      'rgba(94, 255, 155, 1)',    // Green - wake word detected!
-  processing:'rgba(255, 138, 61,  1)',   // Amber - processing command
-  speaking:  'rgba(94, 255, 155, 1)',    // Green - speaking response
-};
+const COLORS = { idle: '#43d9ff', listening: '#54a8ff', wake: '#72f0b0', processing: '#ffb45c', speaking: '#72f0b0' }
+const TAU = Math.PI * 2
+
+function seeded(i) {
+  const x = Math.sin(i * 91.733) * 43758.5453
+  return x - Math.floor(x)
+}
 
 export default function CoreSphere({ state = 'idle' }) {
-  const canvasRef = useRef(null);
+  const canvasRef = useRef(null)
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-
-    let animationFrameId;
-    let rotationX = 0;
-    let rotationY = 0;
-    let time = 0;
-
-    // Sphere parameters
-    const numDots = 550;
-    const baseRadius = 115;
-    const dots = [];
-
-    // Fibonacci sphere distribution for even dot spacing
-    const phi = Math.PI * (3 - Math.sqrt(5));
-    for (let i = 0; i < numDots; i++) {
-      const y = 1 - (i / (numDots - 1)) * 2;
-      const radiusAtY = Math.sqrt(1 - y * y);
-      const theta = phi * i;
-      const x = Math.cos(theta) * radiusAtY;
-      const z = Math.sin(theta) * radiusAtY;
-      dots.push({ x, y, z });
-    }
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return undefined
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const shell = Array.from({ length: 620 }, (_, i) => {
+      const y = 1 - (i / 619) * 2
+      const r = Math.sqrt(Math.max(0, 1 - y * y))
+      const a = Math.PI * (3 - Math.sqrt(5)) * i
+      return { x: Math.cos(a) * r, y, z: Math.sin(a) * r, seed: seeded(i) }
+    })
+    const sparks = Array.from({ length: 130 }, (_, i) => ({
+      a: seeded(i + 700) * TAU, y: seeded(i + 900) * 2 - 1, r: .72 + seeded(i + 1100) * .62, speed: .3 + seeded(i + 1300) * 1.2, size: .5 + seeded(i + 1500) * 1.5
+    }))
+    let raf = 0
+    let t = 0
+    let smoothed = 0
 
     const render = () => {
-      // Read live audio level set by App.jsx (0–1)
-      const audioLevel = Math.min(1, Math.max(0, window.jarvisAudioLevel || 0));
-
-      const width  = canvas.width  = canvas.offsetWidth  * (window.devicePixelRatio || 1);
-      const height = canvas.height = canvas.offsetHeight * (window.devicePixelRatio || 1);
-      ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
-
-      ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
-
-      const centerX = canvas.offsetWidth  / 2;
-      const centerY = canvas.offsetHeight / 2;
-
-      time += 0.04;
-
-      // Faster rotation when active
-      const speedMult = (state === 'processing' || state === 'speaking' || state === 'wake') ? 2.5 : 1;
-      rotationX += 0.002 * speedMult;
-      rotationY += 0.004 * speedMult;
-
-      const cosX = Math.cos(rotationX);
-      const sinX = Math.sin(rotationX);
-      const cosY = Math.cos(rotationY);
-      const sinY = Math.sin(rotationY);
-
-      const color = STATE_COLORS[state] || STATE_COLORS.idle;
-
-      ctx.shadowBlur  = 14;
-      ctx.shadowColor = color;
-      ctx.fillStyle   = color;
-
-      const projected = [];
-      for (let i = 0; i < dots.length; i++) {
-        let { x, y, z } = dots[i];
-
-        // Rotate around X
-        let xy = cosX * y - sinX * z;
-        let xz = sinX * y + cosX * z;
-        y = xy; z = xz;
-
-        // Rotate around Y
-        let yx = cosY * x + sinY * z;
-        let yz = -sinY * x + cosY * z;
-        x = yx; z = yz;
-
-        // Audio ripple: wave travels along Y, amplitude driven by mic level
-        const rippleAmp = audioLevel * 40;
-        const ripple = Math.sin(time * 3 + y * 6) * rippleAmp;
-        const radiusWithRipple = baseRadius + ripple + audioLevel * 12;
-
-        // Perspective projection
-        const scale = 260 / (260 - z * radiusWithRipple);
-        const xProj = centerX + x * radiusWithRipple * scale;
-        const yProj = centerY + y * radiusWithRipple * scale;
-
-        // Depth fade
-        const alpha = Math.max(0.1, (z + 1) / 2);
-
-        projected.push({ x: xProj, y: yProj, scale, alpha, z });
+      const w = canvas.offsetWidth || 400
+      const h = canvas.offsetHeight || 400
+      if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+        canvas.width = Math.floor(w * dpr); canvas.height = Math.floor(h * dpr)
       }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, w, h)
+      const input = Math.min(1, Math.max(0, Number(window.jarvisAudioLevel) || 0))
+      const fallback = .08 + (Math.sin(t * 3.2) * .5 + .5) * .04
+      smoothed += ((input > .015 ? input : fallback) - smoothed) * .14
+      const color = COLORS[state] || COLORS.idle
+      const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
+      const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
+      const rotation = t * (state === 'processing' ? 1.35 : .42)
+      t += state === 'idle' ? .012 : .026
 
-      // Sort back-to-front
-      projected.sort((a, b) => a.z - b.z);
+      ctx.save()
+      ctx.translate(cx, cy)
+      ctx.globalCompositeOperation = 'lighter'
+      const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, base * 1.5 * pulse)
+      glow.addColorStop(0, `${color}55`); glow.addColorStop(.34, `${color}18`); glow.addColorStop(1, `${color}00`)
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(0, 0, base * 1.5 * pulse, 0, TAU); ctx.fill()
 
-      for (const p of projected) {
-        ctx.globalAlpha = p.alpha;
-        ctx.beginPath();
-        const dotSize = Math.max(0.5, 1.3 * p.scale + audioLevel * 2);
-        ctx.arc(p.x, p.y, dotSize, 0, Math.PI * 2);
-        ctx.fill();
+      const project = (x, y, z, scale = 1) => {
+        const perspective = 1 / (1.85 - z * .7)
+        return { x: x * base * scale * perspective, y: y * base * scale * perspective, z: perspective }
       }
+      const points = shell.map((p, i) => {
+        const wobble = Math.sin(t * 3.5 + p.y * 11 + p.seed * 8) * smoothed * .1
+        const rr = 1 + wobble
+        const x0 = p.x * rr, y0 = p.y * rr, z0 = p.z * rr
+        const x = x0 * Math.cos(rotation) - z0 * Math.sin(rotation)
+        const z = x0 * Math.sin(rotation) + z0 * Math.cos(rotation)
+        const q = project(x, y0, z, pulse)
+        return { ...q, z, i }
+      }).sort((a, b) => a.z - b.z)
+      points.forEach((p) => {
+        const front = (p.z + 1) / 2
+        ctx.globalAlpha = .1 + front * .7
+        ctx.fillStyle = color
+        ctx.shadowBlur = 8 + front * 8
+        ctx.shadowColor = color
+        ctx.beginPath(); ctx.arc(p.x, p.y, .45 + front * 1.3 + smoothed * 2.2, 0, TAU); ctx.fill()
+      })
 
-      ctx.globalAlpha = 1;
-      animationFrameId = requestAnimationFrame(render);
-    };
+      const drawOrbit = (rx, ry, tilt, phase, alpha, dash = []) => {
+        ctx.save(); ctx.rotate(tilt + Math.sin(t * .35 + phase) * .08)
+        ctx.scale(1, ry / rx); ctx.rotate(phase)
+        ctx.beginPath(); ctx.arc(0, 0, rx * pulse, 0, TAU)
+        ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .16; ctx.lineWidth = .7 + smoothed * 1.2; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
+      }
+      drawOrbit(base * 1.27, base * .57, .24, rotation * .36, .38, [3, 8])
+      drawOrbit(base * 1.18, base * .74, -1.06, -rotation * .25, .3, [1, 7])
+      drawOrbit(base * 1.42, base * .3, -.55, rotation * .16, .25, [2, 12])
+      drawOrbit(base * 1.08, base * .96, .8, -rotation * .42, .2, [1, 15])
+      drawOrbit(base * .46, base * .2, -.72, rotation * .9, .62, [2, 5])
 
-    render();
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [state]);
+      sparks.forEach((p) => {
+        const a = p.a + t * p.speed
+        const rr = p.r * base * (1 + smoothed * .65)
+        const x = Math.cos(a) * rr, y = p.y * base * .72 * (1 + smoothed * .3), z = Math.sin(a) * rr
+        const q = project(x / base, y / base, z / base, 1)
+        ctx.globalAlpha = Math.max(0, .08 + smoothed * .55 - Math.abs(p.y) * .04)
+        ctx.fillStyle = color; ctx.beginPath(); ctx.arc(q.x, q.y, p.size * (1 + smoothed * 2), 0, TAU); ctx.fill()
+      })
 
-  return (
-    <div className="core-container">
-      <div className="core-glow" style={{
-        boxShadow: `0 0 80px ${STATE_COLORS[state]}`,
-        backgroundColor: STATE_COLORS[state],
-        opacity: 0.06,
-      }} />
-      <canvas
-        ref={canvasRef}
-        className="core-canvas"
-        style={{ width: '100%', height: '100%', display: 'block', position: 'relative', zIndex: 2 }}
-      />
-    </div>
-  );
+      ctx.globalAlpha = .9; ctx.shadowBlur = 28 + smoothed * 25; ctx.shadowColor = color
+      const core = ctx.createRadialGradient(0, 0, 0, 0, 0, base * .26 * pulse)
+      core.addColorStop(0, '#ffffff'); core.addColorStop(.16, color); core.addColorStop(.55, `${color}88`); core.addColorStop(1, `${color}00`)
+      ctx.fillStyle = core; ctx.beginPath(); ctx.arc(0, 0, base * .3 * pulse, 0, TAU); ctx.fill()
+      ctx.restore()
+      raf = requestAnimationFrame(render)
+    }
+    render()
+    return () => cancelAnimationFrame(raf)
+  }, [state])
+
+  const color = COLORS[state] || COLORS.idle
+  return <div className={`core-container core-${state}`} style={{ '--core-color': color }}><canvas ref={canvasRef} className="core-canvas" aria-label="Audio reactive JARVIS 3D core" /></div>
 }
+
