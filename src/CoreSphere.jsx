@@ -10,6 +10,9 @@ function seeded(i) {
 
 export default function CoreSphere({ state = 'idle' }) {
   const canvasRef = useRef(null)
+  const rotationOffsetRef = useRef(0)
+  const draggingRef = useRef(false)
+  const lastPointerRef = useRef({ x: 0, y: 0 })
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -29,10 +32,6 @@ export default function CoreSphere({ state = 'idle' }) {
     let t = 0
     let smoothed = 0
     let lastFrame = 0
-    const rotationOffsetRef = { current: 0 }
-    const draggingRef = { current: false }
-    const lastPointerRef = { current: { x: 0, y: 0 } }
-
     const render = (now = 0) => {
       if (now - lastFrame < 28) {
         raf = requestAnimationFrame(render)
