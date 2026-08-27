@@ -150,9 +150,11 @@ def write_file(filename: str, content: str) -> dict:
         return {"status": "error", "message": f"Failed to write file: {str(e)}"}
 
 def read_file(filename: str) -> dict:
-    """Read file content in the work files directory."""
-    filename = os.path.basename(filename)
-    path = os.path.join(WORK_DIR, filename)
+    """Read file content in the work files directory (supports nested paths like screenshots/x.png)."""
+    filename = filename.replace("\\", "/").lstrip("/")
+    path = os.path.abspath(os.path.join(WORK_DIR, filename))
+    if not path.startswith(os.path.abspath(WORK_DIR)):
+        return {"status": "error", "message": "Invalid path."}
     if not os.path.exists(path):
         return {"status": "error", "message": f"File not found: {filename}"}
     try:

@@ -602,6 +602,7 @@ async def process_command(req: CommandRequest):
     config = load_config()
     api_key_to_use = req.apiKey or config.get("gemini_api_key")
     gemini_project_id = config.get("gemini_project_id", "")
+    hf_key = config.get("huggingface_api_key", "")
 
     # Gather files context
     files_context = list_files()

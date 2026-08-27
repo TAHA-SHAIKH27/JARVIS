@@ -1,7 +1,7 @@
 import { app, BrowserWindow, session, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,15 +23,15 @@ function createWindow() {
     win.loadFile(path.join(__dirname, "dist", "index.html"));
   } else {
     // Dev mode: load the Vite dev server
-    win.loadURL("http://localhost:5173");
+    win.loadURL("http://localhost:3000");
     // Open DevTools in development
     win.webContents.openDevTools();
   }
-  
+
   return win;
 }
 
-let mainWindow: BrowserWindow | null = null;
+let mainWindow = null;
 
 // --- Microphone / media permission fix -------------------------------------
 function registerMediaPermissions() {
@@ -51,43 +51,43 @@ function registerMediaPermissions() {
 }
 
 // --- Python Backend Management ---------------------------------------------
-function startPythonBackend(): Promise<void> {
+function startPythonBackend() {
   return new Promise((resolve, reject) => {
     const backendPath = app.isPackaged
       ? path.join(process.resourcesPath, "backend")
       : path.join(__dirname);
-    
+
     const pythonExe = app.isPackaged
       ? path.join(process.resourcesPath, "python", "python.exe")
       : "python";
-    
+
     console.log("[Main] Starting Python backend from:", backendPath);
-    
+
     pythonBackend = spawn(pythonExe, ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"], {
       cwd: backendPath,
       env: { ...process.env, PYTHONPATH: backendPath },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    
+
     pythonBackend.stdout?.on("data", (data) => {
       console.log("[Backend]", data.toString().trim());
     });
-    
+
     pythonBackend.stderr?.on("data", (data) => {
       console.error("[Backend]", data.toString().trim());
     });
-    
+
     pythonBackend.on("error", (err) => {
       console.error("[Backend] Failed to start:", err);
       reject(err);
     });
-    
+
     pythonBackend.on("exit", (code) => {
       console.log("[Backend] Exited with code:", code);
       pythonBackend = null;
     });
-    
+
     // Wait for backend to be ready
     const checkReady = setInterval(async () => {
       try {
@@ -101,7 +101,7 @@ function startPythonBackend(): Promise<void> {
         // Not ready yet
       }
     }, 500);
-    
+
     // Timeout after 30 seconds
     setTimeout(() => {
       clearInterval(checkReady);
@@ -112,19 +112,17 @@ function startPythonBackend(): Promise<void> {
   });
 }
 
-function stopPythonBackend(): void {
+function stopPythonBackend() {
   if (pythonBackend) {
     pythonBackend.kill("SIGTERM");
     pythonBackend = null;
   }
 }
 
-
-
 // --- IPC Handlers -----------------------------------------------------------
 function registerIPC() {
   // Voice command proxy to Python backend
-  ipcMain.handle("voice:command", async (_event, prompt: string) => {
+  ipcMain.handle("voice:command", async (_event, prompt) => {
     try {
       const response = await fetch("http://127.0.0.1:8000/api/command", {
         method: "POST",
@@ -136,31 +134,31 @@ function registerIPC() {
       return { error: error instanceof Error ? error.message : "Failed" };
     }
   });
-  
+
   // Streaming command endpoint
-  ipcMain.handle("voice:command-stream", async (_event, prompt: string) => {
+  ipcMain.handle("voice:command-stream", async (_event, prompt) => {
     try {
       const response = await fetch("http://127.0.0.1:8000/api/command/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt })
       });
-      
+
       if (!response.ok || !response.body) {
         throw new Error("Stream failed");
       }
-      
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       const events = [];
-      
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
+
         const chunk = decoder.decode(value, { stream: true });
         const lines = chunk.split("\n");
-        
+
         for (const line of lines) {
           if (line.startsWith("data:")) {
             const data = line.slice(5).trim();
@@ -172,7 +170,7 @@ function registerIPC() {
           }
         }
       }
-      
+
       return { events };
     } catch (error) {
       return { error: error instanceof Error ? error.message : "Stream failed" };
@@ -184,14 +182,14 @@ function registerIPC() {
 app.whenReady().then(async () => {
   registerMediaPermissions();
   registerIPC();
-  
+
   // Start Python backend
   try {
     await startPythonBackend();
   } catch (error) {
     console.error("[Main] Failed to start Python backend:", error);
   }
-  
+
   mainWindow = createWindow();
 
   app.on("activate", () => {

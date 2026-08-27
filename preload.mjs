@@ -14,7 +14,7 @@ contextBridge.exposeInMainWorld("systemAPI", {
 
 // Notification API
 contextBridge.exposeInMainWorld("notificationAPI", {
-  show: (title: string, body: string) => {
+  show: (title, body) => {
     if (Notification.permission === "granted") {
       new Notification(title, { body });
     } else if (Notification.permission !== "denied") {
@@ -24,17 +24,3 @@ contextBridge.exposeInMainWorld("notificationAPI", {
     }
   },
 });
-
-// Type declarations for TypeScript
-declare global {
-  interface Window {
-    voiceAPI: Record<string, never>;
-    systemAPI: {
-      getPlatform: () => string;
-      getVersion: () => string;
-    };
-    notificationAPI: {
-      show: (title: string, body: string) => void;
-    };
-  }
-}

@@ -526,16 +526,16 @@ export default function App() {
     }
   }
 
-  async function deleteFile(name) {
+  async function deleteFile(path) {
     try {
-      const res = await fetch(`/api/files/delete?filename=${encodeURIComponent(name)}`, { method: 'DELETE' })
+      const res = await fetch(`/api/files/delete?filename=${encodeURIComponent(path)}`, { method: 'DELETE' })
       if (res.ok) refreshFiles()
     } catch { }
   }
 
-  async function viewFile(name) {
+  async function viewFile(path) {
     try {
-      const res = await fetch(`/api/files/read?filename=${encodeURIComponent(name)}`)
+      const res = await fetch(`/api/files/read?filename=${encodeURIComponent(path)}`)
       if (res.ok) {
         const data = await res.json()
         setImageData(null)
@@ -599,7 +599,7 @@ export default function App() {
       </nav>
       <div className={`hud-grid view-${activeView}`}>
 
-        {/* ΓöÇΓöÇ LEFT COLUMN: Chat + File Bay ΓöÇΓöÇ */}
+        {/* ── LEFT COLUMN: Chat + File Bay ── */}
         <div className="hud-left">
 
           {/* Chat / Transcript */}
@@ -682,9 +682,9 @@ export default function App() {
                   <span className="file-actions">
                     {!f.is_dir && <span className="file-size">{formatBytes(f.size)}</span>}
                     {!f.is_dir && (
-                      <button onClick={() => viewFile(f.name)} aria-label={`View ${f.name}`}><Eye size={12} /></button>
+                      <button onClick={() => viewFile(f.relative_path)} aria-label={`View ${f.name}`}><Eye size={12} /></button>
                     )}
-                    <button className="danger" onClick={() => deleteFile(f.name)} aria-label={`Delete ${f.name}`}><Trash2 size={12} /></button>
+                    <button className="danger" onClick={() => deleteFile(f.relative_path)} aria-label={`Delete ${f.name}`}><Trash2 size={12} /></button>
                   </span>
                 </div>
               ))}
@@ -696,7 +696,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* ΓöÇΓöÇ CENTER COLUMN: Telemetry + Sphere + Logs ΓöÇΓöÇ */}
+        {/* ── CENTER COLUMN: Telemetry + Sphere + Logs ── */}
         <div className="hud-center">
           <Telemetry stats={stats} />
 
@@ -720,7 +720,7 @@ export default function App() {
           {timerData && <TimerWidget timerData={timerData} onCancel={() => setTimerData(null)} />}
         </div>
 
-        {/* ΓöÇΓöÇ RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ΓöÇΓöÇ */}
+        {/* ── RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ── */}
         <div className="hud-right">
           <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} />
           <PhonePanel />
