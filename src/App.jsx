@@ -169,7 +169,7 @@ export default function App() {
   // Wire the execute command ref in the hook so auto-silence PTT can execute commands
   useEffect(() => {
     _setExecuteCommand?.(runVoiceCommand);
-  })
+  }, [_setExecuteCommand])
 
   async function togglePushToTalk() {
     if (isPushToTalkActive) {

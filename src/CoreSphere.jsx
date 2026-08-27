@@ -15,21 +15,30 @@ export default function CoreSphere({ state = 'idle' }) {
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return undefined
-    const dpr = Math.min(window.devicePixelRatio || 1, 2)
-    const shell = Array.from({ length: 620 }, (_, i) => {
-      const y = 1 - (i / 619) * 2
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.25)
+    const shell = Array.from({ length: 300 }, (_, i) => {
+      const y = 1 - (i / 299) * 2
       const r = Math.sqrt(Math.max(0, 1 - y * y))
       const a = Math.PI * (3 - Math.sqrt(5)) * i
       return { x: Math.cos(a) * r, y, z: Math.sin(a) * r, seed: seeded(i) }
     })
-    const sparks = Array.from({ length: 130 }, (_, i) => ({
+    const sparks = Array.from({ length: 56 }, (_, i) => ({
       a: seeded(i + 700) * TAU, y: seeded(i + 900) * 2 - 1, r: .72 + seeded(i + 1100) * .62, speed: .3 + seeded(i + 1300) * 1.2, size: .5 + seeded(i + 1500) * 1.5
     }))
     let raf = 0
     let t = 0
     let smoothed = 0
+    let lastFrame = 0
+    const rotationOffsetRef = { current: 0 }
+    const draggingRef = { current: false }
+    const lastPointerRef = { current: { x: 0, y: 0 } }
 
-    const render = () => {
+    const render = (now = 0) => {
+      if (now - lastFrame < 28) {
+        raf = requestAnimationFrame(render)
+        return
+      }
+      lastFrame = now
       const w = canvas.offsetWidth || 400
       const h = canvas.offsetHeight || 400
       if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
@@ -43,8 +52,8 @@ export default function CoreSphere({ state = 'idle' }) {
       const color = COLORS[state] || COLORS.idle
       const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
       const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
-      const rotation = t * (state === 'processing' ? 1.35 : .42)
-      t += state === 'idle' ? .012 : .026
+      const rotation = t * (state === 'processing' ? 1.65 : .58) + rotationOffsetRef.current
+      t += state === 'idle' ? .018 : .035
 
       ctx.save()
       ctx.translate(cx, cy)
@@ -65,12 +74,12 @@ export default function CoreSphere({ state = 'idle' }) {
         const z = x0 * Math.sin(rotation) + z0 * Math.cos(rotation)
         const q = project(x, y0, z, pulse)
         return { ...q, z, i }
-      }).sort((a, b) => a.z - b.z)
+      })
       points.forEach((p) => {
         const front = (p.z + 1) / 2
         ctx.globalAlpha = .1 + front * .7
         ctx.fillStyle = color
-        ctx.shadowBlur = 8 + front * 8
+        ctx.shadowBlur = 3 + front * 4
         ctx.shadowColor = color
         ctx.beginPath(); ctx.arc(p.x, p.y, .45 + front * 1.3 + smoothed * 2.2, 0, TAU); ctx.fill()
       })
@@ -108,6 +117,22 @@ export default function CoreSphere({ state = 'idle' }) {
   }, [state])
 
   const color = COLORS[state] || COLORS.idle
-  return <div className={`core-container core-${state}`} style={{ '--core-color': color }}><canvas ref={canvasRef} className="core-canvas" aria-label="Audio reactive JARVIS 3D core" /></div>
+  const handlePointerDown = (event) => {
+    draggingRef.current = true
+    lastPointerRef.current = { x: event.clientX, y: event.clientY }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+  }
+  const handlePointerMove = (event) => {
+    if (!draggingRef.current) return
+    const dx = event.clientX - lastPointerRef.current.x
+    const dy = event.clientY - lastPointerRef.current.y
+    rotationOffsetRef.current += dx * 0.012 + dy * 0.006
+    lastPointerRef.current = { x: event.clientX, y: event.clientY }
+  }
+  const handlePointerUp = (event) => {
+    draggingRef.current = false
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+  }
+  return <div className={`core-container core-${state}`} style={{ '--core-color': color }}><canvas ref={canvasRef} className="core-canvas" aria-label="Audio reactive JARVIS 3D core" onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} /> </div>
 }
 
