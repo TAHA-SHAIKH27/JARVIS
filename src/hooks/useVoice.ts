@@ -123,7 +123,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
         const rms = Math.sqrt(sum / bufferLength);
 
         // Map RMS to jarvisAudioLevel (0.0 - 1.0)
-        window.jarvisAudioLevel = Math.min(1.0, rms * 12.0); // Amplified for pulsing visual feedback
+        window.jarvisAudioLevel = Math.min(1.0, Math.max(0, (rms - 0.004) * 24.0)); // Amplified for pulsing visual feedback
 
         animationFrameRef.current = window.setTimeout(() => requestAnimationFrame(getMicLevel), 33) as unknown as number;
       };
@@ -137,7 +137,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
   const releaseAudioVisualizer = useCallback(() => {
     if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
+      window.clearTimeout(animationFrameRef.current);
       animationFrameRef.current = null;
     }
 

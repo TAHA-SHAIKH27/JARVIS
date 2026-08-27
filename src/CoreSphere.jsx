@@ -10,7 +10,7 @@ function seeded(i) {
 
 export default function CoreSphere({ state = 'idle' }) {
   const canvasRef = useRef(null)
-  const rotationOffsetRef = useRef(0)
+  const rotationOffsetRef = useRef({ yaw: 0, pitch: 0 })
   const draggingRef = useRef(false)
   const lastPointerRef = useRef({ x: 0, y: 0 })
 
@@ -51,8 +51,9 @@ export default function CoreSphere({ state = 'idle' }) {
       const color = COLORS[state] || COLORS.idle
       const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
       const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
-      const rotation = t * (state === 'processing' ? 1.65 : .58) + rotationOffsetRef.current
-      t += state === 'idle' ? .018 : .035
+      const rotation = t * (state === 'processing' ? 1.9 : .68) + rotationOffsetRef.current.yaw
+      const pitch = rotationOffsetRef.current.pitch + Math.sin(t * .35) * .12
+      t += state === 'idle' ? .022 : .04
 
       ctx.save()
       ctx.translate(cx, cy)
@@ -69,9 +70,12 @@ export default function CoreSphere({ state = 'idle' }) {
         const wobble = Math.sin(t * 3.5 + p.y * 11 + p.seed * 8) * smoothed * .1
         const rr = 1 + wobble
         const x0 = p.x * rr, y0 = p.y * rr, z0 = p.z * rr
-        const x = x0 * Math.cos(rotation) - z0 * Math.sin(rotation)
-        const z = x0 * Math.sin(rotation) + z0 * Math.cos(rotation)
-        const q = project(x, y0, z, pulse)
+        const x1 = x0 * Math.cos(rotation) - z0 * Math.sin(rotation)
+        const z1 = x0 * Math.sin(rotation) + z0 * Math.cos(rotation)
+        const y = y0 * Math.cos(pitch) - z1 * Math.sin(pitch)
+        const z = y0 * Math.sin(pitch) + z1 * Math.cos(pitch)
+        const x = x1
+        const q = project(x, y, z, pulse)
         return { ...q, z, i }
       })
       points.forEach((p) => {
@@ -87,7 +91,7 @@ export default function CoreSphere({ state = 'idle' }) {
         ctx.save(); ctx.rotate(tilt + Math.sin(t * .35 + phase) * .08)
         ctx.scale(1, ry / rx); ctx.rotate(phase)
         ctx.beginPath(); ctx.arc(0, 0, rx * pulse, 0, TAU)
-        ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .16; ctx.lineWidth = .7 + smoothed * 1.2; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
+        ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .2; ctx.lineWidth = 1.15 + smoothed * 1.8; ctx.shadowBlur = 8 + smoothed * 14; ctx.shadowColor = color; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
       }
       drawOrbit(base * 1.27, base * .57, .24, rotation * .36, .38, [3, 8])
       drawOrbit(base * 1.18, base * .74, -1.06, -rotation * .25, .3, [1, 7])
@@ -125,7 +129,8 @@ export default function CoreSphere({ state = 'idle' }) {
     if (!draggingRef.current) return
     const dx = event.clientX - lastPointerRef.current.x
     const dy = event.clientY - lastPointerRef.current.y
-    rotationOffsetRef.current += dx * 0.012 + dy * 0.006
+    rotationOffsetRef.current.yaw += dx * 0.018
+    rotationOffsetRef.current.pitch = Math.max(-1.2, Math.min(1.2, rotationOffsetRef.current.pitch + dy * 0.014))
     lastPointerRef.current = { x: event.clientX, y: event.clientY }
   }
   const handlePointerUp = (event) => {
