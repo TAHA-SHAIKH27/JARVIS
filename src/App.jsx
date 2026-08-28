@@ -97,7 +97,7 @@ export default function App() {
   const [activeView, setActiveView] = useState('core')
 
   useEffect(() => {
-    const timer = setTimeout(() => setBooting(false), 1800)
+    const timer = setTimeout(() => setBooting(false), 4300)
     return () => clearTimeout(timer)
   }, [])
 
