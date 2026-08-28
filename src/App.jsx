@@ -101,6 +101,27 @@ export default function App() {
     return () => clearTimeout(timer)
   }, [])
 
+  useEffect(() => {
+    if (booting) return
+    const AudioCtx = window.AudioContext || window.webkitAudioContext
+    if (!AudioCtx) return
+    const ctx = new AudioCtx()
+    const now = ctx.currentTime
+    const gain = ctx.createGain()
+    const osc = ctx.createOscillator()
+    osc.type = 'sine'
+    osc.frequency.setValueAtTime(440, now)
+    osc.frequency.exponentialRampToValueAtTime(880, now + 0.18)
+    gain.gain.setValueAtTime(0.0001, now)
+    gain.gain.exponentialRampToValueAtTime(0.08, now + 0.025)
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.24)
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    osc.start(now)
+    osc.stop(now + 0.25)
+    return () => { osc.disconnect(); gain.disconnect(); void ctx.close() }
+  }, [booting])
+
   // New voice system
   const voiceHook = useVoice({
     onTranscript: (event) => {
