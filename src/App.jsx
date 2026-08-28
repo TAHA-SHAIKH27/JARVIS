@@ -97,7 +97,7 @@ export default function App() {
   const [activeView, setActiveView] = useState('core')
 
   useEffect(() => {
-    const timer = setTimeout(() => setBooting(false), 4300)
+    const timer = setTimeout(() => setBooting(false), 4000)
     return () => clearTimeout(timer)
   }, [])
 
@@ -569,15 +569,6 @@ export default function App() {
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
-      {booting && (
-        <div className="boot-screen" role="status" aria-live="polite">
-          <div className="boot-mark">J</div>
-          <p className="boot-kicker">STARK INDUSTRIES // SYSTEM STARTUP</p>
-          <h1>J.A.R.V.I.S.</h1>
-          <div className="boot-progress"><span /></div>
-          <p className="boot-status">INITIALIZING NEURAL CORE <span>OK</span></p>
-        </div>
-      )}
       {/* TOP BAR */}
       <Header
         online={online}
