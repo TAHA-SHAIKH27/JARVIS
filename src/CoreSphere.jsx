@@ -91,7 +91,7 @@ export default function CoreSphere({ state = 'idle' }) {
         ctx.save(); ctx.rotate(tilt + Math.sin(t * .35 + phase) * .08)
         ctx.scale(1, ry / rx); ctx.rotate(phase)
         ctx.beginPath(); ctx.arc(0, 0, rx * pulse, 0, TAU)
-        ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .2; ctx.lineWidth = 1.15 + smoothed * 1.8; ctx.shadowBlur = 8 + smoothed * 14; ctx.shadowColor = color; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
+        ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .24; ctx.lineWidth = 1.35 + smoothed * 2; ctx.shadowBlur = 10 + smoothed * 16; ctx.shadowColor = color; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
       }
       drawOrbit(base * 1.27, base * .57, .24, rotation * .36, .38, [3, 8])
       drawOrbit(base * 1.18, base * .74, -1.06, -rotation * .25, .3, [1, 7])

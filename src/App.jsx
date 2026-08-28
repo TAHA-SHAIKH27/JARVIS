@@ -546,6 +546,7 @@ export default function App() {
 
   const quickActions = [
     { label: 'Screenshot', icon: Camera, cmd: 'take a screenshot' },
+    { label: 'Phone Mirroring', icon: Smartphone, cmd: 'mirror phone' },
     { label: 'PC Health', icon: Activity, cmd: 'check pc health' },
     { label: 'Vol +', icon: Volume2, cmd: 'volume up' },
     { label: 'Vol -', icon: Volume1, cmd: 'volume down' },
