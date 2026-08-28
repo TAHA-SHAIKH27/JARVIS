@@ -97,9 +97,75 @@ export default function App() {
   const [activeView, setActiveView] = useState('core')
 
   useEffect(() => {
-    const timer = setTimeout(() => setBooting(false), 1800)
+    const timer = setTimeout(() => setBooting(false), 4000)
     return () => clearTimeout(timer)
   }, [])
+
+  useEffect(() => {
+    if (!booting) return
+    const AudioCtx = window.AudioContext || window.webkitAudioContext
+    if (!AudioCtx) return
+
+    const ctx = new AudioCtx()
+    const timers = []
+    const at = (delay, sound) => timers.push(window.setTimeout(sound, delay))
+    const tone = (when, frequency, duration, volume, type = 'sine', endFrequency = frequency) => {
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      const filter = ctx.createBiquadFilter()
+      const start = ctx.currentTime
+      osc.type = type
+      osc.frequency.setValueAtTime(frequency, start)
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration)
+      filter.type = 'lowpass'
+      filter.frequency.setValueAtTime(2600, start)
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(volume, start + Math.min(0.04, duration * 0.2))
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+      osc.connect(filter)
+      filter.connect(gain)
+      gain.connect(ctx.destination)
+      osc.start(start)
+      osc.stop(start + duration + 0.02)
+    }
+    const noise = (when, duration, volume) => {
+      const buffer = ctx.createBuffer(1, ctx.sampleRate * duration, ctx.sampleRate)
+      const data = buffer.getChannelData(0)
+      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length)
+      const source = ctx.createBufferSource()
+      const filter = ctx.createBiquadFilter()
+      const gain = ctx.createGain()
+      const start = ctx.currentTime
+      source.buffer = buffer
+      filter.type = 'bandpass'
+      filter.frequency.setValueAtTime(1500, start)
+      filter.frequency.exponentialRampToValueAtTime(4200, start + duration)
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(volume, start + 0.015)
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+      source.connect(filter)
+      filter.connect(gain)
+      gain.connect(ctx.destination)
+      source.start(start)
+      source.stop(start + duration)
+    }
+
+    at(620, () => tone(0, 58, 0.32, 0.018, 'sine', 72))
+    at(700, () => noise(0, 0.32, 0.035))
+    at(700, () => tone(0, 180, 0.28, 0.025, 'triangle', 90))
+    at(1280, () => tone(0, 1100, 0.045, 0.035, 'square', 760))
+    at(1400, () => tone(0, 62, 0.36, 0.12, 'sine', 38))
+    at(1420, () => tone(0, 240, 0.42, 0.045, 'sawtooth', 1180))
+    at(1650, () => tone(0, 82, 0.3, 0.055, 'sine', 58))
+    at(1950, () => tone(0, 780, 0.3, 0.035, 'sine', 1320))
+    at(2100, () => tone(0, 1046, 0.42, 0.024, 'sine', 1318))
+
+    void ctx.resume().catch(() => {})
+    return () => {
+      timers.forEach(window.clearTimeout)
+      window.setTimeout(() => { void ctx.close() }, 2400)
+    }
+  }, [booting])
 
   // New voice system
   const voiceHook = useVoice({
@@ -546,6 +612,7 @@ export default function App() {
 
   const quickActions = [
     { label: 'Screenshot', icon: Camera, cmd: 'take a screenshot' },
+    { label: 'Phone Mirroring', icon: Smartphone, cmd: 'mirror phone' },
     { label: 'PC Health', icon: Activity, cmd: 'check pc health' },
     { label: 'Vol +', icon: Volume2, cmd: 'volume up' },
     { label: 'Vol -', icon: Volume1, cmd: 'volume down' },
@@ -568,15 +635,6 @@ export default function App() {
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
-      {booting && (
-        <div className="boot-screen" role="status" aria-live="polite">
-          <div className="boot-mark">J</div>
-          <p className="boot-kicker">STARK INDUSTRIES // SYSTEM STARTUP</p>
-          <h1>J.A.R.V.I.S.</h1>
-          <div className="boot-progress"><span /></div>
-          <p className="boot-status">INITIALIZING NEURAL CORE <span>OK</span></p>
-        </div>
-      )}
       {/* TOP BAR */}
       <Header
         online={online}
