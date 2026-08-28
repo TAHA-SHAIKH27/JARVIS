@@ -11,10 +11,7 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
 
   return (
     <div className="topbar-header">
-      <div className="wordmark">
-        <img src="/logo.png" alt="J.A.R.V.I.S." style={{ height: 32, objectFit: 'contain' }} />
-        <span className="dim">// Just A Rather Very Intelligent System</span>
-      </div>
+      <div className="wordmark">J.A.R.V.I.S.</div>
 
       <div className="header-cluster">
         <div className="status-pill">
