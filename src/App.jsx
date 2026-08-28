@@ -11,6 +11,8 @@ import Telemetry from './Telemetry';
 import CommandGrid from './CommandGrid';
 import CoreSphere from './CoreSphere';
 import PhonePanel from './PhonePanel';
+import PhoneMirrorPage from './PhoneMirrorPage';
+import GalleryPage from './GalleryPage';
 import { useVoice } from './hooks/useVoice';
 
 function formatBytes(n) {
@@ -635,6 +637,32 @@ export default function App() {
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      {/* ── Full-page overlays (Phone / Gallery) ── */}
+      {activeView === 'phone' && (
+        <PhoneMirrorPage
+          setActiveView={setActiveView}
+          messages={messages}
+          prompt={prompt}
+          setPrompt={setPrompt}
+          busy={busy}
+          handleSend={handleSend}
+          isPushToTalkActive={isPushToTalkActive}
+          togglePushToTalk={togglePushToTalk}
+          fileInputRef={fileInputRef}
+          pendingImage={pendingImage}
+          setPendingImage={setPendingImage}
+          pendingDocument={pendingDocument}
+          setPendingDocument={setPendingDocument}
+          extracting={extracting}
+        />
+      )}
+      {activeView === 'files' && (
+        <GalleryPage setActiveView={setActiveView} />
+      )}
+
+      {/* ── Core view (hidden when phone/files active) ── */}
+      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+
       {/* TOP BAR */}
       <Header
         online={online}
@@ -655,7 +683,7 @@ export default function App() {
         <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
         <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
       </nav>
-      <div className={`hud-grid view-${activeView}`}>
+      <div className="hud-grid">
 
         {/* ── LEFT COLUMN: Chat + File Bay ── */}
         <div className="hud-left">
@@ -784,8 +812,9 @@ export default function App() {
           <PhonePanel />
         </div>
       </div>
+      </div>{/* end core-view wrapper */}
 
-      {/* Settings Modal */}
+      {/* Settings Modal (always rendered so it can open from any view) */}
       {settingsOpen && (
         <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>

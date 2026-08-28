@@ -995,7 +995,81 @@ async def process_command(req: CommandRequest):
         "timer_data": timer_data,
     }
 
+
+# ── Gallery endpoints ─────────────────────────────────────────────────────────
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+@app.get("/api/gallery")
+def get_gallery():
+    """Recursively scan work_files for images, returning metadata for each file.
+    Categorises files into: pc_screenshot, phone, generated, other."""
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
+    if not os.path.exists(work_dir):
+        return {"images": []}
+
+    items = []
+    for root, dirs, files in os.walk(work_dir):
+        # Skip hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _IMAGE_EXTS:
+                continue
+            full_path = os.path.join(root, fname)
+            rel = os.path.relpath(full_path, work_dir).replace("\\", "/")
+            size = 0
+            mtime = 0
+            try:
+                st = os.stat(full_path)
+                size = st.st_size
+                mtime = st.st_mtime
+            except OSError:
+                pass
+
+            # Categorise based on folder / filename prefix
+            rel_lower = rel.lower()
+            if rel_lower.startswith("phone/") or fname.startswith("phone_"):
+                category = "phone"
+            elif rel_lower.startswith("images/") or fname.startswith("gen_") or fname.startswith("image_"):
+                category = "generated"
+            elif fname.startswith("screenshot_") or fname.startswith("screen_"):
+                category = "pc_screenshot"
+            else:
+                category = "other"
+
+            items.append({
+                "filename": fname,
+                "path": rel,
+                "size": size,
+                "mtime": mtime,
+                "category": category,
+            })
+
+    # Newest first
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"images": items}
+
+
+@app.get("/api/files/serve")
+def serve_work_file(path: str):
+    """Serve an image from work_files by its relative path (safe — refuses path traversal)."""
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
+    full_path = os.path.abspath(os.path.join(work_dir, path))
+    # Guard against path traversal
+    if not full_path.startswith(work_dir + os.sep) and full_path != work_dir:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    ext = os.path.splitext(full_path)[1].lower()
+    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+    media_type = mime_map.get(ext, "application/octet-stream")
+    return FileResponse(full_path, media_type=media_type)
+
+
 if __name__ == "__main__":
+
     import uvicorn
     import subprocess
     import os
