@@ -1104,9 +1104,77 @@ def serve_work_file(path: str):
 agent_core = AgentCore()
 
 
+class AgentRunRequest(BaseModel):
+    text: str
+    apiKey: Optional[str] = None
+
+
+@app.post("/api/agent/run")
+async def agent_run(req: AgentRunRequest):
+    """
+    Real Agent Mode endpoint — SSE streaming.
+    Runs the full AgentCore loop and emits live execution events to the frontend.
+    Each SSE line: data: {json}\n\n
+    """
+    task = req.text.strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="Task cannot be empty.")
+
+    # Create a per-request event queue
+    event_queue: asyncio.Queue = asyncio.Queue()
+    state = TaskState()
+
+    async def run_agent():
+        """Run agent in background, putting results into the queue."""
+        try:
+            await agent_core.process(task, state, event_queue)
+        except Exception as e:
+            await event_queue.put({
+                "type": "error",
+                "message": f"Agent error: {str(e)}",
+                "icon": "✗",
+                "data": {"error": str(e)},
+                "ts": __import__('time').time()
+            })
+        finally:
+            # Sentinel to signal end of stream
+            await event_queue.put(None)
+
+    async def event_generator():
+        """Consume the event queue and yield SSE-formatted strings."""
+        # Start the agent task
+        agent_task = asyncio.create_task(run_agent())
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    yield "data: " + json.dumps({"type": "error", "message": "Agent timed out", "icon": "✗"}) + "\n\n"
+                    break
+
+                if event is None:
+                    # End of stream sentinel
+                    yield "data: " + json.dumps({"type": "done", "message": "Stream complete"}) + "\n\n"
+                    break
+
+                yield "data: " + json.dumps(event) + "\n\n"
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @app.post("/api/agent/execute")
 async def agent_execute(req: dict):
-    """Execute a natural language task through the agent core."""
+    """Execute a natural language task through the agent core (non-streaming legacy)."""
     task = req.get("text", "")
     state = TaskState()
     result = await agent_core.process(task, state)
@@ -1117,7 +1185,6 @@ async def agent_execute(req: dict):
 async def agent_status():
     """Get the current agent state status."""
     state = TaskState()
-    # Return basic status - full state would be maintained per-session
     return {
         "task": state.task,
         "completed_steps": state.completed_steps,
@@ -1136,19 +1203,6 @@ async def agent_plan(req: dict):
     planner = Planner()
     steps = planner.plan_task(task, state)
     return {"status": "success", "steps": steps, "task": task}
-
-
-@app.post("/api/agent/observation")
-async def agent_observation():
-    """Get current system observations."""
-    from backend.agent.observer import Observer
-    from backend.agent.registry import ToolRegistry
-    registry = ToolRegistry()
-    observer = Observer(registry)
-    # We can't fully observe without a state, but return basic info
-    from backend.system_ops import get_system_stats
-    stats = get_system_stats()
-    return {"status": "success", "stats": stats if "error" not in stats else {}}
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────

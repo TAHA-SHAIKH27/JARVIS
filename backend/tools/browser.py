@@ -5,7 +5,7 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 
 
 class Browser:
-    """Playwright browser control with persistent context."""
+    """Playwright browser control with persistent context. headless=False so the user sees it."""
 
     def __init__(self):
         self.playwright = None
@@ -14,31 +14,46 @@ class Browser:
         self.page = None
 
     async def start(self):
-        """Initialize Playwright browser."""
+        """Initialize Playwright browser (visible window)."""
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=True)
-        self.context = await self.browser.new_context()
+        # headless=False — user can see JARVIS open and navigate the browser
+        self.browser = await self.playwright.chromium.launch(headless=False)
+        self.context = await self.browser.new_context(
+            viewport={"width": 1280, "height": 800}
+        )
         self.page = await self.context.new_page()
 
     async def stop(self):
         """Clean up browser resources."""
         if self.page:
-            await self.page.close()
+            try:
+                await self.page.close()
+            except Exception:
+                pass
         if self.context:
-            await self.context.close()
+            try:
+                await self.context.close()
+            except Exception:
+                pass
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
 
     async def open(self, url: str = "about:blank", new_tab: bool = False) -> Dict[str, Any]:
         """Open a URL in the browser."""
         try:
-            if new_tab and self.page:
-                await self.page.evaluate("window.open('', '_blank')")
-                await self.page.bring_to_front()
-            await self.page.goto(url, wait_until="networkidle")
-            return {"status": "success", "message": f"Opened {url}", "url": url}
+            if new_tab and self.context:
+                self.page = await self.context.new_page()
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            title = await self.page.title()
+            return {"status": "success", "message": f"Opened {url}", "url": url, "title": title}
         except Exception as e:
             return {"status": "error", "message": f"Failed to open {url}: {str(e)}"}
 
@@ -46,20 +61,77 @@ class Browser:
         """Navigate to a URL."""
         return await self.open(url)
 
-    async def search(self, query: str) -> Dict[str, Any]:
-        """Search for a query."""
+    async def get_page_title(self) -> Dict[str, Any]:
+        """Get the current page title."""
         try:
-            await self.page.goto(f"https://www.google.com/search?q={query}", wait_until="networkidle")
-            # Try to get search results
-            results = await self.page.locator(".g").all_text_contents()
-            return {"status": "success", "message": f"Searched for: {query}", "results": results[:10]}
+            title = await self.page.title()
+            url = self.page.url
+            return {"status": "success", "title": title, "url": url, "message": f"Page title: {title}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get page title: {str(e)}"}
+
+    async def search(self, query: str) -> Dict[str, Any]:
+        """Search Google for a query and return result snippets."""
+        try:
+            encoded = query.replace(" ", "+")
+            await self.page.goto(
+                f"https://www.google.com/search?q={encoded}",
+                wait_until="domcontentloaded",
+                timeout=20000
+            )
+            await asyncio.sleep(1)  # let JS settle
+
+            # Extract organic result links and snippets
+            results = []
+            try:
+                result_els = await self.page.locator("div.g").all()
+                for el in result_els[:8]:
+                    try:
+                        link_el = el.locator("a").first
+                        href = await link_el.get_attribute("href")
+                        snippet_el = el.locator("span")
+                        snippet_texts = await snippet_el.all_text_contents()
+                        snippet = " ".join(snippet_texts)[:300]
+                        if href and href.startswith("http") and snippet:
+                            results.append({"url": href, "snippet": snippet})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "message": f"Searched for: {query}",
+                "query": query,
+                "results": results
+            }
         except Exception as e:
             return {"status": "error", "message": f"Search failed: {str(e)}"}
+
+    async def extract_search_results(self) -> List[Dict[str, Any]]:
+        """Extract clickable search result links from the current Google SERP."""
+        results = []
+        try:
+            els = await self.page.locator("div.g a[href]").all()
+            seen = set()
+            for el in els:
+                try:
+                    href = await el.get_attribute("href")
+                    text = (await el.text_content() or "").strip()
+                    if href and href.startswith("http") and href not in seen:
+                        seen.add(href)
+                        results.append({"url": href, "text": text[:120]})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return results[:10]
 
     async def click(self, selector: str) -> Dict[str, Any]:
         """Click on an element by selector."""
         try:
-            await self.page.click(selector)
+            await self.page.click(selector, timeout=8000)
+            await self.page.wait_for_load_state("domcontentloaded")
             return {"status": "success", "message": f"Clicked: {selector}"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to click: {str(e)}"}
@@ -75,7 +147,7 @@ class Browser:
     async def back(self) -> Dict[str, Any]:
         """Go back in browser history."""
         try:
-            await self.page.go_back()
+            await self.page.go_back(wait_until="domcontentloaded")
             return {"status": "success", "message": "Went back"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to go back: {str(e)}"}
@@ -83,7 +155,7 @@ class Browser:
     async def forward(self) -> Dict[str, Any]:
         """Go forward in browser history."""
         try:
-            await self.page.go_forward()
+            await self.page.go_forward(wait_until="domcontentloaded")
             return {"status": "success", "message": "Went forward"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to go forward: {str(e)}"}
@@ -91,7 +163,7 @@ class Browser:
     async def new_tab(self) -> Dict[str, Any]:
         """Open a new tab."""
         try:
-            await self.page.context.new_page()
+            self.page = await self.context.new_page()
             return {"status": "success", "message": "New tab opened"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to open new tab: {str(e)}"}
@@ -117,18 +189,37 @@ class Browser:
         """Extract text from an element."""
         try:
             element = self.page.locator(selector)
-            text = await element.text_content()
+            text = await element.text_content(timeout=5000)
             return {"status": "success", "text": text, "selector": selector}
         except Exception as e:
             return {"status": "error", "message": f"Failed to extract: {str(e)}"}
 
     async def get_page_text(self) -> Dict[str, Any]:
-        """Get all page text."""
+        """Get all visible text from the current page body."""
         try:
-            text = await self.page.text_content()
-            return {"status": "success", "text": text[:5000] if text else ""}
+            text = await self.page.inner_text("body")
+            return {"status": "success", "text": text[:8000] if text else ""}
         except Exception as e:
             return {"status": "error", "message": f"Failed to get page text: {str(e)}"}
+
+    async def get_links(self, limit: int = 20) -> Dict[str, Any]:
+        """Get all hyperlinks on the current page."""
+        try:
+            links = []
+            els = await self.page.locator("a[href]").all()
+            seen = set()
+            for el in els:
+                try:
+                    href = await el.get_attribute("href")
+                    text = (await el.text_content() or "").strip()
+                    if href and href.startswith("http") and href not in seen:
+                        seen.add(href)
+                        links.append({"url": href, "text": text[:100]})
+                except Exception:
+                    pass
+            return {"status": "success", "links": links[:limit]}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get links: {str(e)}"}
 
     async def screenshot(self) -> Dict[str, Any]:
         """Take a screenshot."""
@@ -154,3 +245,11 @@ class Browser:
             return {"status": "success", "message": "Wait completed"}
         except Exception as e:
             return {"status": "error", "message": f"Wait failed: {str(e)}"}
+
+    @property
+    def current_url(self) -> str:
+        """Return the current page URL."""
+        try:
+            return self.page.url if self.page else ""
+        except Exception:
+            return ""
