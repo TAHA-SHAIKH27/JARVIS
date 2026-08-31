@@ -5,6 +5,7 @@ import time
 import urllib.request
 import urllib.error
 import base64
+import io
 from datetime import datetime
 from system_ops import list_files, read_file, write_file
 import google_oauth
@@ -391,67 +392,73 @@ def _parse_new_commands(prompt: str) -> list:
 
 
 
+# Models tried in priority order for image generation via huggingface_hub's
+# InferenceClient (the old api-inference.huggingface.co raw REST endpoint is
+# retired). "auto" provider lets HF route each model to whichever backend
+# currently serves it, skipping to the next model on failure.
+_HF_IMAGE_MODELS = [
+    "black-forest-labs/FLUX.1-schnell",
+    "stabilityai/stable-diffusion-xl-base-1.0",
+]
+
+
 def generate_image_huggingface(prompt: str, hf_api_key: str, save_name: str = "") -> dict:
-    """Generate an image using HuggingFace Inference API and save it to work_files."""
+    """Generate an image using huggingface_hub's InferenceClient and save it to work_files."""
     if not hf_api_key:
         return {"status": "error", "message": "No Hugging Face API key configured. Please add it in Settings."}
-    
-    # Use a fast, high-quality model
-    model_id = "black-forest-labs/FLUX.1-schnell"
-    url = f"https://api-inference.huggingface.co/models/{model_id}"
-    
-    payload = json.dumps({"inputs": prompt}).encode("utf-8")
-    
+
     try:
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {hf_api_key}",
-                "Content-Type": "application/json"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=60) as response:
-            image_bytes = response.read()
-            
-            # Determine filename
-            if not save_name:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_name = f"generated_{timestamp}.png"
-            elif not save_name.endswith(('.png', '.jpg', '.jpeg')):
-                save_name += ".png"
-            
-            # Save to work_files/images directory
-            work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
-            img_dir = os.path.join(work_dir, "images")
-            os.makedirs(img_dir, exist_ok=True)
-            
-            save_path = os.path.join(img_dir, save_name)
-            with open(save_path, "wb") as f:
-                f.write(image_bytes)
-            
-            # Return base64 for frontend preview
-            b64_image = base64.b64encode(image_bytes).decode("utf-8")
-            
-            return {
-                "status": "success",
-                "message": f"Image generated and saved as images/{save_name}",
-                "filename": f"images/{save_name}",
-                "image_base64": b64_image
-            }
-    except urllib.error.HTTPError as e:
-        error_body = ""
+        from huggingface_hub import InferenceClient
+    except ImportError:
+        return {"status": "error", "message": "huggingface_hub isn't installed, sir. Run: pip install huggingface_hub"}
+
+    client = InferenceClient(provider="auto", api_key=hf_api_key)
+
+    last_error = None
+    image_bytes = None
+    for model_id in _HF_IMAGE_MODELS:
         try:
-            error_body = e.read().decode("utf-8")
-        except:
-            pass
-        if e.code == 503:
-            return {"status": "error", "message": "The image model is currently loading. Please try again in a moment, sir."}
-        elif e.code == 401 or e.code == 403:
+            pil_image = client.text_to_image(prompt, model=model_id)
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+            break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if image_bytes is None:
+        err_str = str(last_error) if last_error else "unknown error"
+        if "401" in err_str or "403" in err_str or "invalid" in err_str.lower():
             return {"status": "error", "message": "Your Hugging Face API key appears to be invalid. Please check it in Settings."}
-        return {"status": "error", "message": f"Image generation failed (HTTP {e.code}): {error_body[:200]}"}
-    except Exception as e:
-        return {"status": "error", "message": f"Image generation failed: {str(e)}"}
+        if "503" in err_str or "loading" in err_str.lower():
+            return {"status": "error", "message": "The image model is currently loading. Please try again in a moment, sir."}
+        return {"status": "error", "message": f"Image generation failed: {err_str[:200]}"}
+
+    # Determine filename
+    if not save_name:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_name = f"generated_{timestamp}.png"
+    elif not save_name.endswith(('.png', '.jpg', '.jpeg')):
+        save_name += ".png"
+
+    # Save to work_files/images directory (WORK_DIR is one level above the project root)
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
+    img_dir = os.path.join(work_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
+
+    save_path = os.path.join(img_dir, save_name)
+    with open(save_path, "wb") as f:
+        f.write(image_bytes)
+
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    return {
+        "status": "success",
+        "message": f"Image generated and saved as images/{save_name}",
+        "filename": f"images/{save_name}",
+        "image_base64": b64_image
+    }
 
 
 # Models tried in priority order. If one is rate-limited (429) or unavailable

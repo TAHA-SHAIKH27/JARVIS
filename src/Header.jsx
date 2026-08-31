@@ -1,13 +1,14 @@
 import React from 'react';
-import { Settings, Mic, MicOff } from 'lucide-react';
+import { Settings, Mic, MicOff, Brain, X } from 'lucide-react';
 
-export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled }) {
+export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled, agentMode, setAgentMode, agentStatus }) {
   let statusLabel = 'ONLINE';
   let statusClass = '';
   if (!online) statusLabel = 'OFFLINE', statusClass = 'offline';
   else if (busy) statusLabel = 'PROCESSING', statusClass = 'busy';
   else if (isSpeaking) statusLabel = 'SPEAKING', statusClass = 'awake';
   else if (voiceActive) statusLabel = 'LISTENING', statusClass = 'awake';
+  else if (agentMode) statusLabel = 'AGENT', statusClass = 'agent';
 
   return (
     <div className="topbar-header">
@@ -36,7 +37,15 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
         </button>
 
         <button
-          className="icon-btn"
+          className={`icon-btn ${agentMode ? 'active' : ''}`}
+          onClick={() => setAgentMode(!agentMode)}
+          title={agentMode ? 'Exit Agent Mode' : 'Enter Agent Mode'}
+        >
+          {agentMode ? <X size={15} /> : <Brain size={15} />}
+        </button>
+
+        <button
+          className={`icon-btn ${voiceEnabled ? 'active' : ''}`}
           onClick={() => setVoiceEnabled(v => !v)}
           title={voiceEnabled ? 'Voice on' : 'Voice off'}
         >
@@ -47,6 +56,12 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
           <Settings size={15} />
         </button>
       </div>
+
+      {agentMode && (
+        <div className="agent-status-bar">
+          <span>Agent: {agentStatus}</span>
+        </div>
+      )}
     </div>
   );
 }

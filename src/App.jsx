@@ -1,689 +1,734 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
-import {
-  Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
-  Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
-  File as FileIcon, Folder, X, RotateCcw,
-  Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
-  Mic, MicOff
-} from 'lucide-react'
-import Header from './Header';
-import Telemetry from './Telemetry';
-import CommandGrid from './CommandGrid';
-import CoreSphere from './CoreSphere';
-import PhonePanel from './PhonePanel';
-import PhoneMirrorPage from './PhoneMirrorPage';
-import GalleryPage from './GalleryPage';
-import { useVoice } from './hooks/useVoice';
-
-function formatBytes(n) {
-  if (!n) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
-  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
-}
-
-function TimerWidget({ timerData, onCancel }) {
-  const [remaining, setRemaining] = useState(timerData.seconds)
-  const totalRef = useRef(timerData.seconds)
-  const intervalRef = useRef(null)
-
-  useEffect(() => {
-    setRemaining(timerData.seconds)
-    totalRef.current = timerData.seconds
-    if (intervalRef.current) clearInterval(intervalRef.current)
-    intervalRef.current = setInterval(() => {
-      setRemaining(r => {
-        if (r <= 1) { clearInterval(intervalRef.current); return 0 }
-        return r - 1
-      })
-    }, 1000)
-    return () => clearInterval(intervalRef.current)
-  }, [timerData])
-
-  const h = Math.floor(remaining / 3600)
-  const m = Math.floor((remaining % 3600) / 60)
-  const s = remaining % 60
-  const display = h > 0
-    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-  const pct = totalRef.current > 0 ? (remaining / totalRef.current) * 100 : 0
-  const urgent = remaining <= 30 && remaining > 0
-  const done = remaining === 0
-
-  return (
-    <div className="timer-strip">
-      <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
-      <div className="timer-info">
-        <div className="timer-label">{timerData.label || 'TIMER'}</div>
-        <div className={`timer-countdown ${urgent ? 'urgent' : ''}`}>
-          {done ? "TIME'S UP!" : display}
-        </div>
-        <div className="timer-bar-wrap">
-          <div className="timer-bar-fill" style={{ width: `${pct}%` }} />
-        </div>
-      </div>
-      <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
-    </div>
-  )
-}
-
-export default function App() {
-  const [online, setOnline] = useState(true)
-  const [busy, setBusy] = useState(false)
-  const [stats, setStats] = useState({ cpu: 0, memory: 0, disk: 0, processes: [] })
-  const [files, setFiles] = useState([])
-  const [messages, setMessages] = useState([
-    { role: 'jarvis', text: 'All systems online, sir. I am at your disposal.' }
-  ])
-  const [prompt, setPrompt] = useState('')
-  const [fileData, setFileData] = useState(null)
-  const [imageData, setImageData] = useState(null)
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const [geminiKey, setGeminiKey] = useState('')
-  const [hfKey, setHfKey] = useState('')
-  const [geminiProjectId, setGeminiProjectId] = useState('')
-  const [groqKey, setGroqKey] = useState('')
-  const [saveNote, setSaveNote] = useState('')
-  const [googleLinked, setGoogleLinked] = useState(null)
-  const [oauthBusy, setOauthBusy] = useState(false)
-  const [oauthMsg, setOauthMsg] = useState('')
-  const [logs, setLogs] = useState([])
-  const [chatMode, setChatMode] = useState(false)
-  const [pendingImage, setPendingImage] = useState(null)
-  const [pendingDocument, setPendingDocument] = useState(null)
-  const [extracting, setExtracting] = useState(false)
-  const [isSpeaking, setIsSpeaking] = useState(false)
-  const [timerData, setTimerData] = useState(null)
-  const [booting, setBooting] = useState(true)
-  const [activeView, setActiveView] = useState('core')
-
-  useEffect(() => {
-    const timer = setTimeout(() => setBooting(false), 4000)
-    return () => clearTimeout(timer)
-  }, [])
-
-  useEffect(() => {
-    if (!booting) return
-    const AudioCtx = window.AudioContext || window.webkitAudioContext
-    if (!AudioCtx) return
-
-    const ctx = new AudioCtx()
-    const timers = []
-    const at = (delay, sound) => timers.push(window.setTimeout(sound, delay))
-    const tone = (when, frequency, duration, volume, type = 'sine', endFrequency = frequency) => {
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      const filter = ctx.createBiquadFilter()
-      const start = ctx.currentTime
-      osc.type = type
-      osc.frequency.setValueAtTime(frequency, start)
-      osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration)
-      filter.type = 'lowpass'
-      filter.frequency.setValueAtTime(2600, start)
-      gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(volume, start + Math.min(0.04, duration * 0.2))
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-      osc.connect(filter)
-      filter.connect(gain)
-      gain.connect(ctx.destination)
-      osc.start(start)
-      osc.stop(start + duration + 0.02)
-    }
-    const noise = (when, duration, volume) => {
-      const buffer = ctx.createBuffer(1, ctx.sampleRate * duration, ctx.sampleRate)
-      const data = buffer.getChannelData(0)
-      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length)
-      const source = ctx.createBufferSource()
-      const filter = ctx.createBiquadFilter()
-      const gain = ctx.createGain()
-      const start = ctx.currentTime
-      source.buffer = buffer
-      filter.type = 'bandpass'
-      filter.frequency.setValueAtTime(1500, start)
-      filter.frequency.exponentialRampToValueAtTime(4200, start + duration)
-      gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(volume, start + 0.015)
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-      source.connect(filter)
-      filter.connect(gain)
-      gain.connect(ctx.destination)
-      source.start(start)
-      source.stop(start + duration)
-    }
-
-    at(620, () => tone(0, 58, 0.32, 0.018, 'sine', 72))
-    at(700, () => noise(0, 0.32, 0.035))
-    at(700, () => tone(0, 180, 0.28, 0.025, 'triangle', 90))
-    at(1280, () => tone(0, 1100, 0.045, 0.035, 'square', 760))
-    at(1400, () => tone(0, 62, 0.36, 0.12, 'sine', 38))
-    at(1420, () => tone(0, 240, 0.42, 0.045, 'sawtooth', 1180))
-    at(1650, () => tone(0, 82, 0.3, 0.055, 'sine', 58))
-    at(1950, () => tone(0, 780, 0.3, 0.035, 'sine', 1320))
-    at(2100, () => tone(0, 1046, 0.42, 0.024, 'sine', 1318))
-
-    void ctx.resume().catch(() => {})
-    return () => {
-      timers.forEach(window.clearTimeout)
-      window.setTimeout(() => { void ctx.close() }, 2400)
-    }
-  }, [booting])
-
-  // New voice system
-  const voiceHook = useVoice({
-    onTranscript: (event) => {
-      // onTranscript only adds the user bubble — actual command execution
-      // happens via runVoiceCommand (set on _setExecuteCommand below)
-      if (event.type === 'final') {
-        setMessages(m => [...m, { role: 'user', text: event.text }]);
-      }
-    },
-    onError: (error) => {
-      setMessages(m => [...m, { role: 'jarvis', text: `Voice error: ${error}` }]);
-    },
-  });
-
-  const {
-    isListening: voiceActive,
-    isWakeDetected,
-    isProcessing,
-    isSpeaking: ttsSpeaking,
-    transcript,
-    partialTranscript,
-    latency,
-    startListening,
-    stopListening,
-    toggleListening,
-    isPushToTalkActive,
-    startPushToTalk,
-    stopPushToTalk,
-    _setExecuteCommand,
-  } = voiceHook;
-
-  // runVoiceCommand: like runCommand but does NOT add a user bubble
-  // (the voice hook already adds it via onTranscript)
-  async function runVoiceCommand(text) {
-    if (!text.trim() || busy) return
-    setBusy(true)
-    try {
-      const res = await fetch('/api/command', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
-        setBusy(false)
-        return
-      }
-      const data = await res.json()
-      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
-      speak(data.speak)
-      setLogs(data.logs || [])
-      setFileData(data.file_data || null)
-      setImageData(data.image_data || null)
-      if (data.timer_data) setTimerData(data.timer_data)
-      if (data.refresh_files) refreshFiles()
-      const logLines = data.logs || []
-
-    } catch {
-      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  // Wire the execute command ref in the hook so auto-silence PTT can execute commands
-  useEffect(() => {
-    _setExecuteCommand?.(runVoiceCommand);
-  }, [_setExecuteCommand])
-
-  async function togglePushToTalk() {
-    if (isPushToTalkActive) {
-      // stopPushToTalk fires onTranscript (user bubble) + executeCommandRef (JARVIS reply)
-      // We just stop it — execution is handled inside the hook via executeCommandRef
-      await stopPushToTalk();
-    } else {
-      await startPushToTalk();
-    }
-  }
-
-  const chatEndRef = useRef(null)
-  const fileInputRef = useRef(null)
-  const runCommandRef = useRef(() => { })
-
-  function playBeep() {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext
-    if (!AudioCtx) return
-    const ctx = new AudioCtx()
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.connect(gain)
-    gain.connect(ctx.destination)
-    osc.frequency.value = 800
-    gain.gain.setValueAtTime(0.3, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.1)
-  }
-
-  const refreshStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/status')
-      setOnline(res.ok)
-    } catch {
-      setOnline(false)
-    }
-  }, [])
-
-  const refreshStats = useCallback(async () => {
-    try {
-      const res = await fetch('/api/stats')
-      if (res.ok) setStats(await res.json())
-    } catch { }
-  }, [])
-
-  const refreshFiles = useCallback(async () => {
-    try {
-      const res = await fetch('/api/files')
-      if (res.ok) {
-        const data = await res.json()
-        setFiles(data.files || [])
-      }
-    } catch { }
-  }, [])
-
-  useEffect(() => {
-    refreshStatus()
-    refreshStats()
-    refreshFiles()
-    const statusTimer = setInterval(refreshStatus, 8000)
-    const statsTimer = setInterval(refreshStats, 4000)
-    return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
-  }, [refreshStatus, refreshStats, refreshFiles])
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  useEffect(() => {
-    fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => {
-      if (cfg) {
-        setGeminiKey(cfg.gemini_api_key || '')
-        setHfKey(cfg.huggingface_api_key || '')
-        setGeminiProjectId(cfg.gemini_project_id || '')
-        setGroqKey(cfg.groq_api_key || '')
-      }
-    }).catch(() => { })
-  }, [])
-
-  const refreshOAuthStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/oauth/status')
-      if (res.ok) {
-        const data = await res.json()
-        setGoogleLinked(!!data.authenticated)
-      } else {
-        setGoogleLinked(false)
-      }
-    } catch {
-      setGoogleLinked(false)
-    }
-  }, [])
-
-  useEffect(() => { refreshOAuthStatus() }, [refreshOAuthStatus])
-  useEffect(() => { if (settingsOpen) refreshOAuthStatus() }, [settingsOpen, refreshOAuthStatus])
-
-  useEffect(() => { runCommandRef.current = chatMode ? runStreamingChat : runCommand })
-
-  function speak(text) {
-    if (!text || !window.speechSynthesis) return
-    window.speechSynthesis.cancel()
-    const utter = new SpeechSynthesisUtterance(text)
-    utter.rate = 1
-    utter.pitch = 0.85
-    utter.onstart = () => setIsSpeaking(true)
-    utter.onend = () => setIsSpeaking(false)
-    utter.onerror = () => setIsSpeaking(false)
-    window.speechSynthesis.speak(utter)
-  }
-
-  function toggleVoice() {
-    toggleListening()
-  }
-
-  async function runCommand(text) {
-    if (!text.trim() || busy) return
-    setMessages(m => [...m, { role: 'user', text }])
-    setPrompt('')
-    setBusy(true)
-    try {
-      const res = await fetch('/api/command', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
-        setBusy(false)
-        return
-      }
-      const data = await res.json()
-      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
-      speak(data.speak)
-      setLogs(data.logs || [])
-      setFileData(data.file_data || null)
-      setImageData(data.image_data || null)
-      if (data.timer_data) setTimerData(data.timer_data)
-      if (data.refresh_files) refreshFiles()
-      const logLines = data.logs || []
-
-    } catch {
-      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function runStreamingChat(text) {
-    if (!text.trim() || busy) return
-    setMessages(m => [...m, { role: 'user', text }, { role: 'jarvis', text: '' }])
-    setPrompt('')
-    setBusy(true)
-    try {
-      const res = await fetch('/api/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
-      })
-      if (!res.ok || !res.body) {
-        setMessages(m => {
-          const copy = [...m]
-          copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir.' }
-          return copy
-        })
-        return
-      }
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let full = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => {
-          const copy = [...m]
-          copy[copy.length - 1] = { role: 'jarvis', text: full }
-          return copy
-        })
-      }
-      if (full) speak(full)
-    } catch {
-      setMessages(m => {
-        const copy = [...m]
-        copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }
-        return copy
-      })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  function handleFileSelect(e) {
-    const file = e.target.files?.[0]
-    e.target.value = ''
-    if (!file) return
-
-    if (file.type.startsWith('image/')) {
-      setPendingDocument(null)
-      const reader = new FileReader()
-      reader.onload = () => {
-        const dataUrl = reader.result
-        const base64 = dataUrl.split(',')[1] || ''
-        setPendingImage({ base64, mimeType: file.type, previewUrl: dataUrl, fileName: file.name })
-      }
-      reader.readAsDataURL(file)
-      return
-    }
-
-    setPendingImage(null)
-    setExtracting(true)
-    const formData = new FormData()
-    formData.append('file', file)
-    fetch('/api/document/extract', { method: 'POST', body: formData })
-      .then(async res => {
-        const data = await res.json().catch(() => ({}))
-        if (res.ok) {
-          setPendingDocument({ text: data.text, fileName: file.name, charCount: data.char_count, truncated: data.truncated })
-        } else {
-          setMessages(m => [...m, { role: 'jarvis', text: data.detail || `I couldn't read ${file.name}, sir.` }])
-        }
-      })
-      .catch(() => {
-        setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection while uploading that file, sir.' }])
-      })
-      .finally(() => setExtracting(false))
-  }
-
-  async function runDocumentAnalysis(text, doc) {
-    if (busy || !doc) return
-    const questionText = text.trim() || 'Summarize this document for me, sir, and note any key points.'
-    setMessages(m => [...m, { role: 'user', text: questionText, docName: doc.fileName }, { role: 'jarvis', text: '' }])
-    setPrompt('')
-    setPendingDocument(null)
-    setBusy(true)
-    try {
-      const res = await fetch('/api/document/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ document_text: doc.text, filename: doc.fileName, prompt: questionText })
-      })
-      if (!res.ok || !res.body) {
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection.' }; return copy })
-        return
-      }
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let full = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
-      }
-      if (full) speak(full)
-    } catch {
-      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function runImageAnalysis(text, image) {
-    if (busy || !image) return
-    const questionText = text.trim() || 'Describe this image in detail, sir.'
-    setMessages(m => [...m, { role: 'user', text: questionText, image: image.previewUrl }, { role: 'jarvis', text: '' }])
-    setPrompt('')
-    setPendingImage(null)
-    setBusy(true)
-    try {
-      const res = await fetch('/api/vision/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_base64: image.base64, mime_type: image.mimeType, prompt: questionText })
-      })
-      if (!res.ok || !res.body) {
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
-        return
-      }
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let full = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
-      }
-      if (full) speak(full)
-    } catch {
-      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  function handleSend() {
-    if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
-    if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
-    if (chatMode) runStreamingChat(prompt)
-    else runCommand(prompt)
-  }
-
-  async function saveKeys() {
-    try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gemini_api_key: geminiKey,
-          huggingface_api_key: hfKey,
-          gemini_project_id: geminiProjectId,
-          groq_api_key: groqKey
-        })
-      })
-      if (res.ok) {
-        setSaveNote('Configuration saved.')
-        setTimeout(() => setSaveNote(''), 2500)
-      }
-    } catch {
-      setSaveNote('Save failed ΓÇö check connection.')
-    }
-  }
-
-  async function linkGoogle() {
-    setOauthBusy(true)
-    setOauthMsg('Opening browser to sign in with GoogleΓÇª')
-    try {
-      const res = await fetch('/api/oauth/login', { method: 'POST' })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) { setOauthMsg(data.message || 'Google account linked.'); setGoogleLinked(true) }
-      else setOauthMsg(data.detail || 'Failed to link Google account.')
-    } catch {
-      setOauthMsg('Could not reach the core service.')
-    } finally {
-      setOauthBusy(false)
-      setTimeout(() => setOauthMsg(''), 5000)
-    }
-  }
-
-  async function unlinkGoogle() {
-    setOauthBusy(true)
-    try {
-      const res = await fetch('/api/oauth/logout', { method: 'POST' })
-      const data = await res.json().catch(() => ({}))
-      setOauthMsg(data.message || 'Google account unlinked.')
-      setGoogleLinked(false)
-    } catch {
-      setOauthMsg('Could not reach the core service.')
-    } finally {
-      setOauthBusy(false)
-      setTimeout(() => setOauthMsg(''), 3500)
-    }
-  }
-
-  async function deleteFile(path) {
-    try {
-      const res = await fetch(`/api/files/delete?filename=${encodeURIComponent(path)}`, { method: 'DELETE' })
-      if (res.ok) refreshFiles()
-    } catch { }
-  }
-
-  async function viewFile(path) {
-    try {
-      const res = await fetch(`/api/files/read?filename=${encodeURIComponent(path)}`)
-      if (res.ok) {
-        const data = await res.json()
-        setImageData(null)
-        setFileData({ filename: data.filename, content: data.content })
-      }
-    } catch { }
-  }
-
-  const quickActions = [
-    { label: 'Screenshot', icon: Camera, cmd: 'take a screenshot' },
-    { label: 'Phone Mirroring', icon: Smartphone, cmd: 'mirror phone' },
-    { label: 'PC Health', icon: Activity, cmd: 'check pc health' },
-    { label: 'Vol +', icon: Volume2, cmd: 'volume up' },
-    { label: 'Vol -', icon: Volume1, cmd: 'volume down' },
-    { label: 'Mute', icon: VolumeX, cmd: 'mute' },
-    { label: 'Play/Pause', icon: Play, cmd: 'play pause' },
-    { label: 'Next Track', icon: SkipForward, cmd: 'next track' },
-    { label: 'Prev Track', icon: SkipBack, cmd: 'previous track' },
-    { label: 'Weather', icon: Cloud, cmd: 'weather in London' },
-    { label: 'Date/Time', icon: Clock, cmd: 'what time is it' },
-    { label: 'Battery', icon: Battery, cmd: 'battery status' },
-    { label: 'Network', icon: Wifi, cmd: 'network info' },
-    { label: 'Lock PC', icon: Lock, cmd: 'lock screen' },
-    { label: 'Sleep', icon: Moon, cmd: 'sleep' },
-    { label: 'Restart', icon: RefreshCw, cmd: 'restart the pc' },
-    { label: 'Shutdown', icon: Power, cmd: 'shutdown' },
-    { label: 'Clear Chat', icon: RotateCcw, cmd: 'clear chat' },
-  ]
-
-  const sphereState = ttsSpeaking ? 'speaking' : (busy || isProcessing) ? 'processing' : (voiceActive || isPushToTalkActive) ? 'listening' : isWakeDetected ? 'wake' : 'idle'
-
-  return (
-    <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
-      {/* ── Full-page overlays (Phone / Gallery) ── */}
-      {activeView === 'phone' && (
-        <PhoneMirrorPage
-          setActiveView={setActiveView}
-          messages={messages}
-          prompt={prompt}
-          setPrompt={setPrompt}
-          busy={busy}
-          handleSend={handleSend}
-          isPushToTalkActive={isPushToTalkActive}
-          togglePushToTalk={togglePushToTalk}
-          fileInputRef={fileInputRef}
-          pendingImage={pendingImage}
-          setPendingImage={setPendingImage}
-          pendingDocument={pendingDocument}
-          setPendingDocument={setPendingDocument}
-          extracting={extracting}
-        />
-      )}
-      {activeView === 'files' && (
-        <GalleryPage setActiveView={setActiveView} />
-      )}
-
-      {/* ── Core view (hidden when phone/files active) ── */}
-      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
-
-      {/* TOP BAR */}
-      <Header
-        online={online}
-        busy={busy}
-        chatMode={chatMode}
-        setChatMode={setChatMode}
-        isSpeaking={ttsSpeaking}
-        onOpenSettings={() => setSettingsOpen(true)}
-        voiceActive={voiceActive}
-        toggleVoice={toggleVoice}
-        voiceEnabled={true}
-        setVoiceEnabled={() => { }}
-      />
-
-      {/* MAIN 3-COLUMN GRID */}
-      <nav className="module-rail" aria-label="JARVIS modules">
-        <button className={activeView === 'core' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('core')}><Activity size={16} /><span>CORE</span></button>
-        <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
-        <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
-      </nav>
-      <div className="hud-grid">
+import React, { useState, useEffect, useRef, useCallback } from 'react'
+import {
+  Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
+  Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
+  File as FileIcon, Folder, X, RotateCcw,
+  Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
+  Mic, MicOff, Brain
+} from 'lucide-react'
+import Header from './Header';
+import Telemetry from './Telemetry';
+import CommandGrid from './CommandGrid';
+import CoreSphere from './CoreSphere';
+import PhonePanel from './PhonePanel';
+import PhoneMirrorPage from './PhoneMirrorPage';
+import GalleryPage from './GalleryPage';
+import { useVoice } from './hooks/useVoice';
+
+function formatBytes(n) {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let i = 0
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function TimerWidget({ timerData, onCancel }) {
+  const [remaining, setRemaining] = useState(timerData.seconds)
+  const totalRef = useRef(timerData.seconds)
+  const intervalRef = useRef(null)
+
+  useEffect(() => {
+    setRemaining(timerData.seconds)
+    totalRef.current = timerData.seconds
+    if (intervalRef.current) clearInterval(intervalRef.current)
+    intervalRef.current = setInterval(() => {
+      setRemaining(r => {
+        if (r <= 1) { clearInterval(intervalRef.current); return 0 }
+        return r - 1
+      })
+    }, 1000)
+    return () => clearInterval(intervalRef.current)
+  }, [timerData])
+
+  const h = Math.floor(remaining / 3600)
+  const m = Math.floor((remaining % 3600) / 60)
+  const s = remaining % 60
+  const display = h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  const pct = totalRef.current > 0 ? (remaining / totalRef.current) * 100 : 0
+  const urgent = remaining <= 30 && remaining > 0
+  const done = remaining === 0
+
+  return (
+    <div className="timer-strip">
+      <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
+      <div className="timer-info">
+        <div className="timer-label">{timerData.label || 'TIMER'}</div>
+        <div className={`timer-countdown ${urgent ? 'urgent' : ''}`}>
+          {done ? "TIME'S UP!" : display}
+        </div>
+        <div className="timer-bar-wrap">
+          <div className="timer-bar-fill" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+      <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
+    </div>
+  )
+}
+
+export default function App() {
+  const [online, setOnline] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [stats, setStats] = useState({ cpu: 0, memory: 0, disk: 0, processes: [] })
+  const [files, setFiles] = useState([])
+  const [messages, setMessages] = useState([
+    { role: 'jarvis', text: 'All systems online, sir. I am at your disposal.' }
+  ])
+  const [prompt, setPrompt] = useState('')
+  const [fileData, setFileData] = useState(null)
+  const [imageData, setImageData] = useState(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [geminiKey, setGeminiKey] = useState('')
+  const [hfKey, setHfKey] = useState('')
+  const [geminiProjectId, setGeminiProjectId] = useState('')
+  const [groqKey, setGroqKey] = useState('')
+  const [saveNote, setSaveNote] = useState('')
+  const [googleLinked, setGoogleLinked] = useState(null)
+  const [oauthBusy, setOauthBusy] = useState(false)
+  const [oauthMsg, setOauthMsg] = useState('')
+  const [logs, setLogs] = useState([])
+  const [chatMode, setChatMode] = useState(false)
+  const [pendingImage, setPendingImage] = useState(null)
+  const [pendingDocument, setPendingDocument] = useState(null)
+  const [extracting, setExtracting] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const [timerData, setTimerData] = useState(null)
+  const [booting, setBooting] = useState(true)
+  const [activeView, setActiveView] = useState('core')
+const [agentMode, setAgentMode] = useState(false)
+const [agentStatus, setAgentStatus] = useState('ready')
+  const [voiceEnabled, setVoiceEnabled] = useState(true)
+
+  useEffect(() => {
+    const timer = setTimeout(() => setBooting(false), 4000)
+    return () => clearTimeout(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!booting) return
+    const AudioCtx = window.AudioContext || window.webkitAudioContext
+    if (!AudioCtx) return
+
+    const ctx = new AudioCtx()
+    const timers = []
+    const at = (delay, sound) => timers.push(window.setTimeout(sound, delay))
+    const tone = (when, frequency, duration, volume, type = 'sine', endFrequency = frequency) => {
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      const filter = ctx.createBiquadFilter()
+      const start = ctx.currentTime
+      osc.type = type
+      osc.frequency.setValueAtTime(frequency, start)
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration)
+      filter.type = 'lowpass'
+      filter.frequency.setValueAtTime(2600, start)
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(volume, start + Math.min(0.04, duration * 0.2))
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+      osc.connect(filter)
+      filter.connect(gain)
+      gain.connect(ctx.destination)
+      osc.start(start)
+      osc.stop(start + duration + 0.02)
+    }
+    const noise = (when, duration, volume) => {
+      const buffer = ctx.createBuffer(1, ctx.sampleRate * duration, ctx.sampleRate)
+      const data = buffer.getChannelData(0)
+      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length)
+      const source = ctx.createBufferSource()
+      const filter = ctx.createBiquadFilter()
+      const gain = ctx.createGain()
+      const start = ctx.currentTime
+      source.buffer = buffer
+      filter.type = 'bandpass'
+      filter.frequency.setValueAtTime(1500, start)
+      filter.frequency.exponentialRampToValueAtTime(4200, start + duration)
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(volume, start + 0.015)
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+      source.connect(filter)
+      filter.connect(gain)
+      gain.connect(ctx.destination)
+      source.start(start)
+      source.stop(start + duration)
+    }
+
+    at(620, () => tone(0, 58, 0.32, 0.018, 'sine', 72))
+    at(700, () => noise(0, 0.32, 0.035))
+    at(700, () => tone(0, 180, 0.28, 0.025, 'triangle', 90))
+    at(1280, () => tone(0, 1100, 0.045, 0.035, 'square', 760))
+    at(1400, () => tone(0, 62, 0.36, 0.12, 'sine', 38))
+    at(1420, () => tone(0, 240, 0.42, 0.045, 'sawtooth', 1180))
+    at(1650, () => tone(0, 82, 0.3, 0.055, 'sine', 58))
+    at(1950, () => tone(0, 780, 0.3, 0.035, 'sine', 1320))
+    at(2100, () => tone(0, 1046, 0.42, 0.024, 'sine', 1318))
+
+    void ctx.resume().catch(() => {})
+    return () => {
+      timers.forEach(window.clearTimeout)
+      window.setTimeout(() => { void ctx.close() }, 2400)
+    }
+  }, [booting])
+
+  // New voice system
+  const voiceHook = useVoice({
+    onTranscript: (event) => {
+      // onTranscript only adds the user bubble — actual command execution
+      // happens via runVoiceCommand (set on _setExecuteCommand below)
+      if (event.type === 'final') {
+        setMessages(m => [...m, { role: 'user', text: event.text }]);
+      }
+    },
+    onError: (error) => {
+      setMessages(m => [...m, { role: 'jarvis', text: `Voice error: ${error}` }]);
+    },
+  });
+
+  const {
+    isListening: voiceActive,
+    isWakeDetected,
+    isProcessing,
+    isSpeaking: ttsSpeaking,
+    transcript,
+    partialTranscript,
+    latency,
+    startListening,
+    stopListening,
+    toggleListening,
+    isPushToTalkActive,
+    startPushToTalk,
+    stopPushToTalk,
+    _setExecuteCommand,
+  } = voiceHook;
+
+  // runVoiceCommand: like runCommand but does NOT add a user bubble
+  // (the voice hook already adds it via onTranscript)
+  async function runVoiceCommand(text) {
+    if (!text.trim() || busy) return
+    setBusy(true)
+    try {
+      const res = await fetch('/api/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: text })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
+        setBusy(false)
+        return
+      }
+      const data = await res.json()
+      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
+      speak(data.speak)
+      setLogs(data.logs || [])
+      setFileData(data.file_data || null)
+      setImageData(data.image_data || null)
+      if (data.timer_data) setTimerData(data.timer_data)
+      if (data.refresh_files) refreshFiles()
+      const logLines = data.logs || []
+
+    } catch {
+      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Wire the execute command ref in the hook so auto-silence PTT can execute commands
+  useEffect(() => {
+    _setExecuteCommand?.(runVoiceCommand);
+  }, [_setExecuteCommand])
+
+  async function togglePushToTalk() {
+    if (isPushToTalkActive) {
+      // stopPushToTalk fires onTranscript (user bubble) + executeCommandRef (JARVIS reply)
+      // We just stop it — execution is handled inside the hook via executeCommandRef
+      await stopPushToTalk();
+    } else {
+      await startPushToTalk();
+    }
+  }
+
+  const chatEndRef = useRef(null)
+  const fileInputRef = useRef(null)
+  const runCommandRef = useRef(() => { })
+
+  function playBeep() {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext
+    if (!AudioCtx) return
+    const ctx = new AudioCtx()
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    osc.frequency.value = 800
+    gain.gain.setValueAtTime(0.3, ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1)
+    osc.start(ctx.currentTime)
+    osc.stop(ctx.currentTime + 0.1)
+  }
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/status')
+      setOnline(res.ok)
+    } catch {
+      setOnline(false)
+    }
+  }, [])
+
+  const refreshStats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/stats')
+      if (res.ok) setStats(await res.json())
+    } catch { }
+  }, [])
+
+  const refreshFiles = useCallback(async () => {
+    try {
+      const res = await fetch('/api/files')
+      if (res.ok) {
+        const data = await res.json()
+        setFiles(data.files || [])
+      }
+    } catch { }
+  }, [])
+
+  useEffect(() => {
+    refreshStatus()
+    refreshStats()
+    refreshFiles()
+    const statusTimer = setInterval(refreshStatus, 8000)
+    const statsTimer = setInterval(refreshStats, 4000)
+    return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
+  }, [refreshStatus, refreshStats, refreshFiles])
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  useEffect(() => {
+    fetch('/api/config').then(r => r.ok ? r.json() : null).then(cfg => {
+      if (cfg) {
+        setGeminiKey(cfg.gemini_api_key || '')
+        setHfKey(cfg.huggingface_api_key || '')
+        setGeminiProjectId(cfg.gemini_project_id || '')
+        setGroqKey(cfg.groq_api_key || '')
+      }
+    }).catch(() => { })
+  }, [])
+
+  const refreshOAuthStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/oauth/status')
+      if (res.ok) {
+        const data = await res.json()
+        setGoogleLinked(!!data.authenticated)
+      } else {
+        setGoogleLinked(false)
+      }
+    } catch {
+      setGoogleLinked(false)
+    }
+  }, [])
+
+  useEffect(() => { refreshOAuthStatus() }, [refreshOAuthStatus])
+  useEffect(() => { if (settingsOpen) refreshOAuthStatus() }, [settingsOpen, refreshOAuthStatus])
+
+  useEffect(() => { runCommandRef.current = chatMode ? runStreamingChat : runCommand })
+
+  function speak(text) {
+    if (!voiceEnabled || !text || !window.speechSynthesis) return
+    window.speechSynthesis.cancel()
+    const utter = new SpeechSynthesisUtterance(text)
+    utter.rate = 1
+    utter.pitch = 0.85
+    utter.onstart = () => setIsSpeaking(true)
+    utter.onend = () => setIsSpeaking(false)
+    utter.onerror = () => setIsSpeaking(false)
+    window.speechSynthesis.speak(utter)
+  }
+
+  function toggleVoice() {
+    toggleListening()
+  }
+
+  async function runCommand(text) {
+    if (!text.trim() || busy) return
+    // Handle agent mode toggle
+    if (text.trim().toLowerCase() === 'toggle agent') {
+      setAgentMode(!agentMode)
+      setMessages(m => [...m, { role: 'jarvis', text: "Agent mode " + (agentMode ? 'deactivated' : 'activated') + ", sir." }])
+      setPrompt('')
+      setBusy(false)
+      return
+    }
+    setMessages(m => [...m, { role: 'user', text }])
+    setPrompt('')
+    setBusy(true)
+    try {
+      const res = await fetch('/api/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: text })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
+        setBusy(false)
+        return
+      }
+      const data = await res.json()
+      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
+      speak(data.speak)
+      setLogs(data.logs || [])
+      setFileData(data.file_data || null)
+      setImageData(data.image_data || null)
+      if (data.timer_data) setTimerData(data.timer_data)
+      if (data.refresh_files) refreshFiles()
+      const logLines = data.logs || []
+
+    } catch {
+      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runStreamingChat(text) {
+    if (!text.trim() || busy) return
+    setMessages(m => [...m, { role: 'user', text }, { role: 'jarvis', text: '' }])
+    setPrompt('')
+    setBusy(true)
+    try {
+      const res = await fetch('/api/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: text })
+      })
+      if (!res.ok || !res.body) {
+        setMessages(m => {
+          const copy = [...m]
+          copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir.' }
+          return copy
+        })
+        return
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let full = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        full += decoder.decode(value, { stream: true })
+        setMessages(m => {
+          const copy = [...m]
+          copy[copy.length - 1] = { role: 'jarvis', text: full }
+          return copy
+        })
+      }
+      if (full) speak(full)
+    } catch {
+      setMessages(m => {
+        const copy = [...m]
+        copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }
+        return copy
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function handleFileSelect(e) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+
+    if (file.type.startsWith('image/')) {
+      setPendingDocument(null)
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUrl = reader.result
+        const base64 = dataUrl.split(',')[1] || ''
+        setPendingImage({ base64, mimeType: file.type, previewUrl: dataUrl, fileName: file.name })
+      }
+      reader.readAsDataURL(file)
+      return
+    }
+
+    setPendingImage(null)
+    setExtracting(true)
+    const formData = new FormData()
+    formData.append('file', file)
+    fetch('/api/document/extract', { method: 'POST', body: formData })
+      .then(async res => {
+        const data = await res.json().catch(() => ({}))
+        if (res.ok) {
+          setPendingDocument({ text: data.text, fileName: file.name, charCount: data.char_count, truncated: data.truncated })
+        } else {
+          setMessages(m => [...m, { role: 'jarvis', text: data.detail || "I couldn't read " + file.name + ", sir." }])
+        }
+      })
+      .catch(() => {
+        setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection while uploading that file, sir.' }])
+      })
+      .finally(() => setExtracting(false))
+  }
+
+  async function runDocumentAnalysis(text, doc) {
+    if (busy || !doc) return
+    const questionText = text.trim() || 'Summarize this document for me, sir, and note any key points.'
+    setMessages(m => [...m, { role: 'user', text: questionText, docName: doc.fileName }, { role: 'jarvis', text: '' }])
+    setPrompt('')
+    setPendingDocument(null)
+    setBusy(true)
+    try {
+      const res = await fetch('/api/document/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document_text: doc.text, filename: doc.fileName, prompt: questionText })
+      })
+      if (!res.ok || !res.body) {
+        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection.' }; return copy })
+        return
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let full = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        full += decoder.decode(value, { stream: true })
+        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
+      }
+      if (full) speak(full)
+    } catch {
+      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runImageAnalysis(text, image) {
+    if (busy || !image) return
+    const questionText = text.trim() || 'Describe this image in detail, sir.'
+    setMessages(m => [...m, { role: 'user', text: questionText, image: image.previewUrl }, { role: 'jarvis', text: '' }])
+    setPrompt('')
+    setPendingImage(null)
+    setBusy(true)
+    try {
+      const res = await fetch('/api/vision/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_base64: image.base64, mime_type: image.mimeType, prompt: questionText })
+      })
+      if (!res.ok || !res.body) {
+        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+        return
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let full = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        full += decoder.decode(value, { stream: true })
+        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
+      }
+      if (full) speak(full)
+    } catch {
+      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function handleSend() {
+    if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
+    if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
+    if (chatMode) runStreamingChat(prompt)
+    else runCommand(prompt)
+  }
+
+  async function saveKeys() {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          gemini_api_key: geminiKey,
+          huggingface_api_key: hfKey,
+          gemini_project_id: geminiProjectId,
+          groq_api_key: groqKey
+        })
+      })
+      if (res.ok) {
+        setSaveNote('Configuration saved.')
+        setTimeout(() => setSaveNote(''), 2500)
+      }
+    } catch {
+      setSaveNote('Save failed ΓÇö check connection.')
+    }
+  }
+
+  async function linkGoogle() {
+    setOauthBusy(true)
+    setOauthMsg('Opening browser to sign in with GoogleΓÇª')
+    try {
+      const res = await fetch('/api/oauth/login', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) { setOauthMsg(data.message || 'Google account linked.'); setGoogleLinked(true) }
+      else setOauthMsg(data.detail || 'Failed to link Google account.')
+    } catch {
+      setOauthMsg('Could not reach the core service.')
+    } finally {
+      setOauthBusy(false)
+      setTimeout(() => setOauthMsg(''), 5000)
+    }
+  }
+
+  async function unlinkGoogle() {
+    setOauthBusy(true)
+    try {
+      const res = await fetch('/api/oauth/logout', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      setOauthMsg(data.message || 'Google account unlinked.')
+      setGoogleLinked(false)
+    } catch {
+      setOauthMsg('Could not reach the core service.')
+    } finally {
+      setOauthBusy(false)
+      setTimeout(() => setOauthMsg(''), 3500)
+    }
+  }
+
+  async function deleteFile(path) {
+    try {
+      const res = await fetch(`/api/files/delete?filename=${encodeURIComponent(path)}`, { method: 'DELETE' })
+      if (res.ok) refreshFiles()
+    } catch { }
+  }
+
+  async function viewFile(path) {
+    try {
+      const res = await fetch(`/api/files/read?filename=${encodeURIComponent(path)}`)
+      if (res.ok) {
+        const data = await res.json()
+        setImageData(null)
+        setFileData({ filename: data.filename, content: data.content })
+      }
+    } catch { }
+  }
+
+  const quickActions = [
+    { label: 'Screenshot', icon: Camera, cmd: 'take a screenshot' },
+    { label: 'Phone Mirroring', icon: Smartphone, cmd: 'mirror phone' },
+    { label: 'PC Health', icon: Activity, cmd: 'check pc health' },
+    { label: 'Vol +', icon: Volume2, cmd: 'volume up' },
+    { label: 'Vol -', icon: Volume1, cmd: 'volume down' },
+    { label: 'Mute', icon: VolumeX, cmd: 'mute' },
+    { label: 'Play/Pause', icon: Play, cmd: 'play pause' },
+    { label: 'Next Track', icon: SkipForward, cmd: 'next track' },
+    { label: 'Prev Track', icon: SkipBack, cmd: 'previous track' },
+    { label: 'Weather', icon: Cloud, cmd: 'weather in London' },
+    { label: 'Date/Time', icon: Clock, cmd: 'what time is it' },
+    { label: 'Battery', icon: Battery, cmd: 'battery status' },
+    { label: 'Network', icon: Wifi, cmd: 'network info' },
+    { label: 'Lock PC', icon: Lock, cmd: 'lock screen' },
+    { label: 'Sleep', icon: Moon, cmd: 'sleep' },
+    { label: 'Restart', icon: RefreshCw, cmd: 'restart the pc' },
+    { label: 'Shutdown', icon: Power, cmd: 'shutdown' },
+    { label: 'Clear Chat', icon: RotateCcw, cmd: 'clear chat' },
+    { label: 'Agent Mode', icon: Brain, cmd: 'toggle agent' },
+  ]
+
+  const sphereState = ttsSpeaking ? 'speaking' : (busy || isProcessing) ? 'processing' : (voiceActive || isPushToTalkActive) ? 'listening' : isWakeDetected ? 'wake' : 'idle'
+
+  // Agent event handlers
+  const handleAgentEvent = useCallback((event) => {
+    switch (event.type) {
+      case 'agent.started':
+        setAgentMode(true)
+        setAgentStatus('planning')
+        break
+      case 'agent.planning':
+        setAgentStatus('planning')
+        break
+      case 'agent.tool_started':
+        setAgentStatus('executing')
+        break
+      case 'agent.tool_finished':
+        setAgentStatus('observing')
+        break
+      case 'agent.observation':
+        setAgentStatus('observing')
+        break
+      case 'agent.error':
+        setAgentStatus('error')
+        setAgentMode(false)
+        break
+      case 'agent.completed':
+        setAgentStatus('completed')
+        setAgentMode(false)
+        break
+    }
+  }, [])
+
+  return (
+    <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      {/* ── Full-page overlays (Phone / Gallery) ── */}
+      {activeView === 'phone' && (
+        <PhoneMirrorPage
+          setActiveView={setActiveView}
+          messages={messages}
+          prompt={prompt}
+          setPrompt={setPrompt}
+          busy={busy}
+          handleSend={handleSend}
+          isPushToTalkActive={isPushToTalkActive}
+          togglePushToTalk={togglePushToTalk}
+          fileInputRef={fileInputRef}
+          pendingImage={pendingImage}
+          setPendingImage={setPendingImage}
+          pendingDocument={pendingDocument}
+          setPendingDocument={setPendingDocument}
+          extracting={extracting}
+        />
+      )}
+      {activeView === 'files' && (
+        <GalleryPage setActiveView={setActiveView} />
+      )}
+
+      {/* ── Core view (hidden when phone/files active) ── */}
+      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+
+      {/* TOP BAR */}
+<Header
+  online={online}
+  busy={busy}
+  chatMode={chatMode}
+  setChatMode={setChatMode}
+  isSpeaking={ttsSpeaking}
+  onOpenSettings={() => setSettingsOpen(true)}
+  voiceActive={voiceActive}
+  toggleVoice={toggleVoice}
+  voiceEnabled={voiceEnabled}
+  setVoiceEnabled={setVoiceEnabled}
+  agentMode={agentMode}
+  setAgentMode={setAgentMode}
+  agentStatus={agentStatus}
+/>
+
+      {/* MAIN 3-COLUMN GRID */}
+      <nav className="module-rail" aria-label="JARVIS modules">
+        <button className={activeView === 'core' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('core')}><Activity size={16} /><span>CORE</span></button>
+        <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
+        <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
+      </nav>
+      <div className="hud-grid">
 
         {/* ── LEFT COLUMN: Chat + File Bay ── */}
         <div className="hud-left">

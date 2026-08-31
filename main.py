@@ -51,6 +51,10 @@ import google_oauth
 import phone_control
 import whatsapp_ops
 import json
+import asyncio
+
+from backend.agent.core import AgentCore
+from backend.agent.state import TaskState
 
 app = FastAPI(title="J.A.R.V.I.S. Core", description="API Service for Windows OS Automation")
 
@@ -62,6 +66,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _start_ws_scrcpy():
+    """Launch ws-scrcpy on port 8080 for the embedded phone mirror.
+    Runs here (not just in the `python main.py` __main__ block) so it also
+    starts when uvicorn is invoked directly, e.g. via start_jarvis.py's
+    `python -m uvicorn main:app` subprocess call."""
+    import subprocess
+    ws_scrcpy_dir = os.path.join(os.path.dirname(__file__), "ws-scrcpy")
+    if not os.path.exists(ws_scrcpy_dir):
+        print("[ws-scrcpy] Directory not found, skipping (phone mirror embed will be unavailable).")
+        return
+    env = os.environ.copy()
+    env["PORT"] = "8080"
+    env["ADB"] = os.getenv("JARVIS_ADB_PATH", "adb")
+    try:
+        subprocess.Popen(
+            ["npm", "start"],
+            cwd=ws_scrcpy_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=True,
+        )
+        print("[ws-scrcpy] Started on port 8080")
+    except Exception as e:
+        print(f"[ws-scrcpy] Failed to start: {e}")
 
 # Configuration persistence
 CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json"))
@@ -1068,30 +1100,55 @@ def serve_work_file(path: str):
     return FileResponse(full_path, media_type=media_type)
 
 
-if __name__ == "__main__":
+# ── Agent endpoints ───────────────────────────────────────────────────────
+agent_core = AgentCore()
 
-    import uvicorn
-    import subprocess
-    import os
-    
-    # Start ws-scrcpy in the background
-    ws_scrcpy_dir = os.path.join(os.path.dirname(__file__), "ws-scrcpy")
-    if os.path.exists(ws_scrcpy_dir):
-        env = os.environ.copy()
-        env["PORT"] = "8080"
-        env["ADB"] = os.getenv("JARVIS_ADB_PATH", "adb")
-        try:
-            subprocess.Popen(
-                ["npm", "start"],
-                cwd=ws_scrcpy_dir,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=True
-            )
-            print("Started ws-scrcpy on port 8080")
-        except Exception as e:
-            print(f"Failed to start ws-scrcpy: {e}")
 
-    # Run server on port 8000
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+@app.post("/api/agent/execute")
+async def agent_execute(req: dict):
+    """Execute a natural language task through the agent core."""
+    task = req.get("text", "")
+    state = TaskState()
+    result = await agent_core.process(task, state)
+    return {"status": result.get("status", "error"), "data": result}
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    """Get the current agent state status."""
+    state = TaskState()
+    # Return basic status - full state would be maintained per-session
+    return {
+        "task": state.task,
+        "completed_steps": state.completed_steps,
+        "errors": state.errors,
+        "retry_count": state.retry_count,
+        "completion_status": state.completion_status
+    }
+
+
+@app.post("/api/agent/plan")
+async def agent_plan(req: dict):
+    """Generate a plan for a task."""
+    task = req.get("text", "")
+    state = TaskState()
+    from backend.agent.planner import Planner
+    planner = Planner()
+    steps = planner.plan_task(task, state)
+    return {"status": "success", "steps": steps, "task": task}
+
+
+@app.post("/api/agent/observation")
+async def agent_observation():
+    """Get current system observations."""
+    from backend.agent.observer import Observer
+    from backend.agent.registry import ToolRegistry
+    registry = ToolRegistry()
+    observer = Observer(registry)
+    # We can't fully observe without a state, but return basic info
+    from backend.system_ops import get_system_stats
+    stats = get_system_stats()
+    return {"status": "success", "stats": stats if "error" not in stats else {}}
+
+
+# ── Agent endpoints end ───────────────────────────────────────────────────

@@ -5,7 +5,33 @@ import {
   Camera, RotateCcw, Send, ImagePlus, Mic, Play
 } from 'lucide-react'
 
-const WS_SCRCPY_URL = 'http://localhost:8080'
+const WS_SCRCPY_HOST = 'localhost:8080'
+const WS_SCRCPY_URL = `http://${WS_SCRCPY_HOST}`
+// ws-scrcpy's internal ADB proxy port (fixed — see ws-scrcpy/src/common/Constants.ts SERVER_PORT)
+const WS_SCRCPY_ADB_PORT = 8886
+
+function buildStreamUrl(udid) {
+  const wsUrl = new URL(`ws://${WS_SCRCPY_HOST}/`)
+  wsUrl.searchParams.set('action', 'proxy-adb')
+  wsUrl.searchParams.set('remote', `tcp:${WS_SCRCPY_ADB_PORT}`)
+  wsUrl.searchParams.set('udid', udid)
+
+  const hash = new URLSearchParams({
+    action: 'stream',
+    udid,
+    // WebCodecsPlayer applies a CSS transform-scale down to a hardcoded
+    // 480x480 default bounds (top-left origin) unless larger video
+    // settings were previously saved via ws-scrcpy's own "Configure
+    // stream" page — that's what makes it render tiny in the corner and
+    // stutter on renegotiation. MsePlayer has no such hack: it's a plain
+    // <video> that fills its container via CSS, so it's what we use here.
+    player: 'mse',
+    ws: wsUrl.toString(),
+    fitToScreen: 'true',
+  })
+
+  return `${WS_SCRCPY_URL}/#!${hash.toString()}`
+}
 
 export default function PhoneMirrorPage({
   setActiveView,
@@ -299,14 +325,13 @@ export default function PhoneMirrorPage({
               )}
 
               {/* Live ws-scrcpy iframe */}
-              {mirrorActive && (
+              {mirrorActive && deviceInfo?.serial && (
                 <iframe
                   ref={iframeRef}
-                  src={WS_SCRCPY_URL}
+                  src={buildStreamUrl(deviceInfo.serial)}
                   title="ws-scrcpy Phone Mirror"
                   allow="fullscreen; autoplay"
                   className="wss-iframe"
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
                 />
               )}
             </div>
