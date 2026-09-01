@@ -91,6 +91,9 @@ class Executor:
         elif atype == "browser_get_title":
             return await self._browser_get_title()
 
+        elif atype == "browser_extract_search_results":
+            return await self._browser_extract_search_results()
+
         # ── Legacy system_ops actions (passed through unchanged) ─────────────
 
         elif atype == "speak":
@@ -380,9 +383,9 @@ class Executor:
             if res.get("status") == "error":
                 return {"status": "error", "message": f"Failed to launch {app_name}: {str(e)}"}
 
-        # Wait for the window to appear (up to 6 seconds)
+        # Wait for the window to appear (up to 8 seconds)
         import win32gui
-        deadline = time.time() + 6
+        deadline = time.time() + 8
         while time.time() < deadline:
             await asyncio.sleep(0.5)
             found = []
@@ -398,8 +401,8 @@ class Executor:
                 state.active_app = found[0]
                 return {"status": "success", "message": f"Launched and found window: {found[0]}"}
 
-        # Window didn't appear in time — still report success from subprocess
-        return {"status": "success", "message": f"Launched {app_name} (window detection timed out)"}
+        # Window didn't appear in time — return ERROR, not success
+        return {"status": "error", "message": f"Launched {app_name} but window '{window_title}' not detected within timeout"}
 
     async def _type_in_app(self, action: Dict, state: TaskState) -> Dict[str, Any]:
         """Focus a window and type text into it using pyautogui."""
@@ -629,6 +632,12 @@ class Executor:
         """Get the current browser page title."""
         browser = await self._get_browser()
         return await browser.get_page_title()
+
+    async def _browser_extract_search_results(self) -> Dict[str, Any]:
+        """Extract clickable search result links from the current Google SERP."""
+        browser = await self._get_browser()
+        results = await browser.extract_search_results()
+        return {"status": "success", "message": f"Found {len(results)} search results", "results": results}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Sequence executor

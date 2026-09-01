@@ -1,188 +1,187 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
-import {
-  Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
-  Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
-  File as FileIcon, Folder, X, RotateCcw,
-  Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
-  Mic, MicOff, Brain
-} from 'lucide-react'
-import Header from './Header';
-import Telemetry from './Telemetry';
-import CommandGrid from './CommandGrid';
-import CoreSphere from './CoreSphere';
-import PhonePanel from './PhonePanel';
-import PhoneMirrorPage from './PhoneMirrorPage';
-import GalleryPage from './GalleryPage';
-import { useVoice } from './hooks/useVoice';
-
-function formatBytes(n) {
-  if (!n) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
-  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
-}
-
-function TimerWidget({ timerData, onCancel }) {
-  const [remaining, setRemaining] = useState(timerData.seconds)
-  const totalRef = useRef(timerData.seconds)
-  const intervalRef = useRef(null)
-
-  useEffect(() => {
-    setRemaining(timerData.seconds)
-    totalRef.current = timerData.seconds
-    if (intervalRef.current) clearInterval(intervalRef.current)
-    intervalRef.current = setInterval(() => {
-      setRemaining(r => {
-        if (r <= 1) { clearInterval(intervalRef.current); return 0 }
-        return r - 1
-      })
-    }, 1000)
-    return () => clearInterval(intervalRef.current)
-  }, [timerData])
-
-  const h = Math.floor(remaining / 3600)
-  const m = Math.floor((remaining % 3600) / 60)
-  const s = remaining % 60
-  const display = h > 0
-    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-  const pct = totalRef.current > 0 ? (remaining / totalRef.current) * 100 : 0
-  const urgent = remaining <= 30 && remaining > 0
-  const done = remaining === 0
-
-  return (
-    <div className="timer-strip">
-      <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
-      <div className="timer-info">
-        <div className="timer-label">{timerData.label || 'TIMER'}</div>
-        <div className={`timer-countdown ${urgent ? 'urgent' : ''}`}>
-          {done ? "TIME'S UP!" : display}
-        </div>
-        <div className="timer-bar-wrap">
-          <div className="timer-bar-fill" style={{ width: `${pct}%` }} />
-        </div>
-      </div>
-      <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
-    </div>
-  )
-}
-
-export default function App() {
-  const [online, setOnline] = useState(true)
-  const [busy, setBusy] = useState(false)
-  const [stats, setStats] = useState({ cpu: 0, memory: 0, disk: 0, processes: [] })
-  const [files, setFiles] = useState([])
-  const [messages, setMessages] = useState([
-    { role: 'jarvis', text: 'All systems online, sir. I am at your disposal.' }
-  ])
-  const [prompt, setPrompt] = useState('')
-  const [fileData, setFileData] = useState(null)
-  const [imageData, setImageData] = useState(null)
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const [geminiKey, setGeminiKey] = useState('')
-  const [hfKey, setHfKey] = useState('')
-  const [geminiProjectId, setGeminiProjectId] = useState('')
-  const [groqKey, setGroqKey] = useState('')
-  const [saveNote, setSaveNote] = useState('')
-  const [googleLinked, setGoogleLinked] = useState(null)
-  const [oauthBusy, setOauthBusy] = useState(false)
-  const [oauthMsg, setOauthMsg] = useState('')
-  const [logs, setLogs] = useState([])
-  const [chatMode, setChatMode] = useState(false)
-  const [pendingImage, setPendingImage] = useState(null)
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+
 import {
+
   Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
+
   Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
+
   File as FileIcon, Folder, X, RotateCcw,
+
   Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
+
   Mic, MicOff, Brain
+
 } from 'lucide-react'
+
 import Header from './Header';
+
 import Telemetry from './Telemetry';
+
 import CommandGrid from './CommandGrid';
+
 import CoreSphere from './CoreSphere';
+
 import PhonePanel from './PhonePanel';
+
 import PhoneMirrorPage from './PhoneMirrorPage';
+
 import GalleryPage from './GalleryPage';
+
 import { useVoice } from './hooks/useVoice';
 
+
+
 function formatBytes(n) {
+
   if (!n) return '0 B'
+
   const units = ['B', 'KB', 'MB', 'GB']
+
   let i = 0
+
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+
 }
+
+
 
 function TimerWidget({ timerData, onCancel }) {
+
   const [remaining, setRemaining] = useState(timerData.seconds)
+
   const totalRef = useRef(timerData.seconds)
+
   const intervalRef = useRef(null)
 
+
+
   useEffect(() => {
+
     setRemaining(timerData.seconds)
+
     totalRef.current = timerData.seconds
+
     if (intervalRef.current) clearInterval(intervalRef.current)
+
     intervalRef.current = setInterval(() => {
+
       setRemaining(r => {
+
         if (r <= 1) { clearInterval(intervalRef.current); return 0 }
+
         return r - 1
+
       })
+
     }, 1000)
+
     return () => clearInterval(intervalRef.current)
+
   }, [timerData])
 
+
+
   const h = Math.floor(remaining / 3600)
+
   const m = Math.floor((remaining % 3600) / 60)
+
   const s = remaining % 60
+
   const display = h > 0
+
     ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+
     : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+
   const pct = totalRef.current > 0 ? (remaining / totalRef.current) * 100 : 0
+
   const urgent = remaining <= 30 && remaining > 0
+
   const done = remaining === 0
 
+
+
   return (
+
     <div className="timer-strip">
+
       <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
+
       <div className="timer-info">
+
         <div className="timer-label">{timerData.label || 'TIMER'}</div>
+
         <div className={`timer-countdown ${urgent ? 'urgent' : ''}`}>
+
           {done ? "TIME'S UP!" : display}
+
         </div>
+
         <div className="timer-bar-wrap">
+
           <div className="timer-bar-fill" style={{ width: `${pct}%` }} />
+
         </div>
+
       </div>
+
       <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
+
     </div>
+
   )
+
 }
 
+
+
 export default function App() {
+
   const [online, setOnline] = useState(true)
+
   const [busy, setBusy] = useState(false)
+
   const [stats, setStats] = useState({ cpu: 0, memory: 0, disk: 0, processes: [] })
+
   const [files, setFiles] = useState([])
+
   const [messages, setMessages] = useState([
+
     { role: 'jarvis', text: 'All systems online, sir. I am at your disposal.' }
+
   ])
+
   const [prompt, setPrompt] = useState('')
+
   const [fileData, setFileData] = useState(null)
+
   const [imageData, setImageData] = useState(null)
+
   const [settingsOpen, setSettingsOpen] = useState(false)
+
   const [geminiKey, setGeminiKey] = useState('')
+
   const [hfKey, setHfKey] = useState('')
+
   const [geminiProjectId, setGeminiProjectId] = useState('')
+
   const [groqKey, setGroqKey] = useState('')
+
   const [saveNote, setSaveNote] = useState('')
+
   const [googleLinked, setGoogleLinked] = useState(null)
+
   const [oauthBusy, setOauthBusy] = useState(false)
+
   const [oauthMsg, setOauthMsg] = useState('')
+
   const [logs, setLogs] = useState([])
+
   const [chatMode, setChatMode] = useState(false)
+
   const [pendingImage, setPendingImage] = useState(null)
   const [pendingDocument, setPendingDocument] = useState(null)
   const [extracting, setExtracting] = useState(false)
@@ -190,9 +189,9 @@ export default function App() {
   const [timerData, setTimerData] = useState(null)
   const [booting, setBooting] = useState(true)
   const [activeView, setActiveView] = useState('core')
-const [agentMode, setAgentMode] = useState(false)
-const [agentStatus, setAgentStatus] = useState('ready')
-const [agentEvents, setAgentEvents] = useState([])  // live events from /api/agent/run
+  const [agentMode, setAgentMode] = useState(false)
+  const [agentStatus, setAgentStatus] = useState('ready')
+  const [agentEvents, setAgentEvents] = useState([])
   const [voiceEnabled, setVoiceEnabled] = useState(true)
 
   useEffect(() => {

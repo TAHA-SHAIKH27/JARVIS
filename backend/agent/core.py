@@ -41,7 +41,8 @@ class AgentCore:
             check_pc_health, adjust_volume, media_control, search_web, launch_any_app,
             save_generated_image, shutdown_pc, restart_pc, cancel_shutdown, sleep_pc,
             lock_screen, get_clipboard, set_clipboard, get_battery_info, get_network_info,
-            get_weather, get_datetime_info, get_system_stats, open_url, type_text, press_key
+            get_weather, get_datetime_info, open_url, type_text, press_key,
+            get_system_stats
         )
         from phone_control import (
             list_devices, start_mirror, screenshot_as_base64, tap, swipe,
@@ -49,6 +50,9 @@ class AgentCore:
             unlock_phone, test_pin_digit_tap
         )
         from whatsapp_ops import send_whatsapp_message, send_whatsapp_message_via_phone, add_contact
+        from backend.tools.computer import Computer
+        from backend.tools.browser import Browser
+        from backend.tools.office import Office
 
         system_tools = {
             "open_app": open_application, "close_app": close_application,
@@ -80,6 +84,11 @@ class AgentCore:
         self.registry.register("send_whatsapp_phone", send_whatsapp_message_via_phone)
         self.registry.register("add_whatsapp_contact", add_contact)
         self.registry.register("generate_image", lambda prompt, **kwargs: None)
+
+        # Register new tool classes for direct access
+        self.registry.register("computer_tool", Computer(self.registry))
+        self.registry.register("browser_tool", Browser())
+        self.registry.register("office_tool", Office)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main agent process loop
@@ -197,6 +206,8 @@ class AgentCore:
                     collected_data["page_title"] = result.get("title", "")
                     collected_data["page_url"] = result.get("url", "")
 
+                # Reset retry count on successful action
+                state.retry_count = 0
                 action_index += 1
 
             else:
@@ -216,8 +227,35 @@ class AgentCore:
                     await asyncio.sleep(1.0)
                     # Don't advance action_index — retry same action
                 else:
-                    # Give up on this action, move to next
-                    action_index += 1
+                    # Mandatory action failed after retries — do NOT silently continue
+                    # Mark task as having a critical failure
+                    await emit("error", f"Critical failure on step '{desc}': {fail_msg}. Task cannot continue.", icon="✗")
+                    state.completion_status = "failed"
+                    # Return early with failure status
+                    speak_text = f"Task failed, sir. Critical step failed: {desc}. Error: {fail_msg}"
+                    if self.executor._browser:
+                        await self.executor.close_browser()
+                    await emit(
+                        "complete",
+                        speak_text,
+                        {
+                            "status": "failed",
+                            "completed_steps": len(state.completed_steps),
+                            "total_steps": len(actions),
+                            "errors": state.errors,
+                            "collected_data": {k: v for k, v in collected_data.items() if isinstance(v, str)},
+                        },
+                        icon="✗"
+                    )
+                    return {
+                        "status": "failed",
+                        "task": task,
+                        "speak": speak_text,
+                        "plan": state.plan,
+                        "completed_steps": state.completed_steps,
+                        "errors": state.errors,
+                        "collected_data": collected_data,
+                    }
 
         # ── Step 3: Auto-inject collected data into create_docx if needed ─
         # If the plan had browser_extract steps and a create_docx step but

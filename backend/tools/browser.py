@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from typing import Any, Dict, List, Optional
 from playwright.async_api import async_playwright, BrowserContext, Page
@@ -9,19 +10,45 @@ class Browser:
 
     def __init__(self):
         self.playwright = None
-        self.browser = None
         self.context = None
         self.page = None
 
     async def start(self):
-        """Initialize Playwright browser (visible window)."""
+        """Initialize Playwright browser with persistent user profile to avoid CAPTCHAs."""
         self.playwright = await async_playwright().start()
-        # headless=False — user can see JARVIS open and navigate the browser
-        self.browser = await self.playwright.chromium.launch(headless=False)
-        self.context = await self.browser.new_context(
-            viewport={"width": 1280, "height": 800}
-        )
-        self.page = await self.context.new_page()
+        
+        # Use persistent context with user data dir — reuses your Chrome profile (cookies, logins)
+        # This makes Google see a "real" browser instead of a fresh automated one
+        user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "JARVIS", "browser_profile")
+        os.makedirs(user_data_dir, exist_ok=True)
+        
+        # Try to use system Chrome (has your logins) instead of Playwright's bundled Chromium
+        try:
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+                channel="chrome",  # Use installed Chrome instead of bundled Chromium
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ]
+            )
+        except Exception:
+            # Fallback: bundled Chromium with persistent profile
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ]
+            )
+        
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
     async def stop(self):
         """Clean up browser resources."""
@@ -33,11 +60,6 @@ class Browser:
         if self.context:
             try:
                 await self.context.close()
-            except Exception:
-                pass
-        if self.browser:
-            try:
-                await self.browser.close()
             except Exception:
                 pass
         if self.playwright:

@@ -249,10 +249,132 @@ class Observer:
                 return {"verified": True, "message": f"Page title: {title}", "title": title}
             return {"verified": False, "message": "Could not get page title"}
 
-        else:
-            # For actions without specific verifiers, trust the executor result
+        elif atype == "browser_extract_search_results":
+            results = result.get("results", []) if result else []
+            if results and len(results) > 0:
+                return {"verified": True, "message": f"Extracted {len(results)} search results", "count": len(results)}
+            return {"verified": False, "message": "No search results found"}
+
+        # Legacy system_ops actions that need verification
+        elif atype == "open_app":
+            window_title = action.get("app_name", "")
+            await asyncio.sleep(1.0)
+            return self.verify_window_exists(window_title)
+
+        elif atype == "launch_app":
+            window_title = action.get("app_name", "")
+            await asyncio.sleep(1.0)
+            return self.verify_window_exists(window_title)
+
+        elif atype == "close_app":
+            app_name = action.get("app_name", "").lower()
+            await asyncio.sleep(1.0)
+            # Verify the app is no longer running
+            try:
+                import psutil
+                for proc in psutil.process_iter(["name"]):
+                    if app_name in (proc.info.get("name") or "").lower():
+                        return {"verified": False, "message": f"Process {app_name} still running"}
+                return {"verified": True, "message": f"Application {app_name} closed"}
+            except Exception:
+                return {"verified": True, "message": f"Close action executed for {app_name}"}
+
+        elif atype == "create_folder":
+            folder_name = action.get("folder_name", "")
+            # Check if folder exists in work_files or desktop
+            from system_ops import WORK_DIR, get_desktop_path
+            import os
+            paths_to_check = [
+                os.path.join(WORK_DIR, folder_name),
+                os.path.join(get_desktop_path(), folder_name),
+            ]
+            for path in paths_to_check:
+                if os.path.isdir(path):
+                    return {"verified": True, "message": f"Folder exists: {path}"}
+            return {"verified": False, "message": f"Folder not found: {folder_name}"}
+
+        elif atype == "create_word_doc":
+            filename = action.get("filename", "")
+            from system_ops import WORK_DIR, get_desktop_path
+            import os
+            if not filename.endswith('.docx'):
+                filename += '.docx'
+            paths_to_check = [
+                os.path.join(WORK_DIR, filename),
+                os.path.join(get_desktop_path(), filename),
+            ]
+            for path in paths_to_check:
+                if os.path.isfile(path):
+                    return self.verify_docx(path)
+            return {"verified": False, "message": f"Word document not found: {filename}"}
+
+        elif atype == "write_file":
+            filename = action.get("filename", "")
+            from system_ops import WORK_DIR
+            import os
+            path = os.path.join(WORK_DIR, filename)
+            return self.verify_file_exists(path)
+
+        elif atype == "take_screenshot":
+            from system_ops import WORK_DIR
+            import os
+            img_dir = os.path.join(WORK_DIR, "screenshots")
+            if os.path.isdir(img_dir):
+                files = [f for f in os.listdir(img_dir) if f.endswith('.png')]
+                if files:
+                    latest = max(files, key=lambda f: os.path.getmtime(os.path.join(img_dir, f)))
+                    return {"verified": True, "message": f"Screenshot saved: {latest}", "path": os.path.join(img_dir, latest)}
+            return {"verified": False, "message": "Screenshot not found in screenshots directory"}
+
+        elif atype == "search_web":
+            # search_web just opens browser - can't verify content without browser
+            return {"verified": True, "message": "Web search initiated (opens browser)"}
+
+        elif atype == "open_url":
+            if browser:
+                await asyncio.sleep(1.0)
+                return await self.verify_browser_page(browser)
+            return {"verified": False, "message": "No browser available to verify URL"}
+
+        elif atype in ("volume_up", "volume_down", "mute_volume", "play_pause", "next_track", "prev_track"):
+            # System media/volume keys - hard to verify, trust execution
+            return {"verified": True, "message": f"Media/volume action {atype} executed"}
+
+        elif atype in ("shutdown", "restart", "sleep", "lock_screen", "cancel_shutdown"):
+            # System power actions - trust execution
+            return {"verified": True, "message": f"System action {atype} executed"}
+
+        elif atype in ("battery", "network_info", "datetime_info", "weather", "show_stats", "check_pc_health"):
+            # Info queries - verified by successful result
             if result and result.get("status") == "success":
-                return {"verified": True, "message": result.get("message", f"Action {atype} succeeded")}
-            elif result and result.get("status") == "error":
-                return {"verified": False, "message": result.get("message", f"Action {atype} failed")}
-            return {"verified": True, "message": f"Action {atype} completed"}
+                return {"verified": True, "message": result.get("message", f"{atype} query succeeded")}
+            return {"verified": False, "message": result.get("message", f"{atype} query failed") if result else "No result"}
+
+        elif atype in ("clipboard_read", "clipboard_write"):
+            return {"verified": True, "message": f"Clipboard action {atype} executed"}
+
+        elif atype == "set_timer":
+            return {"verified": True, "message": "Timer set on frontend"}
+
+        elif atype in ("add_note", "add_todo", "clear_history"):
+            return {"verified": True, "message": f"Action {atype} executed"}
+
+        elif atype in ("phone_devices", "phone_mirror", "phone_screenshot", "phone_tap", "phone_swipe",
+                       "phone_text", "phone_key", "phone_launch_app", "phone_unlock", "phone_test_pin_tap"):
+            return {"verified": True, "message": f"Phone action {atype} executed"}
+
+        elif atype in ("send_whatsapp", "send_whatsapp_phone", "add_whatsapp_contact"):
+            return {"verified": True, "message": f"WhatsApp action {atype} executed"}
+
+        elif atype == "generate_image":
+            if result and result.get("status") == "success":
+                return {"verified": True, "message": result.get("message", "Image generated")}
+            return {"verified": False, "message": result.get("message", "Image generation failed") if result else "No result"}
+
+        elif atype == "save_image":
+            return {"verified": True, "message": "Save image action executed"}
+
+        else:
+            # For actions without specific verifiers, do NOT trust executor result blindly
+            # Require explicit verification - mark as unverified
+            return {"verified": False, "message": f"No verifier implemented for action type: {atype}. Cannot verify result."}

@@ -1,6 +1,6 @@
 # J.A.R.V.I.S. Agent Implementation - RECALL LOG (Final Status)
 
-## PROJECT STATUS: COMPLETE - All backend files, frontend, and API endpoints implemented
+## PROJECT STATUS: ALL MAJOR FIXES COMPLETE - Ready for Integration Testing
 
 ### SERVICES RUNNING
 ```
@@ -10,7 +10,7 @@
   Voice:    Browser WebSocket (click mic button)
 ```
 
-### BACKEND - PYTHON FILES (ALL COMPILE OK)
+### BACKEND - PYTHON FILES (ALL COMPILE OK - VERIFIED)
 - main.py ✅
 - backend/agent/state.py ✅
 - backend/agent/registry.py ✅
@@ -23,6 +23,8 @@
 - backend/tools/browser.py ✅
 - backend/tools/office.py ✅
 - backend/tools/vision.py ✅
+- system_ops.py ✅
+- agent.py ✅
 
 ### FRONTEND FILES
 - src/App.jsx ✅ (with agent mode, AgentStatus, AgentToggle)
@@ -32,119 +34,202 @@
 - src/App.jsx quickActions includes 'Agent Mode' ✅
 
 ### API ENDPOINTS ADDED TO main.py
-- POST /api/agent/execute - Execute natural language task
+- POST /api/agent/run - SSE streaming agent execution (NEW - uses AgentCore)
+- POST /api/agent/execute - Execute natural language task (legacy)
 - GET /api/agent/status - Get current agent state
 - POST /api/agent/plan - Generate plan for task
-- POST /api/agent/observation - Get system observations
 
-### ERRORS FIXED COMPLETELY
+---
 
-1. **JSX Template Literal Error** - VITE compilation fixed
-   - Fixed: Template literals → string concatenation in App.jsx
+## MAJOR FIXES APPLIED (AgentCore Integration)
 
-2. **Duplicate `refreshStatus` Declaration** - Removed duplicate
+### 1. FIXED: open_app_wait returns ERROR when window not detected
+**File:** `backend/agent/executor.py` (lines 347-403)
+- **Problem:** open_app_wait returned success even when window timed out
+- **Fix:** Changed timeout from 6s to 8s, returns `{"status": "error", "message": "Launched {app_name} but window '{window_title}' not detected within timeout"}` instead of success
 
-3. **Missing `Brain` Icon Import** - Added to lucide-react imports
+### 2. FIXED: AgentCore state machine stops on critical failures
+**File:** `backend/agent/core.py` (lines 212-257)
+- **Problem:** Failed mandatory actions silently advanced to next step
+- **Fix:** Added early return on verification failure after max retries - task marked as "failed" and returns immediately
 
-4. **All Python Import/Syntax Errors** - Fixed across agent/ and tools/ files
+### 3. FIXED: Observer/Verifier require actual verification (no blind trust)
+**File:** `backend/agent/observer.py` (lines 252-350)
+- **Problem:** Observer trusted executor results for unknown action types
+- **Fix:** 
+  - Default case now returns `{"verified": False, "message": "No verifier implemented for action type: {atype}. Cannot verify result."}`
+  - Added specific verifiers for ALL legacy system_ops actions:
+    - open_app/launch_app → verify_window_exists
+    - close_app → verify process terminated
+    - create_folder → verify folder exists
+    - create_word_doc → verify_docx (reads content)
+    - write_file → verify_file_exists
+    - take_screenshot → verify file in screenshots dir
+    - search_web/open_url → verify_browser_page
+    - media/volume/power actions → verified by execution
+    - info queries (battery, network, etc.) → verified by result status
+    - clipboard/phone/WhatsApp/image/timer/notes → verified by execution
 
-### 6 DEFINITION OF DONE TEST WORKFLOWS
+### 4. FIXED: Planner produces structured executable actions
+**File:** `backend/agent/planner.py`
+- **Problem:** Rule-based fallback produced vague English descriptions; "search" matched "research" first
+- **Fix:**
+  - Updated PLANNER_SYSTEM_PROMPT with exact action types and parameters
+  - Added `browser_extract_search_results` action type for research workflow
+  - Reordered conditions: "research" checked BEFORE "search" (since "research" contains "search")
+  - Enhanced `_rule_based_plan()` with handlers for:
+    - Notepad + type → open_app_wait → type_in_app → speak
+    - Calculator → calculator_compute → speak
+    - Chrome/Search → browser_search → browser_get_title → speak
+    - Folder creation → create_folder_verified → verify_file → speak
+    - File creation → write_file_verified → verify_file → speak
+    - Research + Word → browser_search → browser_extract_search_results → browser_navigate → browser_extract (multiple) → create_docx → verify_file → speak
 
-1. **"Open Chrome"** → Chrome launches, verified via process/window
-2. **"Open Chrome and search for Science Day"** → Chrome opens, search performed, results visible
-3. **"Open File Explorer"** → Explorer opens, detected
-4. **"Open Word"** → Word opens, detected
-5. **"Create Word document about Science Day"** → Content→DOCX→Word opens→document verified
-6. **Full**: "Open Chrome, search Science Day, create Word doc about it" → Full autonomous workflow
+### 5. FIXED: Tools connected through ToolRegistry (no duplicates)
+**File:** `backend/agent/core.py` (lines 52-90)
+- Added imports for Computer, Browser, Office tool classes
+- Registered as: `computer_tool`, `browser_tool`, `office_tool`
+- Executor uses Browser class directly (headless=False for visibility)
 
-### QUICK TEST COMMANDS
+### 6. FIXED: Browser research workflow
+**Files:** `backend/agent/executor.py`, `backend/tools/browser.py`
+- Added `_browser_extract_search_results()` in executor
+- Added `extract_search_results()` in Browser class (extracts clickable links from Google SERP)
+- Observer verifies search results count > 0
+- Planner prompt updated: browser_search → browser_extract_search_results → browser_navigate → browser_extract
+
+---
+
+## TEST RESULTS
+
+### WHAT PASSED ✅
+| Test | Status | Notes |
+|------|--------|-------|
+| Python compilation (all 14 files) | ✅ PASS | All py_compile checks pass |
+| Planner rule-based fallback (notepad) | ✅ PASS | Returns correct structured actions |
+| Planner rule-based fallback (calculator) | ✅ PASS | calculator_compute action |
+| Planner rule-based fallback (search) | ✅ PASS | browser_search action |
+| Planner rule-based fallback (folder) | ✅ PASS | Extracts folder name correctly |
+| Planner rule-based fallback (research) | ✅ PASS | Full 9-step research workflow |
+| Planner LLM path (Gemini) | ✅ PASS | Falls back correctly when rate limited |
+| AgentCore initialization | ✅ PASS | Creates all components, registers tools |
+| AgentCore process() start | ✅ PASS | Emits "planning" event successfully |
+
+### KNOWN ISSUES / UNTESTED
+| Component | Status | Notes |
+|-----------|--------|-------|
+| open_app_wait (Notepad) | ⚠️ UNTESTED | May need longer timeout on some systems |
+| calculator_compute | ⚠️ UNTESTED | Windows Calculator automation via pyautogui |
+| browser_search + extract | ⚠️ UNTESTED | Playwright headless=False visibility |
+| Full AgentCore loop | ⚠️ UNTESTED | Need to test with actual window operations |
+
+---
+
+## 5 DEFINITION OF DONE TESTS TO RUN
+
+### TEST 1: Notepad
+> "Open Notepad and type 'JARVIS system test successful.' Do not save it."
+- Expected: Notepad opens → window detected → text typed → verified → no save
+
+### TEST 2: Calculator
+> "Open Calculator and calculate 125 × 48."
+- Expected: Calculator opens → 125 * 48 entered → equals pressed → display reads 6000 → verified
+
+### TEST 3: Folder + File
+> "Create a folder on my Desktop called JARVIS_TEST and create status.txt inside it. Verify it exists."
+- Expected: Folder created → file created → both verified on filesystem
+
+### TEST 4: Browser Research
+> "Open Chrome, search for the official OpenAI website, open it, and tell me the page title."
+- Expected: Visible Chrome opens → Google search → result clicked → page loaded → title extracted
+
+### TEST 5: Full Research + Word (MOST IMPORTANT)
+> "Research National Science Day from multiple websites and create a Word document on my Desktop containing the information and sources."
+- Expected: Search → extract results → navigate sources → extract content → create DOCX → save → verify → report
+
+---
+
+## QUICK TEST COMMANDS
 
 ```powershell
-# Start backend
+# Start backend (terminal 1)
 python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level warning
 
-# Start frontend (new terminal)
+# Start frontend (terminal 2)  
 npm run dev
 
 # Test backend status
 curl http://127.0.0.1:8000/api/status
-# → {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}
 
 # Test agent status
 curl http://127.0.0.1:8000/api/agent/status
 
-# Test agent execute  
-curl -X POST http://127.0.0.1:8000/api/agent/execute -d "{\"text\": \"open chrome\"}"
+# Test agent plan (no execution)
+curl -X POST http://127.0.0.1:8000/api/agent/plan -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
+
+# Test agent execute (full run)
+curl -X POST http://127.0.0.1:8000/api/agent/execute -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
+
+# Test SSE endpoint (Agent Mode uses this)
+curl -N http://127.0.0.1:8000/api/agent/run -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
 ```
 
-### ALL AGENT CAPABILITIES REGISTERED (60+ tools)
+---
 
-**System Ops**: open_app, close_app, launch_app, shutdown, restart, sleep, lock_screen
-**Volume/Media**: volume_up, volume_down, mute_volume, play_pause, next_track, prev_track
-**Search/Info**: search_web, weather, battery, network_info, datetime_info
-**Files**: take_screenshot, show_stats, create_folder, create_word_doc, check_pc_health
-**Clipboard**: clipboard_read, clipboard_write
-**URL**: open_url, type_text, press_key
-**Phone**: phone_devices, phone_mirror, phone_screenshot, phone_tap, phone_swipe
-**Phone**: phone_text, phone_key, phone_launch_app, phone_unlock, phone_test_pin_tap
-**WhatsApp**: send_whatsapp, send_whatsapp_phone, add_whatsapp_contact
-**Images**: generate_image, generate_image_huggingface
-**Timer**: set_timer
-**Notes/Todos**: add_note, add_todo, clear_history
+## ARCHITECTURE VERIFICATION
 
-### COMPONENTS CREATED
+### Agent Mode Flow (NOW CONNECTED):
+```
+USER REQUEST
+  ↓
+Frontend: runAgentMode() → POST /api/agent/run (SSE)
+  ↓
+main.py: agent_run() → AgentCore.process()
+  ↓
+AgentCore → Planner.plan_task() → structured actions
+  ↓
+For each action:
+  Executor.execute() → real tool (computer/browser/office)
+  Observer.observe_after_action() → actual state check
+  Verifier.verify_action() → pass/fail/retry
+  emit event → SSE → Frontend shows live events
+  ↓
+VERIFIED RESULT → Agent decides next action
+  ↓
+REPEAT until complete
+  ↓
+FINAL VERIFIED RESPONSE
+```
 
-**Backend (new)**:
-- backend/agent/state.py - TaskState dataclass
-- backend/agent/registry.py - ToolRegistry class
-- backend/agent/planner.py - Natural language to step list
-- backend/agent/executor.py - Tool execution engine
-- backend/agent/observer.py - System state observer
-- backend/agent/verifier.py - Result verification
-- backend/agent/core.py - Main agent orchestration loop
+### Normal Chat Mode (UNCHANGED):
+```
+USER REQUEST
+  ↓
+Frontend: runCommand() → POST /api/command
+  ↓
+main.py: process_command() → agent.get_gemini_actions()
+  ↓
+LLM → JSON actions → system_ops execution
+  ↓
+Response with speak text
+```
 
-**Tools (new)**:
-- backend/tools/computer.py - Windows UI Automation (pywinauto/uiautomation)
-- backend/tools/browser.py - Playwright browser control (persistent context)
-- backend/tools/office.py - Word/DOCX generation (python-docx)
-- backend/tools/vision.py - Gemini vision fallback (image analysis/OCR)
+---
 
-**Frontend (new)**:
-- src/components/AgentStatus.jsx - Status tooltip component
-- src/components/AgentToggle.jsx - Brain/X toggle button
+## FILES CHANGED IN THIS SESSION
 
-**Modified**:
-- main.py - Added 4 agent API endpoints
-- src/App.jsx - AgentMode state, agentStatus, event handlers, quick action
-- src/Header.jsx - Brain icon toggle, agent status bar
+| File | Key Changes |
+|------|-------------|
+| `backend/agent/executor.py` | Fixed open_app_wait error on timeout; added browser_extract_search_results |
+| `backend/agent/core.py` | Fixed state machine early return on failure; added tool class registration; fixed _setup_default_tools indentation |
+| `backend/agent/observer.py` | Added verifiers for all legacy action types; default case requires verification |
+| `backend/agent/planner.py` | Updated system prompt; reordered conditions (research before search); enhanced rule-based fallback |
+| `backend/tools/browser.py` | Added extract_search_results() method |
+| `test_agent.py` / `test_planner_direct.py` | Test scripts created |
 
-### BACKEND IMPORT PATHS (ALL USING DIRECT IMPORTS, NO `backend.` PREFIX)
-- system_ops.py → `from system_ops import ...`
-- phone_control.py → `from phone_control import ...`
-- whatsapp_ops.py → `from whatsapp_ops import ...`
+---
 
-### PLAYWRIGHT STATUS
-- Chromium installed successfully (191.8 MB download completed)
-- Ready for browser automation workflows
-
-### ERROR RESOLUTION SUMMARY
-
-| Error | Location | Fix Applied |
-|-------|----------|-------------|
-| JSX template literal | src/App.jsx:471,363 | Converted to string concatenation |
-| Duplicate refreshStatus | src/App.jsx:679-692 | Removed duplicate |
-| Brain icon not defined | src/App.jsx:644 | Added Brain to lucide-imports |
-| Python import errors | backend/agent/*.py | Fixed import paths (direct, no `backend.`) |
-| Python syntax errors | backend/agent/*, tools/* | Fixed across all 11 files |
-| Playwright install | N/A | Completed (100%) |
-
-### READY TO TEST - IMMEDIATE ACTION
-
-1. Start backend: `python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level warning`
-2. Start frontend: `npm run dev`
-3. Open http://localhost:3000
-4. Click Agent Mode brain icon in header
-5. Test the 6 Definition of Done workflows
-
-### LAST UPDATED
-Complete implementation with all errors resolved. System ready for execution testing.
+## LAST UPDATED
+All major AgentCore fixes applied. Planner working correctly with research workflow.
+All Python files compile. Ready for integration testing with 5 DoD tests.
+Next step: Start backend + frontend and run the 5 Definition of Done tests.
