@@ -51,6 +51,10 @@ import google_oauth
 import phone_control
 import whatsapp_ops
 import json
+import asyncio
+
+from backend.agent.core import AgentCore
+from backend.agent.state import TaskState
 
 app = FastAPI(title="J.A.R.V.I.S. Core", description="API Service for Windows OS Automation")
 
@@ -62,6 +66,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _start_ws_scrcpy():
+    """Launch ws-scrcpy on port 8080 for the embedded phone mirror.
+    Runs here (not just in the `python main.py` __main__ block) so it also
+    starts when uvicorn is invoked directly, e.g. via start_jarvis.py's
+    `python -m uvicorn main:app` subprocess call."""
+    import subprocess
+    ws_scrcpy_dir = os.path.join(os.path.dirname(__file__), "ws-scrcpy")
+    if not os.path.exists(ws_scrcpy_dir):
+        print("[ws-scrcpy] Directory not found, skipping (phone mirror embed will be unavailable).")
+        return
+    env = os.environ.copy()
+    env["PORT"] = "8080"
+    env["ADB"] = os.getenv("JARVIS_ADB_PATH", "adb")
+    try:
+        subprocess.Popen(
+            ["npm", "start"],
+            cwd=ws_scrcpy_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=True,
+        )
+        print("[ws-scrcpy] Started on port 8080")
+    except Exception as e:
+        print(f"[ws-scrcpy] Failed to start: {e}")
 
 # Configuration persistence
 CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json"))
@@ -995,29 +1027,190 @@ async def process_command(req: CommandRequest):
         "timer_data": timer_data,
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    import subprocess
-    import os
-    
-    # Start ws-scrcpy in the background
-    ws_scrcpy_dir = os.path.join(os.path.dirname(__file__), "ws-scrcpy")
-    if os.path.exists(ws_scrcpy_dir):
-        env = os.environ.copy()
-        env["PORT"] = "8080"
-        env["ADB"] = os.getenv("JARVIS_ADB_PATH", "adb")
-        try:
-            subprocess.Popen(
-                ["npm", "start"],
-                cwd=ws_scrcpy_dir,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=True
-            )
-            print("Started ws-scrcpy on port 8080")
-        except Exception as e:
-            print(f"Failed to start ws-scrcpy: {e}")
 
-    # Run server on port 8000
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+# ── Gallery endpoints ─────────────────────────────────────────────────────────
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+@app.get("/api/gallery")
+def get_gallery():
+    """Recursively scan work_files for images, returning metadata for each file.
+    Categorises files into: pc_screenshot, phone, generated, other."""
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
+    if not os.path.exists(work_dir):
+        return {"images": []}
+
+    items = []
+    for root, dirs, files in os.walk(work_dir):
+        # Skip hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _IMAGE_EXTS:
+                continue
+            full_path = os.path.join(root, fname)
+            rel = os.path.relpath(full_path, work_dir).replace("\\", "/")
+            size = 0
+            mtime = 0
+            try:
+                st = os.stat(full_path)
+                size = st.st_size
+                mtime = st.st_mtime
+            except OSError:
+                pass
+
+            # Categorise based on folder / filename prefix
+            rel_lower = rel.lower()
+            if rel_lower.startswith("phone/") or fname.startswith("phone_"):
+                category = "phone"
+            elif rel_lower.startswith("images/") or fname.startswith("gen_") or fname.startswith("image_"):
+                category = "generated"
+            elif fname.startswith("screenshot_") or fname.startswith("screen_"):
+                category = "pc_screenshot"
+            else:
+                category = "other"
+
+            items.append({
+                "filename": fname,
+                "path": rel,
+                "size": size,
+                "mtime": mtime,
+                "category": category,
+            })
+
+    # Newest first
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"images": items}
+
+
+@app.get("/api/files/serve")
+def serve_work_file(path: str):
+    """Serve an image from work_files by its relative path (safe — refuses path traversal)."""
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
+    full_path = os.path.abspath(os.path.join(work_dir, path))
+    # Guard against path traversal
+    if not full_path.startswith(work_dir + os.sep) and full_path != work_dir:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if not os.path.isfile(full_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    ext = os.path.splitext(full_path)[1].lower()
+    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+    media_type = mime_map.get(ext, "application/octet-stream")
+    return FileResponse(full_path, media_type=media_type)
+
+
+# ── Agent endpoints ───────────────────────────────────────────────────────
+agent_core = AgentCore()
+
+
+class AgentRunRequest(BaseModel):
+    text: str
+    apiKey: Optional[str] = None
+
+
+@app.post("/api/agent/run")
+async def agent_run(req: AgentRunRequest):
+    """
+    Real Agent Mode endpoint — SSE streaming.
+    Runs the full AgentCore loop and emits live execution events to the frontend.
+    Each SSE line: data: {json}\n\n
+    """
+    task = req.text.strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="Task cannot be empty.")
+
+    # Create a per-request event queue
+    event_queue: asyncio.Queue = asyncio.Queue()
+    state = TaskState()
+
+    async def run_agent():
+        """Run agent in background, putting results into the queue."""
+        try:
+            await agent_core.process(task, state, event_queue)
+        except Exception as e:
+            await event_queue.put({
+                "type": "error",
+                "message": f"Agent error: {str(e)}",
+                "icon": "✗",
+                "data": {"error": str(e)},
+                "ts": __import__('time').time()
+            })
+        finally:
+            # Sentinel to signal end of stream
+            await event_queue.put(None)
+
+    async def event_generator():
+        """Consume the event queue and yield SSE-formatted strings."""
+        # Start the agent task
+        agent_task = asyncio.create_task(run_agent())
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    yield "data: " + json.dumps({"type": "error", "message": "Agent timed out", "icon": "✗"}) + "\n\n"
+                    break
+
+                if event is None:
+                    # End of stream sentinel
+                    yield "data: " + json.dumps({"type": "done", "message": "Stream complete"}) + "\n\n"
+                    break
+
+                yield "data: " + json.dumps(event) + "\n\n"
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+@app.post("/api/agent/execute")
+async def agent_execute(req: dict):
+    """Execute a natural language task through the agent core (non-streaming legacy)."""
+    task = req.get("text", "")
+    state = TaskState()
+    result = await agent_core.process(task, state)
+    return {"status": result.get("status", "error"), "data": result}
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    """Get the current agent state status."""
+    state = TaskState()
+    return {
+        "task": state.task,
+        "completed_steps": state.completed_steps,
+        "errors": state.errors,
+        "retry_count": state.retry_count,
+        "completion_status": state.completion_status
+    }
+
+
+@app.post("/api/agent/plan")
+async def agent_plan(req: dict):
+    """Generate a plan for a task."""
+    task = req.get("text", "")
+    state = TaskState()
+    from backend.agent.planner import Planner
+    planner = Planner()
+    steps = planner.plan_task(task, state)
+    return {"status": "success", "steps": [{"type": s.type, "description": s.description, "parameters": s.parameters} for s in steps], "task": task}
+
+
+@app.post("/api/agent/resume")
+async def agent_resume(req: dict):
+    """Resume agent after human intervention."""
+    # This would need a way to persist state across requests
+    # For now, return a placeholder
+    return {"status": "success", "message": "Resume endpoint - state persistence needed"}
+
+
+# ── Agent endpoints end ───────────────────────────────────────────────────

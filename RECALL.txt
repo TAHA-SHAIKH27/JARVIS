@@ -1,0 +1,252 @@
+# JARVIS Agent Architecture Improvements - Recall Document
+
+## AIM
+Transform JARVIS from a simple command executor into a genuine AI computer agent that:
+1. Understands the user's ACTUAL GOAL (not just the literal request)
+2. Decomposes tasks into dependency-aware steps
+3. Validates plans BEFORE execution
+4. Executes → Observes → Verifies each step with real state checking
+5. Classifies failures intelligently (retryable/recoverable/human_required/fatal)
+6. Replans automatically when strategies fail
+7. Handles human-in-the-loop properly (pause/resume, not fail)
+8. Only reports success when the FINAL OUTCOME is genuinely verified
+9. Emits structured observability events for the frontend
+
+---
+
+## CORE ARCHITECTURAL CHANGES
+
+### 1. Enhanced TaskState (`backend/agent/state.py`)
+**New fields added:**
+- `interpreted_goal` - The understood end state (not the raw request)
+- `requirements` - Full goal analysis from planner
+- `constraints` - Extracted constraints (format, location, min_sources, etc.)
+- `task_type` - Enum: SIMPLE, SEQUENTIAL, RESEARCH, RESEARCH_CALCULATION, RESEARCH_DOCUMENT, MULTI_APP, HUMAN_INTERVENTION
+- `action_outputs` - Structured outputs from each step for data flow
+- `failed_steps` - Detailed failure tracking with classification
+- `human_verification_*` - Complete human-in-the-loop state
+- `waiting_for_user` - Explicit pause state
+- `replan_count`, `max_replans`, `last_replan_reason` - Replanning control
+- `final_outcome_verified`, `final_outcome_data` - Final verification gate
+
+**New enums:**
+- `TaskType` - Classifies task complexity for planning strategy
+- `FailureClassification` - RETRYABLE, HUMAN_REQUIRED, RECOVERABLE, FATAL, COMPLETED
+- `BrowserPageState` - CAPTCHA, CONSENT, SORRY_PAGE, NETWORK_ERROR, EMPTY_RESULTS, NAVIGATION_PENDING, NORMAL_SERP, UNKNOWN
+
+**New dataclasses:**
+- `ActionSpec` - Structured action with: type, description, parameters, depends_on[], produces[], consumes[], verification{}, is_critical
+- `Plan` - Validated plan with: actions[], goal, task_type, validation_errors[], is_valid, final_outcome_verification{}
+
+---
+
+### 2. Goal Understanding & Dependency-Aware Planning (`backend/agent/planner.py`)
+
+**New capabilities:**
+- **Two-stage planning**: First understand goal (GOAL_UNDERSTANDING_PROMPT), then create plan (PLANNER_SYSTEM_PROMPT)
+- **Structured action specs**: Each action has explicit depends_on, produces, consumes for data flow
+- **Plan validation** (`_validate_plan`): Checks dependencies, required parameters, consumed/produced keys, speak action at end
+- **Auto-fix** (`_auto_fix_plan`): Adds missing speak, fixes browser_extract/create_docx dependencies
+- **Replanning** (`replan`): Preserves completed steps, extracted data, search results; generates new plan with failure context
+- **Rule-based fallbacks** for all task types when no API key
+
+**Data flow example (research → document):**
+```
+browser_search (produces: search_results) 
+  → browser_navigate[0] (consumes: search_results, produces: current_page_url)
+    → browser_extract[0] (consumes: current_page_url, produces: extracted_sources)
+  → browser_navigate[1] (consumes: search_results)
+    → browser_extract[1] (produces: extracted_sources)
+  → browser_navigate[2] 
+    → browser_extract[2]
+  → create_docx (consumes: extracted_sources, produces: created_document_path)
+  → verify_file (consumes: created_document_path)
+  → speak
+```
+
+---
+
+### 3. Executor Updates (`backend/agent/executor.py`)
+- **Accepts ActionSpec** instead of raw dict
+- **State injection** (`_inject_state_data`): Auto-resolves source_index → URL, injects extracted_sources into create_docx content, passes active_window to type_in_app
+- **Structured outputs** stored in state.action_outputs for downstream steps
+
+---
+
+### 4. Observer Updates (`backend/agent/observer.py`)
+- **Accepts ActionSpec** for type-safe parameter access
+- **All verifiers return classification**: success/retryable/human_required/recoverable/fatal
+- **Explicit CAPTCHA/consent/sorry page detection** with human_required classification
+- **No blind trust** - actions without verifiers return "recoverable" (not success)
+
+---
+
+### 5. Verifier Updates (`backend/agent/verifier.py`)
+- **Accepts ActionSpec** for type safety
+- **Proper COMPLETED classification** for successful actions
+- **Failure classification mapping** from observer to verifier status
+- **should_retry()** logic per classification type
+
+---
+
+### 6. AgentCore Orchestration (`backend/agent/core.py`)
+
+**New execution loop:**
+```
+1. GOAL UNDERSTANDING (planner.understand_goal)
+2. PLAN GENERATION (planner.plan_task → ActionSpec[])
+3. PLAN VALIDATION (plan.is_valid, auto-fix if needed)
+4. DEPENDENCY-AWARE EXECUTION:
+   while actions remain:
+     - Check dependencies satisfied
+     - Skip speak actions (collect text)
+     - Check human pause state
+     - EXECUTE (emit tool_started/tool_completed)
+     - OBSERVE (emit observing)
+     - VERIFY (emit verification_started/verification_passed/verification_failed)
+     - ON SUCCESS: mark completed, reset retry, advance
+     - ON FAILURE: classify → retry/replan/human/fatal
+5. EXECUTE REMAINING INCOMPLETE STEPS
+6. FINAL OUTCOME VERIFICATION (_verify_final_outcome)
+7. EMIT task_completed/task_partial/task_failed
+```
+
+**New event types emitted:**
+- planning, plan_created, plan_validated, plan_validation_failed
+- step_started, tool_started, tool_completed, observing, verification_started, verification_passed, verification_failed
+- step_completed, step_failed
+- retrying, replanning, human_intervention_required, waiting_for_user, resuming
+- final_verification, task_completed, task_partial, task_failed
+
+---
+
+### 7. API Endpoints (`main.py`)
+- `/api/agent/plan` - Returns structured ActionSpec list
+- `/api/agent/resume` - Placeholder for human-in-the-loop resume (needs state persistence)
+
+---
+
+## BEHAVIORAL CHANGES
+
+### Before (Old Architecture):
+```
+USER REQUEST → LLM → Action List → Execute All → "Done, sir."
+```
+- No goal understanding
+- No dependency tracking
+- No plan validation
+- No real verification (trusted executor OK)
+- No failure classification (all failures = retry 3x)
+- No replanning
+- No human pause (treated as failure)
+- Success = last tool returned OK
+
+### After (New Architecture):
+```
+USER REQUEST 
+  → GOAL UNDERSTANDING (what is the END STATE?)
+  → PLANNING (dependency-aware ActionSpec[])
+  → PLAN VALIDATION (check all params, deps, completeness)
+  → EXECUTION LOOP (respecting dependencies):
+      EXECUTE → OBSERVE (real state) → VERIFY (classify failure)
+      → RETRY / REPLAN / PAUSE FOR HUMAN / FATAL
+  → FINAL OUTCOME VERIFICATION (document exists? calculation correct? file created?)
+  → ONLY THEN: "Task complete, sir."
+```
+
+---
+
+## TEST RESULTS
+
+### Planner Tests (all passing):
+1. **Simple sequential** (Open Notepad + type): 3 steps, valid deps, task_type=SEQUENTIAL
+2. **Calculator** (125 * 48): 2 steps, task_type=SIMPLE
+3. **Research + Document** (Python history → Word): 10 steps, complex deps, task_type=RESEARCH_DOCUMENT
+4. **Browser search** (AI news): 3 steps, task_type=SIMPLE
+5. **Replanning**: Preserves completed steps, regenerates plan with failure context
+
+### State Management:
+- ActionSpec properly tracks depends_on, produces, consumes
+- Plan validation catches missing params, invalid deps, missing speak
+- TaskState preserves extracted_sources, search_results across replans
+
+### Events:
+- All new event types emitted in correct sequence
+- Structured data includes step info, classifications, context
+
+---
+
+## FILES MODIFIED
+
+1. `backend/agent/state.py` - Complete rewrite with new enums, ActionSpec, Plan, enhanced TaskState
+2. `backend/agent/planner.py` - Complete rewrite with goal understanding, validation, replanning
+3. `backend/agent/executor.py` - Updated for ActionSpec, added state injection
+4. `backend/agent/observer.py` - Updated for ActionSpec, all verifiers return classification
+5. `backend/agent/verifier.py` - Updated for ActionSpec, proper COMPLETED status
+6. `backend/agent/core.py` - Complete rewrite with new orchestration loop, final verification, events
+7. `main.py` - Updated /api/agent/plan, added /api/agent/resume
+8. `test_architecture.py` - New test script (created)
+
+---
+
+## KNOWN LIMITATIONS / TODO
+
+1. **State persistence for resume**: `/api/agent/resume` needs TaskState serialization across requests
+2. **LLM replanning quality**: Replan prompt could be more sophisticated
+3. **Parallel execution**: Currently sequential; could execute independent branches in parallel
+4. **More verifiers**: Some action types still lack specific verifiers (return recoverable)
+5. **Frontend integration**: SSE events need frontend handlers for new event types
+6. **Timeout handling**: Long-running tasks may need configurable timeouts
+
+---
+
+## ARCHITECTURAL PRINCIPLES FOLLOWED
+
+✅ Goal understanding before planning
+✅ Automatic task decomposition
+✅ Structured action parameters (no natural-language tool args)
+✅ Dependency-aware planning with explicit data flow
+✅ Persistent TaskState with structured outputs
+✅ Plan validation BEFORE execution
+✅ Execute → Observe → Verify loop
+✅ Failure classification (retryable/recoverable/human/fatal)
+✅ Intelligent retrying (exponential backoff, strategy change)
+✅ Human-in-the-loop (pause/resume, not fail)
+✅ Replanning from current state (preserving progress)
+✅ Tool selection by task (not keyword)
+✅ Entity/data type awareness
+✅ Data flow between steps via state.action_outputs
+✅ Final completion gate (outcome verification)
+✅ Final response reflects real state
+✅ Observability events for all major transitions
+✅ Kept all existing capabilities (Playwright, pywinauto, Calculator, Word, etc.)
+
+---
+
+## HOW TO TEST
+
+```bash
+# Test planner goal understanding
+python -c "
+from backend.agent.planner import Planner
+from backend.agent.state import TaskState
+p = Planner()
+s = TaskState()
+goal = p.understand_goal('Research AI and create doc', s)
+print(goal)
+"
+
+# Test plan generation
+python -c "
+from backend.agent.planner import Planner
+from backend.agent.state import TaskState
+p = Planner()
+s = TaskState()
+actions = p.plan_task('Open Notepad and type Hello', s)
+for a in actions: print(a.type, a.description, a.depends_on)
+print('Valid:', s.plan.is_valid)
+"
+
+# Test full agent (requires API key for browser actions)
+python test_architecture.py
+```

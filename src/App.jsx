@@ -1,93 +1,187 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+
 import {
+
   Settings, Send, Camera, Activity, Volume2, VolumeX, Volume1,
+
   Play, SkipForward, SkipBack, Search, FolderPlus, Trash2, Eye,
+
   File as FileIcon, Folder, X, RotateCcw,
+
   Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
-  Mic, MicOff
+
+  Mic, MicOff, Brain
+
 } from 'lucide-react'
+
 import Header from './Header';
+
 import Telemetry from './Telemetry';
+
 import CommandGrid from './CommandGrid';
+
 import CoreSphere from './CoreSphere';
+
 import PhonePanel from './PhonePanel';
+
+import PhoneMirrorPage from './PhoneMirrorPage';
+
+import GalleryPage from './GalleryPage';
+
 import { useVoice } from './hooks/useVoice';
 
+
+
 function formatBytes(n) {
+
   if (!n) return '0 B'
+
   const units = ['B', 'KB', 'MB', 'GB']
+
   let i = 0
+
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+
 }
+
+
 
 function TimerWidget({ timerData, onCancel }) {
+
   const [remaining, setRemaining] = useState(timerData.seconds)
+
   const totalRef = useRef(timerData.seconds)
+
   const intervalRef = useRef(null)
 
+
+
   useEffect(() => {
+
     setRemaining(timerData.seconds)
+
     totalRef.current = timerData.seconds
+
     if (intervalRef.current) clearInterval(intervalRef.current)
+
     intervalRef.current = setInterval(() => {
+
       setRemaining(r => {
+
         if (r <= 1) { clearInterval(intervalRef.current); return 0 }
+
         return r - 1
+
       })
+
     }, 1000)
+
     return () => clearInterval(intervalRef.current)
+
   }, [timerData])
 
+
+
   const h = Math.floor(remaining / 3600)
+
   const m = Math.floor((remaining % 3600) / 60)
+
   const s = remaining % 60
+
   const display = h > 0
+
     ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+
     : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+
   const pct = totalRef.current > 0 ? (remaining / totalRef.current) * 100 : 0
+
   const urgent = remaining <= 30 && remaining > 0
+
   const done = remaining === 0
 
+
+
   return (
+
     <div className="timer-strip">
+
       <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
+
       <div className="timer-info">
+
         <div className="timer-label">{timerData.label || 'TIMER'}</div>
+
         <div className={`timer-countdown ${urgent ? 'urgent' : ''}`}>
+
           {done ? "TIME'S UP!" : display}
+
         </div>
+
         <div className="timer-bar-wrap">
+
           <div className="timer-bar-fill" style={{ width: `${pct}%` }} />
+
         </div>
+
       </div>
+
       <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
+
     </div>
+
   )
+
 }
 
+
+
 export default function App() {
+
   const [online, setOnline] = useState(true)
+
   const [busy, setBusy] = useState(false)
+
   const [stats, setStats] = useState({ cpu: 0, memory: 0, disk: 0, processes: [] })
+
   const [files, setFiles] = useState([])
+
   const [messages, setMessages] = useState([
+
     { role: 'jarvis', text: 'All systems online, sir. I am at your disposal.' }
+
   ])
+
   const [prompt, setPrompt] = useState('')
+
   const [fileData, setFileData] = useState(null)
+
   const [imageData, setImageData] = useState(null)
+
   const [settingsOpen, setSettingsOpen] = useState(false)
+
   const [geminiKey, setGeminiKey] = useState('')
+
   const [hfKey, setHfKey] = useState('')
+
   const [geminiProjectId, setGeminiProjectId] = useState('')
+
   const [groqKey, setGroqKey] = useState('')
+
   const [saveNote, setSaveNote] = useState('')
+
   const [googleLinked, setGoogleLinked] = useState(null)
+
   const [oauthBusy, setOauthBusy] = useState(false)
+
   const [oauthMsg, setOauthMsg] = useState('')
+
   const [logs, setLogs] = useState([])
+
   const [chatMode, setChatMode] = useState(false)
+
   const [pendingImage, setPendingImage] = useState(null)
   const [pendingDocument, setPendingDocument] = useState(null)
   const [extracting, setExtracting] = useState(false)
@@ -95,6 +189,10 @@ export default function App() {
   const [timerData, setTimerData] = useState(null)
   const [booting, setBooting] = useState(true)
   const [activeView, setActiveView] = useState('core')
+  const [agentMode, setAgentMode] = useState(false)
+  const [agentStatus, setAgentStatus] = useState('ready')
+  const [agentEvents, setAgentEvents] = useState([])
+  const [voiceEnabled, setVoiceEnabled] = useState(true)
 
   useEffect(() => {
     const timer = setTimeout(() => setBooting(false), 4000)
@@ -336,7 +434,7 @@ export default function App() {
   useEffect(() => { runCommandRef.current = chatMode ? runStreamingChat : runCommand })
 
   function speak(text) {
-    if (!text || !window.speechSynthesis) return
+    if (!voiceEnabled || !text || !window.speechSynthesis) return
     window.speechSynthesis.cancel()
     const utter = new SpeechSynthesisUtterance(text)
     utter.rate = 1
@@ -353,6 +451,14 @@ export default function App() {
 
   async function runCommand(text) {
     if (!text.trim() || busy) return
+    // Handle agent mode toggle
+    if (text.trim().toLowerCase() === 'toggle agent') {
+      setAgentMode(!agentMode)
+      setMessages(m => [...m, { role: 'jarvis', text: "Agent mode " + (agentMode ? 'deactivated' : 'activated') + ", sir." }])
+      setPrompt('')
+      setBusy(false)
+      return
+    }
     setMessages(m => [...m, { role: 'user', text }])
     setPrompt('')
     setBusy(true)
@@ -429,6 +535,90 @@ export default function App() {
     }
   }
 
+  async function runAgentMode(text) {
+    if (!text.trim() || busy) return
+    setMessages(m => [...m, { role: 'user', text }])
+    setPrompt('')
+    setBusy(true)
+    setAgentEvents([])
+    setAgentStatus('planning')
+
+    try {
+      const res = await fetch('/api/agent/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      })
+
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({}))
+        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Agent failed to start, sir.' }])
+        setAgentStatus('error')
+        setBusy(false)
+        return
+      }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let finalSpeak = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        // Parse SSE lines
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const raw = line.slice(6).trim()
+          if (!raw) continue
+          try {
+            const event = JSON.parse(raw)
+            const { type, message, icon } = event
+
+            // Update agent status
+            if (type === 'planning') setAgentStatus('planning')
+            else if (type === 'action_start') setAgentStatus('executing')
+            else if (type === 'action_done') setAgentStatus('observing')
+            else if (type === 'action_error') setAgentStatus('error')
+            else if (type === 'complete' || type === 'done') setAgentStatus('completed')
+            else if (type === 'error') setAgentStatus('error')
+
+            // Accumulate event log
+            if (type !== 'done') {
+              const prefix = icon || (type === 'action_done' ? '✓' : type === 'action_error' ? '✗' : '→')
+              setAgentEvents(ev => [
+                ...ev,
+                { text: `${prefix} ${message}`, type }
+              ])
+            }
+
+            // Capture final speak text
+            if (type === 'complete') {
+              finalSpeak = message
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+
+      // Add final JARVIS message
+      const reply = finalSpeak || 'Agent task complete, sir.'
+      setMessages(m => [...m, { role: 'jarvis', text: reply }])
+      speak(reply)
+      refreshFiles()
+
+    } catch (err) {
+      setMessages(m => [...m, { role: 'jarvis', text: 'Agent connection lost, sir. Is the backend running?' }])
+      setAgentStatus('error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   function handleFileSelect(e) {
     const file = e.target.files?.[0]
     e.target.value = ''
@@ -456,7 +646,7 @@ export default function App() {
         if (res.ok) {
           setPendingDocument({ text: data.text, fileName: file.name, charCount: data.char_count, truncated: data.truncated })
         } else {
-          setMessages(m => [...m, { role: 'jarvis', text: data.detail || `I couldn't read ${file.name}, sir.` }])
+          setMessages(m => [...m, { role: 'jarvis', text: data.detail || "I couldn't read " + file.name + ", sir." }])
         }
       })
       .catch(() => {
@@ -536,6 +726,7 @@ export default function App() {
   function handleSend() {
     if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
     if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
+    if (agentMode) { runAgentMode(prompt); return }
     if (chatMode) runStreamingChat(prompt)
     else runCommand(prompt)
   }
@@ -629,25 +820,55 @@ export default function App() {
     { label: 'Restart', icon: RefreshCw, cmd: 'restart the pc' },
     { label: 'Shutdown', icon: Power, cmd: 'shutdown' },
     { label: 'Clear Chat', icon: RotateCcw, cmd: 'clear chat' },
+    { label: 'Agent Mode', icon: Brain, cmd: 'toggle agent' },
   ]
 
   const sphereState = ttsSpeaking ? 'speaking' : (busy || isProcessing) ? 'processing' : (voiceActive || isPushToTalkActive) ? 'listening' : isWakeDetected ? 'wake' : 'idle'
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      {/* ── Full-page overlays (Phone / Gallery) ── */}
+      {activeView === 'phone' && (
+        <PhoneMirrorPage
+          setActiveView={setActiveView}
+          messages={messages}
+          prompt={prompt}
+          setPrompt={setPrompt}
+          busy={busy}
+          handleSend={handleSend}
+          isPushToTalkActive={isPushToTalkActive}
+          togglePushToTalk={togglePushToTalk}
+          fileInputRef={fileInputRef}
+          pendingImage={pendingImage}
+          setPendingImage={setPendingImage}
+          pendingDocument={pendingDocument}
+          setPendingDocument={setPendingDocument}
+          extracting={extracting}
+        />
+      )}
+      {activeView === 'files' && (
+        <GalleryPage setActiveView={setActiveView} />
+      )}
+
+      {/* ── Core view (hidden when phone/files active) ── */}
+      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+
       {/* TOP BAR */}
-      <Header
-        online={online}
-        busy={busy}
-        chatMode={chatMode}
-        setChatMode={setChatMode}
-        isSpeaking={ttsSpeaking}
-        onOpenSettings={() => setSettingsOpen(true)}
-        voiceActive={voiceActive}
-        toggleVoice={toggleVoice}
-        voiceEnabled={true}
-        setVoiceEnabled={() => { }}
-      />
+<Header
+  online={online}
+  busy={busy}
+  chatMode={chatMode}
+  setChatMode={setChatMode}
+  isSpeaking={ttsSpeaking}
+  onOpenSettings={() => setSettingsOpen(true)}
+  voiceActive={voiceActive}
+  toggleVoice={toggleVoice}
+  voiceEnabled={voiceEnabled}
+  setVoiceEnabled={setVoiceEnabled}
+  agentMode={agentMode}
+  setAgentMode={setAgentMode}
+  agentStatus={agentStatus}
+/>
 
       {/* MAIN 3-COLUMN GRID */}
       <nav className="module-rail" aria-label="JARVIS modules">
@@ -655,7 +876,7 @@ export default function App() {
         <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
         <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
       </nav>
-      <div className={`hud-grid view-${activeView}`}>
+      <div className="hud-grid">
 
         {/* ── LEFT COLUMN: Chat + File Bay ── */}
         <div className="hud-left">
@@ -764,7 +985,17 @@ export default function App() {
             </div>
           </div>
 
-          {logs.length > 0 && (
+          {/* Show agent events in Agent Mode, otherwise show normal logs */}
+          {agentMode && agentEvents.length > 0 && (
+            <div className="panel log-ticker">
+              {[...agentEvents].reverse().map((ev, i) => (
+                <div key={i} className={`line ${ev.type === 'action_done' ? 'result' : ev.type === 'action_error' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
+                  {ev.text}
+                </div>
+              ))}
+            </div>
+          )}
+          {!agentMode && logs.length > 0 && (
             <div className="panel log-ticker">
               {[...logs].reverse().map((l, i) => (
                 <div key={i} className={`line ${l.startsWith('ACTION') ? 'exec' : l.startsWith('RESULT') ? 'result' : ''}`}>
@@ -784,8 +1015,9 @@ export default function App() {
           <PhonePanel />
         </div>
       </div>
+      </div>{/* end core-view wrapper */}
 
-      {/* Settings Modal */}
+      {/* Settings Modal (always rendered so it can open from any view) */}
       {settingsOpen && (
         <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
