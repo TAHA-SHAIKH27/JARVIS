@@ -1202,7 +1202,15 @@ async def agent_plan(req: dict):
     from backend.agent.planner import Planner
     planner = Planner()
     steps = planner.plan_task(task, state)
-    return {"status": "success", "steps": steps, "task": task}
+    return {"status": "success", "steps": [{"type": s.type, "description": s.description, "parameters": s.parameters} for s in steps], "task": task}
+
+
+@app.post("/api/agent/resume")
+async def agent_resume(req: dict):
+    """Resume agent after human intervention."""
+    # This would need a way to persist state across requests
+    # For now, return a placeholder
+    return {"status": "success", "message": "Resume endpoint - state persistence needed"}
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────

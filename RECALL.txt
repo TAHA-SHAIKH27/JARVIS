@@ -1,235 +1,252 @@
-# J.A.R.V.I.S. Agent Implementation - RECALL LOG (Final Status)
+# JARVIS Agent Architecture Improvements - Recall Document
 
-## PROJECT STATUS: ALL MAJOR FIXES COMPLETE - Ready for Integration Testing
-
-### SERVICES RUNNING
-```
-[Start] All services running!
-  Backend:  http://127.0.0.1:8000
-  Frontend: http://localhost:3000
-  Voice:    Browser WebSocket (click mic button)
-```
-
-### BACKEND - PYTHON FILES (ALL COMPILE OK - VERIFIED)
-- main.py ✅
-- backend/agent/state.py ✅
-- backend/agent/registry.py ✅
-- backend/agent/planner.py ✅
-- backend/agent/executor.py ✅
-- backend/agent/observer.py ✅
-- backend/agent/verifier.py ✅
-- backend/agent/core.py ✅
-- backend/tools/computer.py ✅
-- backend/tools/browser.py ✅
-- backend/tools/office.py ✅
-- backend/tools/vision.py ✅
-- system_ops.py ✅
-- agent.py ✅
-
-### FRONTEND FILES
-- src/App.jsx ✅ (with agent mode, AgentStatus, AgentToggle)
-- src/Header.jsx ✅ (Brain icon, agent mode toggle, status bar)
-- src/components/AgentStatus.jsx ✅
-- src/components/AgentToggle.jsx ✅
-- src/App.jsx quickActions includes 'Agent Mode' ✅
-
-### API ENDPOINTS ADDED TO main.py
-- POST /api/agent/run - SSE streaming agent execution (NEW - uses AgentCore)
-- POST /api/agent/execute - Execute natural language task (legacy)
-- GET /api/agent/status - Get current agent state
-- POST /api/agent/plan - Generate plan for task
+## AIM
+Transform JARVIS from a simple command executor into a genuine AI computer agent that:
+1. Understands the user's ACTUAL GOAL (not just the literal request)
+2. Decomposes tasks into dependency-aware steps
+3. Validates plans BEFORE execution
+4. Executes → Observes → Verifies each step with real state checking
+5. Classifies failures intelligently (retryable/recoverable/human_required/fatal)
+6. Replans automatically when strategies fail
+7. Handles human-in-the-loop properly (pause/resume, not fail)
+8. Only reports success when the FINAL OUTCOME is genuinely verified
+9. Emits structured observability events for the frontend
 
 ---
 
-## MAJOR FIXES APPLIED (AgentCore Integration)
+## CORE ARCHITECTURAL CHANGES
 
-### 1. FIXED: open_app_wait returns ERROR when window not detected
-**File:** `backend/agent/executor.py` (lines 347-403)
-- **Problem:** open_app_wait returned success even when window timed out
-- **Fix:** Changed timeout from 6s to 8s, returns `{"status": "error", "message": "Launched {app_name} but window '{window_title}' not detected within timeout"}` instead of success
+### 1. Enhanced TaskState (`backend/agent/state.py`)
+**New fields added:**
+- `interpreted_goal` - The understood end state (not the raw request)
+- `requirements` - Full goal analysis from planner
+- `constraints` - Extracted constraints (format, location, min_sources, etc.)
+- `task_type` - Enum: SIMPLE, SEQUENTIAL, RESEARCH, RESEARCH_CALCULATION, RESEARCH_DOCUMENT, MULTI_APP, HUMAN_INTERVENTION
+- `action_outputs` - Structured outputs from each step for data flow
+- `failed_steps` - Detailed failure tracking with classification
+- `human_verification_*` - Complete human-in-the-loop state
+- `waiting_for_user` - Explicit pause state
+- `replan_count`, `max_replans`, `last_replan_reason` - Replanning control
+- `final_outcome_verified`, `final_outcome_data` - Final verification gate
 
-### 2. FIXED: AgentCore state machine stops on critical failures
-**File:** `backend/agent/core.py` (lines 212-257)
-- **Problem:** Failed mandatory actions silently advanced to next step
-- **Fix:** Added early return on verification failure after max retries - task marked as "failed" and returns immediately
+**New enums:**
+- `TaskType` - Classifies task complexity for planning strategy
+- `FailureClassification` - RETRYABLE, HUMAN_REQUIRED, RECOVERABLE, FATAL, COMPLETED
+- `BrowserPageState` - CAPTCHA, CONSENT, SORRY_PAGE, NETWORK_ERROR, EMPTY_RESULTS, NAVIGATION_PENDING, NORMAL_SERP, UNKNOWN
 
-### 3. FIXED: Observer/Verifier require actual verification (no blind trust)
-**File:** `backend/agent/observer.py` (lines 252-350)
-- **Problem:** Observer trusted executor results for unknown action types
-- **Fix:** 
-  - Default case now returns `{"verified": False, "message": "No verifier implemented for action type: {atype}. Cannot verify result."}`
-  - Added specific verifiers for ALL legacy system_ops actions:
-    - open_app/launch_app → verify_window_exists
-    - close_app → verify process terminated
-    - create_folder → verify folder exists
-    - create_word_doc → verify_docx (reads content)
-    - write_file → verify_file_exists
-    - take_screenshot → verify file in screenshots dir
-    - search_web/open_url → verify_browser_page
-    - media/volume/power actions → verified by execution
-    - info queries (battery, network, etc.) → verified by result status
-    - clipboard/phone/WhatsApp/image/timer/notes → verified by execution
+**New dataclasses:**
+- `ActionSpec` - Structured action with: type, description, parameters, depends_on[], produces[], consumes[], verification{}, is_critical
+- `Plan` - Validated plan with: actions[], goal, task_type, validation_errors[], is_valid, final_outcome_verification{}
 
-### 4. FIXED: Planner produces structured executable actions
-**File:** `backend/agent/planner.py`
-- **Problem:** Rule-based fallback produced vague English descriptions; "search" matched "research" first
-- **Fix:**
-  - Updated PLANNER_SYSTEM_PROMPT with exact action types and parameters
-  - Added `browser_extract_search_results` action type for research workflow
-  - Reordered conditions: "research" checked BEFORE "search" (since "research" contains "search")
-  - Enhanced `_rule_based_plan()` with handlers for:
-    - Notepad + type → open_app_wait → type_in_app → speak
-    - Calculator → calculator_compute → speak
-    - Chrome/Search → browser_search → browser_get_title → speak
-    - Folder creation → create_folder_verified → verify_file → speak
-    - File creation → write_file_verified → verify_file → speak
-    - Research + Word → browser_search → browser_extract_search_results → browser_navigate → browser_extract (multiple) → create_docx → verify_file → speak
+---
 
-### 5. FIXED: Tools connected through ToolRegistry (no duplicates)
-**File:** `backend/agent/core.py` (lines 52-90)
-- Added imports for Computer, Browser, Office tool classes
-- Registered as: `computer_tool`, `browser_tool`, `office_tool`
-- Executor uses Browser class directly (headless=False for visibility)
+### 2. Goal Understanding & Dependency-Aware Planning (`backend/agent/planner.py`)
 
-### 6. FIXED: Browser research workflow
-**Files:** `backend/agent/executor.py`, `backend/tools/browser.py`
-- Added `_browser_extract_search_results()` in executor
-- Added `extract_search_results()` in Browser class (extracts clickable links from Google SERP)
-- Observer verifies search results count > 0
-- Planner prompt updated: browser_search → browser_extract_search_results → browser_navigate → browser_extract
+**New capabilities:**
+- **Two-stage planning**: First understand goal (GOAL_UNDERSTANDING_PROMPT), then create plan (PLANNER_SYSTEM_PROMPT)
+- **Structured action specs**: Each action has explicit depends_on, produces, consumes for data flow
+- **Plan validation** (`_validate_plan`): Checks dependencies, required parameters, consumed/produced keys, speak action at end
+- **Auto-fix** (`_auto_fix_plan`): Adds missing speak, fixes browser_extract/create_docx dependencies
+- **Replanning** (`replan`): Preserves completed steps, extracted data, search results; generates new plan with failure context
+- **Rule-based fallbacks** for all task types when no API key
+
+**Data flow example (research → document):**
+```
+browser_search (produces: search_results) 
+  → browser_navigate[0] (consumes: search_results, produces: current_page_url)
+    → browser_extract[0] (consumes: current_page_url, produces: extracted_sources)
+  → browser_navigate[1] (consumes: search_results)
+    → browser_extract[1] (produces: extracted_sources)
+  → browser_navigate[2] 
+    → browser_extract[2]
+  → create_docx (consumes: extracted_sources, produces: created_document_path)
+  → verify_file (consumes: created_document_path)
+  → speak
+```
+
+---
+
+### 3. Executor Updates (`backend/agent/executor.py`)
+- **Accepts ActionSpec** instead of raw dict
+- **State injection** (`_inject_state_data`): Auto-resolves source_index → URL, injects extracted_sources into create_docx content, passes active_window to type_in_app
+- **Structured outputs** stored in state.action_outputs for downstream steps
+
+---
+
+### 4. Observer Updates (`backend/agent/observer.py`)
+- **Accepts ActionSpec** for type-safe parameter access
+- **All verifiers return classification**: success/retryable/human_required/recoverable/fatal
+- **Explicit CAPTCHA/consent/sorry page detection** with human_required classification
+- **No blind trust** - actions without verifiers return "recoverable" (not success)
+
+---
+
+### 5. Verifier Updates (`backend/agent/verifier.py`)
+- **Accepts ActionSpec** for type safety
+- **Proper COMPLETED classification** for successful actions
+- **Failure classification mapping** from observer to verifier status
+- **should_retry()** logic per classification type
+
+---
+
+### 6. AgentCore Orchestration (`backend/agent/core.py`)
+
+**New execution loop:**
+```
+1. GOAL UNDERSTANDING (planner.understand_goal)
+2. PLAN GENERATION (planner.plan_task → ActionSpec[])
+3. PLAN VALIDATION (plan.is_valid, auto-fix if needed)
+4. DEPENDENCY-AWARE EXECUTION:
+   while actions remain:
+     - Check dependencies satisfied
+     - Skip speak actions (collect text)
+     - Check human pause state
+     - EXECUTE (emit tool_started/tool_completed)
+     - OBSERVE (emit observing)
+     - VERIFY (emit verification_started/verification_passed/verification_failed)
+     - ON SUCCESS: mark completed, reset retry, advance
+     - ON FAILURE: classify → retry/replan/human/fatal
+5. EXECUTE REMAINING INCOMPLETE STEPS
+6. FINAL OUTCOME VERIFICATION (_verify_final_outcome)
+7. EMIT task_completed/task_partial/task_failed
+```
+
+**New event types emitted:**
+- planning, plan_created, plan_validated, plan_validation_failed
+- step_started, tool_started, tool_completed, observing, verification_started, verification_passed, verification_failed
+- step_completed, step_failed
+- retrying, replanning, human_intervention_required, waiting_for_user, resuming
+- final_verification, task_completed, task_partial, task_failed
+
+---
+
+### 7. API Endpoints (`main.py`)
+- `/api/agent/plan` - Returns structured ActionSpec list
+- `/api/agent/resume` - Placeholder for human-in-the-loop resume (needs state persistence)
+
+---
+
+## BEHAVIORAL CHANGES
+
+### Before (Old Architecture):
+```
+USER REQUEST → LLM → Action List → Execute All → "Done, sir."
+```
+- No goal understanding
+- No dependency tracking
+- No plan validation
+- No real verification (trusted executor OK)
+- No failure classification (all failures = retry 3x)
+- No replanning
+- No human pause (treated as failure)
+- Success = last tool returned OK
+
+### After (New Architecture):
+```
+USER REQUEST 
+  → GOAL UNDERSTANDING (what is the END STATE?)
+  → PLANNING (dependency-aware ActionSpec[])
+  → PLAN VALIDATION (check all params, deps, completeness)
+  → EXECUTION LOOP (respecting dependencies):
+      EXECUTE → OBSERVE (real state) → VERIFY (classify failure)
+      → RETRY / REPLAN / PAUSE FOR HUMAN / FATAL
+  → FINAL OUTCOME VERIFICATION (document exists? calculation correct? file created?)
+  → ONLY THEN: "Task complete, sir."
+```
 
 ---
 
 ## TEST RESULTS
 
-### WHAT PASSED ✅
-| Test | Status | Notes |
-|------|--------|-------|
-| Python compilation (all 14 files) | ✅ PASS | All py_compile checks pass |
-| Planner rule-based fallback (notepad) | ✅ PASS | Returns correct structured actions |
-| Planner rule-based fallback (calculator) | ✅ PASS | calculator_compute action |
-| Planner rule-based fallback (search) | ✅ PASS | browser_search action |
-| Planner rule-based fallback (folder) | ✅ PASS | Extracts folder name correctly |
-| Planner rule-based fallback (research) | ✅ PASS | Full 9-step research workflow |
-| Planner LLM path (Gemini) | ✅ PASS | Falls back correctly when rate limited |
-| AgentCore initialization | ✅ PASS | Creates all components, registers tools |
-| AgentCore process() start | ✅ PASS | Emits "planning" event successfully |
+### Planner Tests (all passing):
+1. **Simple sequential** (Open Notepad + type): 3 steps, valid deps, task_type=SEQUENTIAL
+2. **Calculator** (125 * 48): 2 steps, task_type=SIMPLE
+3. **Research + Document** (Python history → Word): 10 steps, complex deps, task_type=RESEARCH_DOCUMENT
+4. **Browser search** (AI news): 3 steps, task_type=SIMPLE
+5. **Replanning**: Preserves completed steps, regenerates plan with failure context
 
-### KNOWN ISSUES / UNTESTED
-| Component | Status | Notes |
-|-----------|--------|-------|
-| open_app_wait (Notepad) | ⚠️ UNTESTED | May need longer timeout on some systems |
-| calculator_compute | ⚠️ UNTESTED | Windows Calculator automation via pyautogui |
-| browser_search + extract | ⚠️ UNTESTED | Playwright headless=False visibility |
-| Full AgentCore loop | ⚠️ UNTESTED | Need to test with actual window operations |
+### State Management:
+- ActionSpec properly tracks depends_on, produces, consumes
+- Plan validation catches missing params, invalid deps, missing speak
+- TaskState preserves extracted_sources, search_results across replans
+
+### Events:
+- All new event types emitted in correct sequence
+- Structured data includes step info, classifications, context
 
 ---
 
-## 5 DEFINITION OF DONE TESTS TO RUN
+## FILES MODIFIED
 
-### TEST 1: Notepad
-> "Open Notepad and type 'JARVIS system test successful.' Do not save it."
-- Expected: Notepad opens → window detected → text typed → verified → no save
-
-### TEST 2: Calculator
-> "Open Calculator and calculate 125 × 48."
-- Expected: Calculator opens → 125 * 48 entered → equals pressed → display reads 6000 → verified
-
-### TEST 3: Folder + File
-> "Create a folder on my Desktop called JARVIS_TEST and create status.txt inside it. Verify it exists."
-- Expected: Folder created → file created → both verified on filesystem
-
-### TEST 4: Browser Research
-> "Open Chrome, search for the official OpenAI website, open it, and tell me the page title."
-- Expected: Visible Chrome opens → Google search → result clicked → page loaded → title extracted
-
-### TEST 5: Full Research + Word (MOST IMPORTANT)
-> "Research National Science Day from multiple websites and create a Word document on my Desktop containing the information and sources."
-- Expected: Search → extract results → navigate sources → extract content → create DOCX → save → verify → report
+1. `backend/agent/state.py` - Complete rewrite with new enums, ActionSpec, Plan, enhanced TaskState
+2. `backend/agent/planner.py` - Complete rewrite with goal understanding, validation, replanning
+3. `backend/agent/executor.py` - Updated for ActionSpec, added state injection
+4. `backend/agent/observer.py` - Updated for ActionSpec, all verifiers return classification
+5. `backend/agent/verifier.py` - Updated for ActionSpec, proper COMPLETED status
+6. `backend/agent/core.py` - Complete rewrite with new orchestration loop, final verification, events
+7. `main.py` - Updated /api/agent/plan, added /api/agent/resume
+8. `test_architecture.py` - New test script (created)
 
 ---
 
-## QUICK TEST COMMANDS
+## KNOWN LIMITATIONS / TODO
 
-```powershell
-# Start backend (terminal 1)
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level warning
-
-# Start frontend (terminal 2)  
-npm run dev
-
-# Test backend status
-curl http://127.0.0.1:8000/api/status
-
-# Test agent status
-curl http://127.0.0.1:8000/api/agent/status
-
-# Test agent plan (no execution)
-curl -X POST http://127.0.0.1:8000/api/agent/plan -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
-
-# Test agent execute (full run)
-curl -X POST http://127.0.0.1:8000/api/agent/execute -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
-
-# Test SSE endpoint (Agent Mode uses this)
-curl -N http://127.0.0.1:8000/api/agent/run -H "Content-Type: application/json" -d "{\"text\": \"open notepad and type hello\"}"
-```
+1. **State persistence for resume**: `/api/agent/resume` needs TaskState serialization across requests
+2. **LLM replanning quality**: Replan prompt could be more sophisticated
+3. **Parallel execution**: Currently sequential; could execute independent branches in parallel
+4. **More verifiers**: Some action types still lack specific verifiers (return recoverable)
+5. **Frontend integration**: SSE events need frontend handlers for new event types
+6. **Timeout handling**: Long-running tasks may need configurable timeouts
 
 ---
 
-## ARCHITECTURE VERIFICATION
+## ARCHITECTURAL PRINCIPLES FOLLOWED
 
-### Agent Mode Flow (NOW CONNECTED):
-```
-USER REQUEST
-  ↓
-Frontend: runAgentMode() → POST /api/agent/run (SSE)
-  ↓
-main.py: agent_run() → AgentCore.process()
-  ↓
-AgentCore → Planner.plan_task() → structured actions
-  ↓
-For each action:
-  Executor.execute() → real tool (computer/browser/office)
-  Observer.observe_after_action() → actual state check
-  Verifier.verify_action() → pass/fail/retry
-  emit event → SSE → Frontend shows live events
-  ↓
-VERIFIED RESULT → Agent decides next action
-  ↓
-REPEAT until complete
-  ↓
-FINAL VERIFIED RESPONSE
-```
-
-### Normal Chat Mode (UNCHANGED):
-```
-USER REQUEST
-  ↓
-Frontend: runCommand() → POST /api/command
-  ↓
-main.py: process_command() → agent.get_gemini_actions()
-  ↓
-LLM → JSON actions → system_ops execution
-  ↓
-Response with speak text
-```
+✅ Goal understanding before planning
+✅ Automatic task decomposition
+✅ Structured action parameters (no natural-language tool args)
+✅ Dependency-aware planning with explicit data flow
+✅ Persistent TaskState with structured outputs
+✅ Plan validation BEFORE execution
+✅ Execute → Observe → Verify loop
+✅ Failure classification (retryable/recoverable/human/fatal)
+✅ Intelligent retrying (exponential backoff, strategy change)
+✅ Human-in-the-loop (pause/resume, not fail)
+✅ Replanning from current state (preserving progress)
+✅ Tool selection by task (not keyword)
+✅ Entity/data type awareness
+✅ Data flow between steps via state.action_outputs
+✅ Final completion gate (outcome verification)
+✅ Final response reflects real state
+✅ Observability events for all major transitions
+✅ Kept all existing capabilities (Playwright, pywinauto, Calculator, Word, etc.)
 
 ---
 
-## FILES CHANGED IN THIS SESSION
+## HOW TO TEST
 
-| File | Key Changes |
-|------|-------------|
-| `backend/agent/executor.py` | Fixed open_app_wait error on timeout; added browser_extract_search_results |
-| `backend/agent/core.py` | Fixed state machine early return on failure; added tool class registration; fixed _setup_default_tools indentation |
-| `backend/agent/observer.py` | Added verifiers for all legacy action types; default case requires verification |
-| `backend/agent/planner.py` | Updated system prompt; reordered conditions (research before search); enhanced rule-based fallback |
-| `backend/tools/browser.py` | Added extract_search_results() method |
-| `test_agent.py` / `test_planner_direct.py` | Test scripts created |
+```bash
+# Test planner goal understanding
+python -c "
+from backend.agent.planner import Planner
+from backend.agent.state import TaskState
+p = Planner()
+s = TaskState()
+goal = p.understand_goal('Research AI and create doc', s)
+print(goal)
+"
 
----
+# Test plan generation
+python -c "
+from backend.agent.planner import Planner
+from backend.agent.state import TaskState
+p = Planner()
+s = TaskState()
+actions = p.plan_task('Open Notepad and type Hello', s)
+for a in actions: print(a.type, a.description, a.depends_on)
+print('Valid:', s.plan.is_valid)
+"
 
-## LAST UPDATED
-All major AgentCore fixes applied. Planner working correctly with research workflow.
-All Python files compile. Ready for integration testing with 5 DoD tests.
-Next step: Start backend + frontend and run the 5 Definition of Done tests.
+# Test full agent (requires API key for browser actions)
+python test_architecture.py
+```

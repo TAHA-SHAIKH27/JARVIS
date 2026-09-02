@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from backend.agent.state import TaskState
+from backend.agent.state import TaskState, ActionSpec
 from backend.agent.registry import ToolRegistry
 
 
@@ -45,48 +45,51 @@ class Executor:
     # Main dispatch
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def execute(self, action: Dict[str, Any], state: TaskState) -> Optional[Dict[str, Any]]:
-        """Execute a single action dict and return a result dict."""
-        atype = action.get("type", "")
+    async def execute(self, action: ActionSpec, state: TaskState) -> Optional[Dict[str, Any]]:
+        """Execute a single action spec and return a result dict."""
+        atype = action.type
+
+        # Inject state data into parameters for data flow
+        params = self._inject_state_data(action, state)
 
         # ── Desktop / Windows automation ────────────────────────────────────
 
         if atype == "open_app_wait":
-            return await self._open_app_wait(action, state)
+            return await self._open_app_wait(params, state)
 
         elif atype == "type_in_app":
-            return await self._type_in_app(action, state)
+            return await self._type_in_app(params, state)
 
         elif atype == "press_key":
-            return await self._press_key(action, state)
+            return await self._press_key(params, state)
 
         elif atype == "calculator_compute":
-            return await self._calculator_compute(action, state)
+            return await self._calculator_compute(params, state)
 
         # ── File system ──────────────────────────────────────────────────────
 
         elif atype == "create_folder_verified":
-            return self._create_folder(action)
+            return self._create_folder(params)
 
         elif atype == "write_file_verified":
-            return self._write_file(action)
+            return self._write_file(params)
 
         elif atype == "verify_file":
-            return self._verify_file(action)
+            return self._verify_file(params)
 
         elif atype == "create_docx":
-            return await self._create_docx(action, state)
+            return await self._create_docx(params, state)
 
-        # ── Browser ─────────────────────────────────────────────────────────
+        # ── Browser ──────────────────────────────────────────────────────────
 
         elif atype == "browser_search":
-            return await self._browser_search(action)
+            return await self._browser_search(params, state)
 
         elif atype == "browser_navigate":
-            return await self._browser_navigate(action)
+            return await self._browser_navigate(params, state)
 
         elif atype == "browser_extract":
-            return await self._browser_extract(action)
+            return await self._browser_extract(params, state)
 
         elif atype == "browser_get_title":
             return await self._browser_get_title()
@@ -97,30 +100,30 @@ class Executor:
         # ── Legacy system_ops actions (passed through unchanged) ─────────────
 
         elif atype == "speak":
-            return {"status": "success", "message": action.get("text", "")}
+            return {"status": "success", "message": params.get("text", "")}
 
         elif atype == "open_app":
-            app_name = action.get("app_name", "")
+            app_name = params.get("app_name", "")
             from system_ops import launch_any_app
             return launch_any_app(app_name)
 
         elif atype == "close_app":
-            app_name = action.get("app_name", "")
+            app_name = params.get("app_name", "")
             from system_ops import close_application
             return close_application(app_name)
 
         elif atype == "launch_app":
-            app_name = action.get("app_name", "")
+            app_name = params.get("app_name", "")
             from system_ops import launch_any_app
             return launch_any_app(app_name)
 
         elif atype == "shutdown":
             from system_ops import shutdown_pc
-            return shutdown_pc(int(action.get("delay_seconds", 0)))
+            return shutdown_pc(int(params.get("delay_seconds", 0)))
 
         elif atype == "restart":
             from system_ops import restart_pc
-            return restart_pc(int(action.get("delay_seconds", 0)))
+            return restart_pc(int(params.get("delay_seconds", 0)))
 
         elif atype == "cancel_shutdown":
             from system_ops import cancel_shutdown
@@ -159,13 +162,13 @@ class Executor:
             return media_control("prev")
 
         elif atype == "search_web":
-            query = action.get("query", "")
+            query = params.get("query", "")
             from system_ops import search_web
             return search_web(query)
 
         elif atype == "weather":
             from system_ops import get_weather
-            return get_weather(action.get("city", "London"))
+            return get_weather(params.get("city", "London"))
 
         elif atype == "battery":
             from system_ops import get_battery_info
@@ -188,13 +191,13 @@ class Executor:
             return get_system_stats()
 
         elif atype == "create_folder":
-            folder_name = action.get("folder_name", "")
+            folder_name = params.get("folder_name", "")
             from system_ops import create_folder
             return create_folder(folder_name)
 
         elif atype == "create_word_doc":
-            filename = action.get("filename", "")
-            content = action.get("content", "")
+            filename = params.get("filename", "")
+            content = params.get("content", "")
             from system_ops import create_word_document
             return create_word_document(filename, content)
 
@@ -208,29 +211,29 @@ class Executor:
 
         elif atype == "clipboard_write":
             from system_ops import set_clipboard
-            return set_clipboard(action.get("text", ""))
+            return set_clipboard(params.get("text", ""))
 
         elif atype == "open_url":
             from system_ops import open_url
-            return open_url(action.get("url", ""))
+            return open_url(params.get("url", ""))
 
         elif atype in ("write_file", "write_file_text"):
             from system_ops import write_file
-            return write_file(action.get("filename", ""), action.get("content", ""))
+            return write_file(params.get("filename", ""), params.get("content", ""))
 
         elif atype == "read_file":
             from system_ops import read_file
-            return read_file(action.get("filename", ""))
+            return read_file(params.get("filename", ""))
 
         elif atype == "delete_file":
             from system_ops import delete_file
-            return delete_file(action.get("filename", ""))
+            return delete_file(params.get("filename", ""))
 
         elif atype == "set_timer":
             return {
                 "status": "success",
-                "message": f"Timer set for {action.get('seconds', 60)} seconds",
-                "timer_data": {"seconds": action.get("seconds", 60), "label": action.get("label", "Timer")}
+                "message": f"Timer set for {params.get('seconds', 60)} seconds",
+                "timer_data": {"seconds": params.get("seconds", 60), "label": params.get("label", "Timer")}
             }
 
         elif atype == "add_note":
@@ -242,7 +245,7 @@ class Executor:
                 if os.path.exists(notes_path):
                     with open(notes_path) as f:
                         notes = _json.load(f)
-                note = {"id": int(datetime.now().timestamp() * 1000), "text": action.get("text", ""),
+                note = {"id": int(datetime.now().timestamp() * 1000), "text": params.get("text", ""),
                         "time": datetime.now().strftime("%b %d %H:%M")}
                 notes.append(note)
                 with open(notes_path, "w") as f:
@@ -260,7 +263,7 @@ class Executor:
                 if os.path.exists(todos_path):
                     with open(todos_path) as f:
                         todos = _json.load(f)
-                todo = {"id": int(datetime.now().timestamp() * 1000), "text": action.get("text", ""), "done": False}
+                todo = {"id": int(datetime.now().timestamp() * 1000), "text": params.get("text", ""), "done": False}
                 todos.append(todo)
                 with open(todos_path, "w") as f:
                     _json.dump(todos, f, indent=2)
@@ -282,45 +285,45 @@ class Executor:
 
         elif atype == "phone_tap":
             from phone_control import tap
-            return tap(action.get("x", 0), action.get("y", 0))
+            return tap(params.get("x", 0), params.get("y", 0))
 
         elif atype == "phone_swipe":
             from phone_control import swipe
-            return swipe(action.get("x1", 0), action.get("y1", 0),
-                         action.get("x2", 0), action.get("y2", 0),
-                         int(action.get("duration_ms", 300)))
+            return swipe(params.get("x1", 0), params.get("y1", 0),
+                         params.get("x2", 0), params.get("y2", 0),
+                         int(params.get("duration_ms", 300)))
 
         elif atype == "phone_text":
             from phone_control import input_text
-            return input_text(action.get("text", ""))
+            return input_text(params.get("text", ""))
 
         elif atype == "phone_key":
             from phone_control import press_key
-            return press_key(action.get("key", ""))
+            return press_key(params.get("key", ""))
 
         elif atype == "phone_launch_app":
             from phone_control import launch_app
-            return launch_app(action.get("package", ""))
+            return launch_app(params.get("package", ""))
 
         elif atype == "phone_unlock":
             from phone_control import unlock_phone
-            return unlock_phone(action.get("pin"))
+            return unlock_phone(params.get("pin"))
 
         elif atype == "phone_test_pin_tap":
             from phone_control import test_pin_digit_tap
-            return test_pin_digit_tap(str(action.get("digit", "")))
+            return test_pin_digit_tap(str(params.get("digit", "")))
 
         elif atype == "send_whatsapp":
             from whatsapp_ops import send_whatsapp_message
-            return send_whatsapp_message(action.get("contact", ""), action.get("message", ""))
+            return send_whatsapp_message(params.get("contact", ""), params.get("message", ""))
 
         elif atype == "send_whatsapp_phone":
             from whatsapp_ops import send_whatsapp_message_via_phone
-            return send_whatsapp_message_via_phone(action.get("contact", ""), action.get("message", ""))
+            return send_whatsapp_message_via_phone(params.get("contact", ""), params.get("message", ""))
 
         elif atype == "add_whatsapp_contact":
             from whatsapp_ops import add_contact
-            return add_contact(action.get("name", ""), action.get("phone", ""))
+            return add_contact(params.get("name", ""), params.get("phone", ""))
 
         elif atype == "clear_history":
             import agent
@@ -336,12 +339,41 @@ class Executor:
                     with open(cfg_path) as f:
                         hf_key = _json.load(f).get("huggingface_api_key", "")
                 from agent import generate_image_huggingface
-                return generate_image_huggingface(action.get("prompt", ""), hf_key, action.get("save_name", ""))
+                return generate_image_huggingface(params.get("prompt", ""), hf_key, params.get("save_name", ""))
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
         else:
             return {"status": "error", "message": f"Unknown action type: {atype}"}
+
+    def _inject_state_data(self, action: ActionSpec, state: TaskState) -> Dict[str, Any]:
+        """Inject state data into action parameters based on consumes/produces."""
+        params = action.parameters.copy()
+        
+        # For browser_navigate with source_index, resolve URL from search_results
+        if action.type == "browser_navigate" and "source_index" in params:
+            source_index = params["source_index"]
+            if state.search_results and 0 <= source_index < len(state.search_results):
+                params["url"] = state.search_results[source_index].get("url", "")
+        
+        # For create_docx, inject extracted sources if content is empty
+        if action.type == "create_docx" and not params.get("content") and state.extracted_sources:
+            content_parts = []
+            for src in state.extracted_sources:
+                if src.get("text"):
+                    content_parts.append(f"Source: {src.get('title', 'Unknown')}")
+                    content_parts.append(f"URL: {src.get('url', '')}")
+                    content_parts.append("")
+                    content_parts.append(src["text"][:3000])
+                    content_parts.append("\n---\n")
+            if content_parts:
+                params["content"] = "\n".join(content_parts)
+        
+        # For type_in_app, ensure window_title matches active window
+        if action.type == "type_in_app" and not params.get("window_title") and state.active_window:
+            params["window_title"] = state.active_window
+        
+        return params
 
     # ─────────────────────────────────────────────────────────────────────────
     # Desktop automation helpers
@@ -399,6 +431,7 @@ class Executor:
                 pass
             if found:
                 state.active_app = found[0]
+                state.active_window = found[0]
                 return {"status": "success", "message": f"Launched and found window: {found[0]}"}
 
         # Window didn't appear in time — return ERROR, not success
@@ -605,28 +638,37 @@ class Executor:
     # Browser helpers
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _browser_search(self, action: Dict) -> Dict[str, Any]:
-        """Search Google and return results."""
+    async def _browser_search(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Search Google and return results (includes built-in extraction)."""
         query = action.get("query", "")
         browser = await self._get_browser()
         return await browser.search(query)
 
-    async def _browser_navigate(self, action: Dict) -> Dict[str, Any]:
-        """Navigate to a URL."""
-        url = action.get("url", "")
+    async def _browser_navigate(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Navigate to a URL. Supports source_index to use state.search_results."""
         browser = await self._get_browser()
+
+        # Check if source_index is provided to navigate to a search result
+        source_index = action.get("source_index")
+        url = action.get("url", "")
+
+        if source_index is not None and state.search_results:
+            if 0 <= source_index < len(state.search_results):
+                url = state.search_results[source_index].get("url", "")
+                if not url:
+                    return {"status": "error", "message": f"Search result {source_index} has no URL"}
+            else:
+                return {"status": "error", "message": f"Invalid source_index {source_index}, have {len(state.search_results)} results"}
+
+        if not url:
+            return {"status": "error", "message": "No URL provided for navigation"}
+
         return await browser.open(url)
 
-    async def _browser_extract(self, action: Dict) -> Dict[str, Any]:
+    async def _browser_extract(self, action: Dict, state: TaskState) -> Dict[str, Any]:
         """Extract text from the current page."""
         browser = await self._get_browser()
-        result = await browser.get_page_text()
-        if result.get("status") == "success":
-            # Also get title and URL for citation
-            title_res = await browser.get_page_title()
-            result["title"] = title_res.get("title", "")
-            result["url"] = title_res.get("url", "")
-        return result
+        return await browser.get_page_text()
 
     async def _browser_get_title(self) -> Dict[str, Any]:
         """Get the current browser page title."""
@@ -643,12 +685,12 @@ class Executor:
     # Sequence executor
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def execute_sequence(self, actions: List[Dict[str, Any]], state: TaskState) -> List[Dict[str, Any]]:
+    async def execute_sequence(self, actions: List[ActionSpec], state: TaskState) -> List[Dict[str, Any]]:
         """Execute a sequence of actions and return results."""
         results = []
         for action in actions:
             result = await self.execute(action, state)
             results.append(result)
-            if result and result.get("status") == "error" and not action.get("retry", False):
+            if result and result.get("status") == "error" and not action.parameters.get("retry", False):
                 break
         return results
