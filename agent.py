@@ -462,14 +462,57 @@ def generate_image_huggingface(prompt: str, hf_api_key: str, save_name: str = ""
     }
 
 
-# Models tried in priority order. If one is rate-limited (429) or unavailable
-# (404 / 503), the next one is attempted automatically.
-# List confirmed by querying the API key's available models.
-_GEMINI_MODELS = [
-    "gemini-2.0-flash",       # newest + fastest + highest quality
-    "gemini-1.5-flash",       # fallback
-    "gemini-1.5-pro",
+# Static fallback, only used if live ListModels lookup fails (e.g. offline).
+# Kept intentionally short-lived — Google deprecates dated models over time,
+# which is exactly what caused the original 404s.
+_GEMINI_MODELS_FALLBACK = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
+
+_MODEL_LIST_CACHE = {"models": None, "ts": 0.0}
+_MODEL_LIST_TTL = 3600  # re-check available models once an hour
+
+
+def _fetch_available_models(api_key: str, use_oauth: bool, access_token: str, project_id: str = "") -> list:
+    """Query Gemini's ListModels endpoint and return generateContent-capable
+    model names, flash models first. Falls back to the static list above if
+    the lookup itself fails (network issue, bad auth, etc.)."""
+    now = time.time()
+    if _MODEL_LIST_CACHE["models"] and (now - _MODEL_LIST_CACHE["ts"] < _MODEL_LIST_TTL):
+        return _MODEL_LIST_CACHE["models"]
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    headers = {"Content-Type": "application/json"}
+    if use_oauth:
+        headers["Authorization"] = f"Bearer {access_token}"
+        if project_id:
+            headers["x-goog-user-project"] = project_id
+    else:
+        url += f"?key={api_key}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        names = []
+        for m in data.get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            name = m["name"].replace("models/", "")
+            # Skip variants we don't want to auto-select for chat/actions
+            if any(x in name for x in ("embedding", "aqa", "vision", "tts", "image-generation")):
+                continue
+            names.append(name)
+        # Prefer flash models (cheaper/faster) first; keep API's own ordering within each group
+        names.sort(key=lambda n: "flash" not in n)
+        if names:
+            _MODEL_LIST_CACHE["models"] = names
+            _MODEL_LIST_CACHE["ts"] = now
+            return names
+    except Exception as e:
+        print(f"[Gemini] ListModels lookup failed, using static fallback: {e}")
+    return list(_GEMINI_MODELS_FALLBACK)
 
 
 def _call_gemini(url: str, headers: dict, payload: dict, max_retries: int = 1, backoff_seconds: float = 3.0):
@@ -503,16 +546,19 @@ _GEMINI_WORKING_MODEL: str | None = None  # Cached last-working model for fast s
 
 def _call_gemini_with_fallback(base_url_template: str, headers_template: dict, payload: dict, api_key: str, use_oauth: bool):
     """
-    Try each model in _GEMINI_MODELS in order. Skips a model on 429 (quota)
-    or 404 (unavailable/deprecated) and moves to the next. Raises the last
-    error if all models are exhausted.
+    Tries each live, generateContent-capable model (fetched via ListModels,
+    cached hourly) in order. Skips a model on 429 (quota) or 404
+    (unavailable/deprecated) and moves to the next. Raises the last error
+    if all models are exhausted.
 
     Caches the last working model so subsequent calls skip straight to it,
     eliminating redundant 404 round-trips each time JARVIS starts up.
     """
     global _GEMINI_WORKING_MODEL
+    access_token = headers_template.get("Authorization", "").replace("Bearer ", "")
+    project_id = headers_template.get("x-goog-user-project", "")
     # Build ordered list: try last-known-good model first
-    ordered = list(_GEMINI_MODELS)
+    ordered = _fetch_available_models(api_key, use_oauth, access_token, project_id)
     if _GEMINI_WORKING_MODEL and _GEMINI_WORKING_MODEL in ordered:
         ordered.remove(_GEMINI_WORKING_MODEL)
         ordered.insert(0, _GEMINI_WORKING_MODEL)
@@ -735,7 +781,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     """ + json.dumps(context or {})
 
     # Use Gemini API (v1beta endpoint) with automatic model fallback.
-    # Models are tried in order defined by _GEMINI_MODELS (see top of file).
+    # Models are tried in order returned by _fetch_available_models() (see top of file).
     base_model_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
 
     if use_oauth:
@@ -887,7 +933,7 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1051,7 +1097,7 @@ def stream_gemini_actions(prompt: str, api_key: str, project_id: str = ""):
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1179,7 +1225,7 @@ def stream_image_analysis(image_base64: str, mime_type: str, prompt: str, api_ke
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1295,7 +1341,7 @@ def stream_document_analysis(document_text: str, filename: str, prompt: str, api
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
