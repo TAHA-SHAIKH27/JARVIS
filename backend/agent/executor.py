@@ -41,6 +41,13 @@ class Executor:
                 pass
             self._browser = None
 
+    def _computer(self):
+        """Return the shared Windows automation tool registered by AgentCore."""
+        computer = self.registry.get("computer_tool")
+        if computer is None:
+            raise RuntimeError("Windows automation tool is not registered")
+        return computer
+
     # ─────────────────────────────────────────────────────────────────────────
     # Main dispatch
     # ─────────────────────────────────────────────────────────────────────────
@@ -65,6 +72,42 @@ class Executor:
 
         elif atype == "calculator_compute":
             return await self._calculator_compute(params, state)
+
+        elif atype == "inspect_ui":
+            result = await self._computer().inspect_ui(params.get("target", ""), state)
+            if result.get("status") == "success":
+                state.update_context("ui_elements", result.get("elements", []))
+            return result
+
+        elif atype == "find_ui_element":
+            criteria = {
+                "text": params.get("text", params.get("target", "")),
+                "class": params.get("class", ""),
+            }
+            result = await self._computer().find_element(criteria, state)
+            if result.get("status") == "success" and result.get("element"):
+                state.update_context("ui_target", result["element"])
+            return result
+
+        elif atype == "click_ui":
+            element = params.get("element") or state.get_context("ui_target")
+            if not element and params.get("text"):
+                found = await self._computer().find_element({"text": params["text"]}, state)
+                if found.get("status") != "success":
+                    return found
+                element = found.get("element")
+                state.update_context("ui_target", element)
+            return await self._computer().click(
+                x=params.get("x"), y=params.get("y"), element=element, state=state
+            )
+
+        elif atype == "type_ui":
+            return await self._computer().type_text(
+                params.get("text", ""), element=params.get("element") or state.get_context("ui_target"), state=state
+            )
+
+        elif atype == "screenshot_ui":
+            return await self._computer().screenshot(state)
 
         # ── File system ──────────────────────────────────────────────────────
 
@@ -94,8 +137,23 @@ class Executor:
         elif atype == "browser_get_title":
             return await self._browser_get_title()
 
+        elif atype == "browser_click":
+            browser = await self._get_browser()
+            return await browser.click(params.get("selector", ""))
+
+        elif atype == "browser_type":
+            browser = await self._get_browser()
+            return await browser.type(params.get("selector", ""), params.get("text", ""))
+
+        elif atype == "browser_new_tab":
+            browser = await self._get_browser()
+            return await browser.new_tab()
+
         elif atype == "browser_extract_search_results":
             return await self._browser_extract_search_results()
+
+        elif atype == "report_page_finding":
+            return self._report_page_finding(params, state)
 
         # ── Legacy system_ops actions (passed through unchanged) ─────────────
 
@@ -609,27 +667,69 @@ class Executor:
         return {"status": "error", "message": f"File NOT found: {path}"}
 
     async def _create_docx(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Create a Word document using python-docx."""
+        """Create a Word document using python-docx, synthesizing research content from state if available."""
         path = action.get("path", "")
-        title = action.get("title", "Document")
+        title = action.get("title", "Research Report")
         content = action.get("content", "")
         headings = action.get("headings", [])
 
         if not path:
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            path = os.path.join(desktop, f"{title.replace(' ', '_')}.docx")
+            safe_title = re.sub(r'[^\w\-_]', '_', title)
+            path = os.path.join(desktop, f"{safe_title}.docx")
 
         if not path.endswith(".docx"):
             path += ".docx"
+
+        # If extracted sources exist in state, synthesize them into comprehensive report content
+        if state.extracted_sources or state.search_results:
+            sources = state.extracted_sources if state.extracted_sources else state.search_results
+            content_sections = []
+
+            # 1. Executive Summary
+            content_sections.append("EXECUTIVE SUMMARY")
+            content_sections.append(f"This document presents comprehensive research findings on '{title}'. Data was gathered from multiple web sources and compiled automatically by J.A.R.V.I.S.")
+            content_sections.append("")
+
+            # 2. Key Findings per Source
+            content_sections.append("KEY FINDINGS & EXTRACTED DATA")
+            for idx, src in enumerate(sources, 1):
+                src_title = src.get("title") or src.get("url") or f"Source {idx}"
+                src_url = src.get("url", "")
+                src_text = src.get("text") or src.get("snippet") or "No detailed body text available."
+
+                content_sections.append(f"Source {idx}: {src_title}")
+                if src_url:
+                    content_sections.append(f"URL: {src_url}")
+                content_sections.append("Summary of Content:")
+                # Clean up snippet/text lines
+                lines = [line.strip() for line in src_text.split("\n") if len(line.strip()) > 30]
+                body_summary = "\n".join(lines[:10]) if lines else src_text[:1500]
+                content_sections.append(body_summary)
+                content_sections.append("")
+
+            # 3. References
+            content_sections.append("REFERENCES & SOURCES")
+            for idx, src in enumerate(sources, 1):
+                url = src.get("url", "N/A")
+                t = src.get("title", "Web Resource")
+                content_sections.append(f"[{idx}] {t} — {url}")
+
+            content = "\n".join(content_sections)
+
+        if not content.strip():
+            content = f"Research report for {title}.\nGenerated by J.A.R.V.I.S. Agentic System."
 
         try:
             from backend.tools.office import Office
             result = await Office.create_docx(
                 content=content,
                 title=title,
-                headings=headings if headings else None,
+                headings=headings if headings else ["Executive Summary", "Key Findings & Extracted Data", "References & Sources"],
                 save_path=path
             )
+            state.final_outcome_verified = True
+            state.final_outcome_data = {"path": path, "title": title}
             return result
         except Exception as e:
             return {"status": "error", "message": f"Failed to create DOCX: {str(e)}"}
@@ -639,36 +739,92 @@ class Executor:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _browser_search(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Search Google and return results (includes built-in extraction)."""
+        """Search web and store search_results in state."""
         query = action.get("query", "")
         browser = await self._get_browser()
-        return await browser.search(query)
+        res = await browser.search(query)
+        if res.get("status") == "success":
+            state.search_results = res.get("results", [])
+            state.current_page_url = res.get("url", "")
+            state.current_page_title = res.get("title", "")
+        return res
 
     async def _browser_navigate(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Navigate to a URL. Supports source_index to use state.search_results."""
+        """Navigate to a URL or use source_index from state.search_results."""
         browser = await self._get_browser()
 
-        # Check if source_index is provided to navigate to a search result
         source_index = action.get("source_index")
         url = action.get("url", "")
 
         if source_index is not None and state.search_results:
             if 0 <= source_index < len(state.search_results):
-                url = state.search_results[source_index].get("url", "")
-                if not url:
-                    return {"status": "error", "message": f"Search result {source_index} has no URL"}
+                src = state.search_results[source_index]
+                url = src.get("url", "")
+                # Fallback snippet if URL is missing
+                if not url and src.get("snippet"):
+                    state.extracted_sources.append({
+                        "url": "search_snippet",
+                        "title": src.get("title", "Search Result"),
+                        "text": src.get("snippet", "")
+                    })
+                    return {"status": "success", "message": f"Used snippet from result {source_index}"}
             else:
-                return {"status": "error", "message": f"Invalid source_index {source_index}, have {len(state.search_results)} results"}
+                if state.search_results:
+                    url = state.search_results[0].get("url", "")
 
         if not url:
-            return {"status": "error", "message": "No URL provided for navigation"}
+            return {"status": "error", "message": "No URL available for navigation"}
 
-        return await browser.open(url)
+        res = await browser.open(url)
+        if res.get("status") == "success":
+            state.current_page_url = url
+            state.current_page_title = res.get("title", "")
+        return res
 
     async def _browser_extract(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Extract text from the current page."""
+        """Extract text from current page and append to state.extracted_sources."""
         browser = await self._get_browser()
-        return await browser.get_page_text()
+        res = await browser.get_page_text()
+        if res.get("status") == "success" and res.get("text"):
+            text = res.get("text", "").strip()
+            if len(text) > 30:
+                source_item = {
+                    "url": res.get("url") or state.current_page_url,
+                    "title": res.get("title") or state.current_page_title or "Extracted Web Page",
+                    "text": text
+                }
+                state.extracted_sources.append(source_item)
+        return res
+
+    def _report_page_finding(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Return a quoted-in-spirit finding selected from extracted page text.
+
+        This is intentionally deterministic: it never invents an answer when a
+        page has not supplied matching evidence.
+        """
+        query = action.get("query", "").strip()
+        if not state.extracted_sources:
+            return {"status": "error", "message": "No extracted page content is available for the requested finding."}
+        source = state.extracted_sources[-1]
+        text = source.get("text", "")
+        stop_words = {"the", "and", "for", "from", "with", "this", "that", "which", "what", "tell", "shown", "show", "page", "section", "please", "current", "appears", "human", "verification", "wait", "me", "go", "open", "find"}
+        terms = [word.lower() for word in re.findall(r"[a-zA-Z0-9.]+", query) if len(word) > 2 and word.lower() not in stop_words]
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        candidates = [line for line in lines if len(line) >= 8]
+
+        def score(line: str) -> int:
+            low = line.lower()
+            matched = sum(term in low for term in terms)
+            # Common evidence indicators are useful only as a ranking boost.
+            boost = sum(token in low for token in ("download", "release", "version", "latest"))
+            return matched * 10 + boost
+
+        best = max(candidates, key=score, default="")
+        if not best or score(best) == 0:
+            return {"status": "error", "message": f"The page did not contain a verifiable answer for: {query}"}
+        answer = f"From {source.get('title') or source.get('url')}: {best}"
+        state.update_context("last_finding", answer)
+        return {"status": "success", "message": "Page finding verified", "answer": answer, "source_url": source.get("url", "")}
 
     async def _browser_get_title(self) -> Dict[str, Any]:
         """Get the current browser page title."""

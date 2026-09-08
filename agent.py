@@ -104,9 +104,10 @@ def parse_local_command(prompt: str) -> list:
         return actions
 
     # 6. Web Search
-    search_match = re.search(r'(?:search for|google|search web for)\s+(.+)', prompt_clean)
+    search_match = re.search(r'(?:open\s+(?:chrome|browser|google)(?:\s+and)?\s+)?(?:search\s+(?:for|fr|about|web\s+for)?|google|search web for)\s+(.+)', prompt_clean)
     if search_match:
         query = search_match.group(1).strip()
+        query = re.sub(r'^(?:for|fr|about|on|the)\s+', '', query, flags=re.I).strip()
         actions.append({"type": "search_web", "query": query})
         actions.append({"type": "speak", "text": f"Searching Google for {query}, sir."})
         return actions
@@ -163,9 +164,9 @@ def parse_local_command(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"Saving the image as {save_name} to your desktop, sir."})
         return actions
 
-    # Launch app (offline fallback)
-    launch_match = re.search(r'(?:launch|open|start|run)\s+(.+)', prompt_clean)
-    if launch_match:
+    # Launch app (offline fallback - only for actual app launches, not research/folder commands)
+    launch_match = re.search(r'(?:launch|open|start|run)\s+([a-zA-Z0-9_\-\s]{2,30})$', prompt_clean)
+    if launch_match and not any(k in prompt_clean for k in ['website', 'websites', 'folder', 'file', 'word', 'docx', 'search', 'research']):
         app_name = launch_match.group(1).strip()
         actions.append({"type": "launch_app", "app_name": app_name})
         actions.append({"type": "speak", "text": f"Launching {app_name} for you, sir."})
@@ -465,8 +466,9 @@ def generate_image_huggingface(prompt: str, hf_api_key: str, save_name: str = ""
 # (404 / 503), the next one is attempted automatically.
 # List confirmed by querying the API key's available models.
 _GEMINI_MODELS = [
-    "gemini-2.5-flash",       # newest + fastest + highest quality
+    "gemini-2.0-flash",       # newest + fastest + highest quality
     "gemini-1.5-flash",       # fallback
+    "gemini-1.5-pro",
 ]
 
 

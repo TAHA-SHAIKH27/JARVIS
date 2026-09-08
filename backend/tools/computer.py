@@ -4,6 +4,7 @@ import win32gui
 import win32api
 import win32con
 import time
+import re
 from typing import Any, Dict, Optional, List
 import pywinauto
 from pywinauto import application as py_app
@@ -121,11 +122,35 @@ class Computer:
             return {"status": "error", "message": f"Failed to inspect UI: {str(e)}"}
 
     async def find_element(self, criteria: Dict[str, Any], state: TaskState) -> Dict[str, Any]:
-        """Find a UI element by criteria."""
+        """Find a visible Windows control by label/class, then fall back to a window."""
         try:
             pythoncom.CoInitialize()
             target_text = criteria.get("text", "")
             target_class = criteria.get("class", "")
+
+            # UI Automation can identify real child controls (buttons, text boxes,
+            # menu items), unlike Win32's top-level-window enumeration.
+            try:
+                from pywinauto import Desktop
+                query = {"visible_only": True, "enabled_only": True}
+                if target_text:
+                    query["title_re"] = ".*" + re.escape(target_text) + ".*"
+                if target_class:
+                    query["class_name_re"] = ".*" + re.escape(target_class) + ".*"
+                control = Desktop(backend="uia").window(**query)
+                if control.exists(timeout=2):
+                    rect = control.rectangle()
+                    return {
+                        "status": "success",
+                        "element": {
+                            "title": control.window_text(),
+                            "text": control.window_text(),
+                            "class": control.class_name(),
+                            "rect": [rect.left, rect.top, rect.right, rect.bottom],
+                        },
+                    }
+            except Exception:
+                pass
 
             found_window = []
             def enum_handler(hwnd, ctx):
@@ -158,7 +183,15 @@ class Computer:
             if element:
                 # Click on element
                 try:
-                    title = element.get("title", "")
+                    rect = element.get("rect")
+                    if rect and len(rect) == 4:
+                        cx = (int(rect[0]) + int(rect[2])) // 2
+                        cy = (int(rect[1]) + int(rect[3])) // 2
+                        win32api.SetCursorPos((cx, cy))
+                        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN | win32con.MOUSEEVENTF_LEFTUP, cx, cy, 0, 0)
+                        return {"status": "success", "message": f"Clicked UI control at ({cx}, {cy})"}
+
+                    title = element.get("title") or element.get("text", "")
                     hwnd = int(element.get("handle")) if element.get("handle") else None
                     if not hwnd and title:
                         hwnd = win32gui.FindWindow(None, title)

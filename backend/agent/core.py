@@ -197,7 +197,11 @@ class AgentCore:
 
             # Skip "speak" actions during execution loop — collect text instead
             if atype == "speak":
-                speak_text = action.parameters.get("text", "")
+                speak_text = (
+                    state.get_context("last_finding", "")
+                    if action.parameters.get("use_last_finding")
+                    else action.parameters.get("text", "")
+                )
                 state.completed_steps.append(action_index)
                 completed_indices.add(action_index)
                 action_index += 1
@@ -348,6 +352,10 @@ class AgentCore:
                         }
                         new_actions = self.planner.replan(task, state, failure_context)
                         actions = new_actions
+                        # Replanning replaces the authoritative plan. Final
+                        # verification must evaluate the replacement, not the
+                        # plan that just failed.
+                        plan = state.plan
                         action_index = 0
                         completed_indices = set()
                         state.completed_steps = []
@@ -537,11 +545,26 @@ class AgentCore:
                         from docx import Document
                         doc = Document(doc_path)
                         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                        if paragraphs:
+                        document_text = "\n".join(paragraphs).lower()
+                        requested_title = next(
+                            (a.parameters.get("title", "") for a in plan.actions if a.type == "create_docx"),
+                            ""
+                        ).lower()
+                        title_terms = [term for term in requested_title.split() if len(term) > 3 and term not in {"research", "report", "document"}]
+                        has_requested_topic = not title_terms or any(term in document_text for term in title_terms)
+                        has_research_evidence = not state.extracted_sources or any(
+                            source.get("url", "").lower() in document_text
+                            for source in state.extracted_sources if source.get("url")
+                        )
+                        if paragraphs and has_requested_topic and has_research_evidence:
                             results["verified"] = True
                             results["message"] = f"Document created and verified: {len(paragraphs)} paragraphs"
-                            results["details"] = {"path": doc_path, "paragraph_count": len(paragraphs)}
+                            results["details"] = {"path": doc_path, "paragraph_count": len(paragraphs), "topic_verified": has_requested_topic, "sources_verified": has_research_evidence}
                             results["summary"] = f"Document saved to {doc_path}"
+                        elif not has_requested_topic:
+                            results["message"] = "Document exists but does not contain the requested topic"
+                        elif not has_research_evidence:
+                            results["message"] = "Document exists but does not include extracted source evidence"
                         else:
                             results["verified"] = False
                             results["message"] = "Document exists but has no content"

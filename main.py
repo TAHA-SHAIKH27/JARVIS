@@ -12,6 +12,7 @@ import struct
 import numpy as np
 import wave
 import io
+import uuid
 
 # Import local helper modules
 from system_ops import (
@@ -1101,7 +1102,9 @@ def serve_work_file(path: str):
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────
-agent_core = AgentCore()
+# Each task owns its state and tools. Sharing an Executor also shares its
+# Playwright browser, which lets concurrent tasks corrupt each other.
+agent_runs = {}
 
 
 class AgentRunRequest(BaseModel):
@@ -1123,11 +1126,18 @@ async def agent_run(req: AgentRunRequest):
     # Create a per-request event queue
     event_queue: asyncio.Queue = asyncio.Queue()
     state = TaskState()
+    run_id = str(uuid.uuid4())
+    core = AgentCore()
+    agent_runs[run_id] = {"state": state, "core": core, "task": task}
 
     async def run_agent():
         """Run agent in background, putting results into the queue."""
         try:
-            await agent_core.process(task, state, event_queue)
+            await event_queue.put({
+                "type": "run_started", "message": "Agent run started", "icon": ">",
+                "data": {"run_id": run_id}, "ts": __import__('time').time()
+            })
+            await core.process(task, state, event_queue)
         except Exception as e:
             await event_queue.put({
                 "type": "error",
@@ -1137,6 +1147,10 @@ async def agent_run(req: AgentRunRequest):
                 "ts": __import__('time').time()
             })
         finally:
+            # A human-blocked run must remain addressable by /resume. Finished
+            # runs are removed promptly and their browser is closed by AgentCore.
+            if not state.waiting_for_user:
+                agent_runs.pop(run_id, None)
             # Sentinel to signal end of stream
             await event_queue.put(None)
 
@@ -1177,15 +1191,18 @@ async def agent_execute(req: dict):
     """Execute a natural language task through the agent core (non-streaming legacy)."""
     task = req.get("text", "")
     state = TaskState()
-    result = await agent_core.process(task, state)
+    result = await AgentCore().process(task, state)
     return {"status": result.get("status", "error"), "data": result}
 
 
 @app.get("/api/agent/status")
-async def agent_status():
-    """Get the current agent state status."""
-    state = TaskState()
+async def agent_status(run_id: str = ""):
+    """Get status for an active agent run."""
+    run = agent_runs.get(run_id)
+    state = run["state"] if run else TaskState()
     return {
+        "run_id": run_id,
+        "active": bool(run),
         "task": state.task,
         "completed_steps": state.completed_steps,
         "errors": state.errors,
@@ -1208,9 +1225,15 @@ async def agent_plan(req: dict):
 @app.post("/api/agent/resume")
 async def agent_resume(req: dict):
     """Resume agent after human intervention."""
-    # This would need a way to persist state across requests
-    # For now, return a placeholder
-    return {"status": "success", "message": "Resume endpoint - state persistence needed"}
+    run_id = req.get("run_id", "")
+    run = agent_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="No paused agent run found for this run_id.")
+    state = run["state"]
+    if not state.waiting_for_user:
+        raise HTTPException(status_code=409, detail="This agent run is not waiting for human intervention.")
+    result = await run["core"].resume_after_human(state, req.get("resolution", {}))
+    return {"status": "success", "run_id": run_id, "data": result}
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────

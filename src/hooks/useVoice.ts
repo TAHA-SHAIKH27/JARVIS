@@ -359,8 +359,14 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
     rec.onerror = (err: any) => {
       console.error('[Voice] Continuous SpeechRecognition error:', err.error);
-      if (err.error === 'not-allowed') {
+      if (err.error === 'not-allowed' || err.error === 'service-not-allowed') {
         options.onError?.('Microphone permission denied.');
+        stopListening();
+      } else if (err.error === 'network') {
+        // Web Speech is a network-backed browser service.  Do not spin in an
+        // invisible restart loop while it is unavailable; microphone visuals
+        // can continue to work even though transcription cannot.
+        options.onError?.('Speech recognition network service is unavailable. Please try again or use text input.');
         stopListening();
       }
     };
@@ -508,6 +514,11 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
     rec.onerror = (err: any) => {
       console.error('[Voice] PTT recognition error:', err);
+      if (err.error === 'not-allowed' || err.error === 'service-not-allowed') {
+        options.onError?.('Microphone permission denied.');
+      } else if (err.error === 'network') {
+        options.onError?.('Speech recognition network service is unavailable.');
+      }
     };
 
     rec.onend = () => {

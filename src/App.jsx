@@ -192,6 +192,8 @@ export default function App() {
   const [agentMode, setAgentMode] = useState(false)
   const [agentStatus, setAgentStatus] = useState('ready')
   const [agentEvents, setAgentEvents] = useState([])
+  const [agentRunId, setAgentRunId] = useState('')
+  const [agentWaitingForHuman, setAgentWaitingForHuman] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(true)
 
   useEffect(() => {
@@ -541,6 +543,8 @@ export default function App() {
     setPrompt('')
     setBusy(true)
     setAgentEvents([])
+    setAgentRunId('')
+    setAgentWaitingForHuman(false)
     setAgentStatus('planning')
 
     try {
@@ -580,13 +584,16 @@ export default function App() {
             const event = JSON.parse(raw)
             const { type, message, icon } = event
 
+            if (type === 'run_started' && event.data?.run_id) setAgentRunId(event.data.run_id)
+            if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentWaitingForHuman(true)
+
             // Update agent status
-            if (type === 'planning') setAgentStatus('planning')
-            else if (type === 'action_start') setAgentStatus('executing')
-            else if (type === 'action_done') setAgentStatus('observing')
-            else if (type === 'action_error') setAgentStatus('error')
-            else if (type === 'complete' || type === 'done') setAgentStatus('completed')
-            else if (type === 'error') setAgentStatus('error')
+            if (type === 'planning' || type === 'plan_created' || type === 'plan_validated') setAgentStatus('planning')
+            else if (type === 'step_started' || type === 'tool_started' || type === 'retrying' || type === 'replanning') setAgentStatus('executing')
+            else if (type === 'observing' || type === 'verification_started') setAgentStatus('observing')
+            else if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentStatus('blocked')
+            else if (type === 'step_failed' || type === 'verification_failed' || type === 'task_failed' || type === 'error') setAgentStatus('error')
+            else if (type === 'task_completed' || type === 'task_partial' || type === 'done') setAgentStatus('completed')
 
             // Accumulate event log
             if (type !== 'done') {
@@ -598,8 +605,9 @@ export default function App() {
             }
 
             // Capture final speak text
-            if (type === 'complete') {
+            if (type === 'task_completed' || type === 'task_partial' || type === 'task_failed') {
               finalSpeak = message
+              setAgentWaitingForHuman(false)
             }
           } catch { /* ignore parse errors */ }
         }
@@ -616,6 +624,27 @@ export default function App() {
       setAgentStatus('error')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function resumeAgentAfterHuman() {
+    if (!agentRunId || !agentWaitingForHuman) return
+    try {
+      const res = await fetch('/api/agent/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: agentRunId, resolution: { completed: true } })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setAgentEvents(ev => [...ev, { text: `✕ Could not resume: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
+        return
+      }
+      setAgentWaitingForHuman(false)
+      setAgentStatus('executing')
+      setAgentEvents(ev => [...ev, { text: '▶ Human verification acknowledged; resuming agent.', type: 'resuming' }])
+    } catch {
+      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent resume endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -988,8 +1017,14 @@ export default function App() {
           {/* Show agent events in Agent Mode, otherwise show normal logs */}
           {agentMode && agentEvents.length > 0 && (
             <div className="panel log-ticker">
+              {agentWaitingForHuman && (
+                <div className="line exec">
+                  Human verification is required in the browser or app. Complete it, then{' '}
+                  <button className="btn-secondary" onClick={resumeAgentAfterHuman}>RESUME AGENT</button>
+                </div>
+              )}
               {[...agentEvents].reverse().map((ev, i) => (
-                <div key={i} className={`line ${ev.type === 'action_done' ? 'result' : ev.type === 'action_error' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
+                <div key={i} className={`line ${ev.type === 'step_completed' ? 'result' : ev.type === 'step_failed' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
                   {ev.text}
                 </div>
               ))}

@@ -69,6 +69,36 @@ class Observer:
             expected = str(action.parameters.get("expected", ""))
             return self.verify_calculator_result(expected)
 
+        elif atype == "inspect_ui":
+            elements = result.get("elements", []) if result else []
+            element = result.get("element") if result else None
+            if result and result.get("status") == "success":
+                found = bool(elements or element)
+                return {
+                    "verified": found,
+                    "message": f"Found {len(elements)} visible UI items" if elements else "Matching UI item found",
+                    "classification": "success" if found else "recoverable",
+                }
+            return {"verified": False, "message": result.get("message", "UI inspection failed") if result else "UI inspection failed", "classification": "retryable"}
+
+        elif atype == "find_ui_element":
+            element = result.get("element") if result else None
+            if result and result.get("status") == "success" and element:
+                state.update_context("ui_target", element)
+                return {"verified": True, "message": f"Found UI control: {element.get('title') or element.get('text', 'unnamed')}", "classification": "success"}
+            return {"verified": False, "message": result.get("message", "UI control not found") if result else "UI control not found", "classification": "recoverable"}
+
+        elif atype in ("click_ui", "type_ui"):
+            if result and result.get("status") == "success":
+                return {"verified": True, "message": result.get("message", f"UI action {atype} completed"), "classification": "success"}
+            return {"verified": False, "message": result.get("message", f"UI action {atype} failed") if result else "UI action failed", "classification": "retryable"}
+
+        elif atype == "screenshot_ui":
+            path = result.get("path", "") if result else ""
+            if path and os.path.isfile(path):
+                return {"verified": True, "message": f"Screenshot saved: {path}", "path": path, "classification": "success"}
+            return {"verified": False, "message": "UI screenshot was not saved", "classification": "recoverable"}
+
         elif atype == "create_folder_verified":
             path = action.parameters.get("path", "")
             return self.verify_folder_exists(path)
@@ -130,6 +160,32 @@ class Observer:
                 return {"verified": True, "message": f"Page title: {title}", "title": title, "classification": "success"}
             return {"verified": False, "message": "Could not get page title", "classification": "retryable"}
 
+        elif atype == "browser_type":
+            expected = action.parameters.get("text", "")
+            actual = result.get("value", "") if result else ""
+            if result and result.get("status") == "success" and actual == expected:
+                return {"verified": True, "message": "Browser form value verified", "classification": "success"}
+            return {"verified": False, "message": result.get("message", "Browser form input was not verified") if result else "No browser result", "classification": "recoverable"}
+
+        elif atype == "browser_click":
+            if not browser or not result or result.get("status") != "success":
+                return {"verified": False, "message": result.get("message", "Browser click failed") if result else "No browser result", "classification": "retryable"}
+            expected_url = action.parameters.get("expected_url_contains", "")
+            expected_text = action.parameters.get("expected_text", "")
+            current = await self.verify_browser_page(browser, expected_url_fragment=expected_url)
+            if not current.get("verified"):
+                return current
+            if expected_text:
+                body = await browser.get_page_text()
+                if expected_text.lower() not in body.get("text", "").lower():
+                    return {"verified": False, "message": f"Click completed but expected text was not present: {expected_text}", "classification": "recoverable"}
+            return {"verified": True, "message": "Browser click result verified", "classification": "success"}
+
+        elif atype == "browser_new_tab":
+            if result and result.get("status") == "success":
+                return {"verified": True, "message": "New browser tab verified", "classification": "success"}
+            return {"verified": False, "message": result.get("message", "New browser tab failed") if result else "No browser result", "classification": "retryable"}
+
         elif atype == "browser_extract_search_results":
             if browser:
                 verification = await self.verify_search_results(browser)
@@ -138,6 +194,12 @@ class Observer:
                     return {"verified": True, "message": verification.get("message", "Search results extracted"), "classification": "success", "results_count": len(state.search_results)}
                 return verification
             return {"verified": False, "message": "No browser available for search results extraction", "classification": "fatal"}
+
+        elif atype == "report_page_finding":
+            answer = result.get("answer", "") if result else ""
+            if result and result.get("status") == "success" and answer:
+                return {"verified": True, "message": "Finding is grounded in extracted page content", "classification": "success"}
+            return {"verified": False, "message": result.get("message", "No evidence-based page finding") if result else "No page finding result", "classification": "recoverable"}
 
         elif atype == "open_app":
             window_title = action.parameters.get("app_name", "")
@@ -164,7 +226,6 @@ class Observer:
         elif atype == "create_folder":
             folder_name = action.parameters.get("folder_name", "")
             from system_ops import WORK_DIR, get_desktop_path
-            import os
             paths_to_check = [
                 os.path.join(WORK_DIR, folder_name),
                 os.path.join(get_desktop_path(), folder_name),
@@ -177,7 +238,6 @@ class Observer:
         elif atype == "create_word_doc":
             filename = action.parameters.get("filename", "")
             from system_ops import WORK_DIR, get_desktop_path
-            import os
             if not filename.endswith('.docx'):
                 filename += '.docx'
             paths_to_check = [
@@ -192,13 +252,11 @@ class Observer:
         elif atype == "write_file":
             filename = action.parameters.get("filename", "")
             from system_ops import WORK_DIR
-            import os
             path = os.path.join(WORK_DIR, filename)
             return self.verify_file_exists(path)
 
         elif atype == "take_screenshot":
             from system_ops import WORK_DIR
-            import os
             img_dir = os.path.join(WORK_DIR, "screenshots")
             if os.path.isdir(img_dir):
                 files = [f for f in os.listdir(img_dir) if f.endswith('.png')]
@@ -359,7 +417,7 @@ class Observer:
             if page_state.state == BrowserPageState.CAPTCHA:
                 return {
                     "verified": False,
-                    "message": "Google CAPTCHA / human verification required",
+                    "message": page_state.message or "CAPTCHA / human verification required",
                     "classification": "human_required",
                     "page_state": page_state.state.value,
                     "details": page_state.details
@@ -368,7 +426,7 @@ class Observer:
             if page_state.state == BrowserPageState.CONSENT:
                 return {
                     "verified": False,
-                    "message": "Consent page requires user interaction",
+                    "message": page_state.message or "Consent page requires user interaction",
                     "classification": "human_required",
                     "page_state": page_state.state.value,
                     "details": page_state.details
@@ -377,7 +435,7 @@ class Observer:
             if page_state.state == BrowserPageState.SORRY_PAGE:
                 return {
                     "verified": False,
-                    "message": "Google 'unusual traffic' page detected",
+                    "message": page_state.message or "Google 'unusual traffic' page detected",
                     "classification": "human_required",
                     "page_state": page_state.state.value,
                     "details": page_state.details
@@ -513,17 +571,16 @@ class Observer:
             return {"verified": False, "message": f"Could not verify text: {str(e)}"}
 
     def detect_captcha(self, page_content: str) -> bool:
-        """Scan for common CAPTCHA patterns in page content."""
+        """Scan for common CAPTCHA patterns in visible page content."""
         if not page_content:
             return False
         content_lower = page_content.lower()
         captcha_indicators = [
-            'recaptcha',
-            'hcaptcha',
-            'cloudflare-turnstile',
-            'i am not a robot',
             'please verify you are human',
-            'captcha required',
-            'security check to access'
+            'verify you are human',
+            'confirm you are human',
+            'complete the security check to continue',
+            'our systems have detected unusual traffic',
+            'press and hold to confirm you are human',
         ]
         return any(indicator in content_lower for indicator in captcha_indicators)

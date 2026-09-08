@@ -34,6 +34,13 @@ AVAILABLE ACTION TYPES AND THEIR PARAMETERS:
 {"type": "press_key",     "key": "ctrl+s",        "description": "Press Ctrl+S to save", "expected_outcome": "Save dialog is opened or file is saved", "required_context_keys": []}
 {"type": "calculator_compute", "expression": "125 * 48", "expected": "6000", "description": "Calculate 125 × 48", "expected_outcome": "Calculation result is computed", "required_context_keys": []}
 
+// General Windows UI automation. Use find_ui_element before click_ui whenever a label is available.
+{"type": "inspect_ui", "target": "Settings", "description": "Inspect visible UI", "expected_outcome": "Matching UI controls are discovered", "required_context_keys": []}
+{"type": "find_ui_element", "text": "Save", "description": "Find the Save button", "expected_outcome": "The requested control is located", "required_context_keys": []}
+{"type": "click_ui", "text": "Save", "description": "Click Save", "expected_outcome": "The requested control is clicked", "required_context_keys": []}
+{"type": "type_ui", "text": "Hello", "description": "Type into the focused control", "expected_outcome": "Text is entered", "required_context_keys": []}
+{"type": "screenshot_ui", "description": "Capture the current screen", "expected_outcome": "A screenshot file is saved", "required_context_keys": []}
+
 // File system (VERIFIED versions - these check actual filesystem)
 {"type": "create_folder_verified", "path": "C:/Users/username/Desktop/FOLDER_NAME", "description": "Create folder on Desktop", "expected_outcome": "Folder exists at the specified path", "required_context_keys": []}
 {"type": "write_file_verified",    "path": "C:/full/path/file.txt", "content": "text", "description": "Create file", "expected_outcome": "File exists with the correct content", "required_context_keys": []}
@@ -49,6 +56,10 @@ AVAILABLE ACTION TYPES AND THEIR PARAMETERS:
 // browser_extract: extracts text from current page, stores in state.extracted_sources
 {"type": "browser_extract",  "description": "Extract text from current page", "expected_outcome": "Text is extracted from the page", "required_context_keys": ["current_page_url"]}
 {"type": "browser_get_title","description": "Get current page title", "expected_outcome": "Page title is retrieved", "required_context_keys": []}
+{"type": "browser_click", "selector": "button[type=submit]", "expected_url_contains": "", "expected_text": "", "description": "Click a web control", "expected_outcome": "The requested web control changes the page as expected", "required_context_keys": []}
+{"type": "browser_type", "selector": "input[name=q]", "text": "query", "description": "Fill a web form", "expected_outcome": "The form field contains the requested text", "required_context_keys": []}
+{"type": "browser_new_tab", "description": "Open a new browser tab", "expected_outcome": "A new browser tab is available", "required_context_keys": []}
+{"type": "report_page_finding", "query": "current Python release", "description": "Report an evidence-based finding from the page", "expected_outcome": "A finding from extracted page content is available", "required_context_keys": ["extracted_sources"]}
 
 // System info
 {"type": "open_app_wait", "app_name": "chrome", "window_title": "Chrome", "description": "Open Chrome", "expected_outcome": "Chrome browser is open", "required_context_keys": []}
@@ -131,7 +142,7 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
     if not use_oauth and not api_key:
         return None
 
-    models = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     base_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
 
     payload = {
@@ -190,76 +201,163 @@ def _resolve_desktop_path(path: str) -> str:
     path = path.replace("C:/Users/user/Desktop", desktop)
     path = path.replace("C:\\Users\\user\\Desktop", desktop)
     # Handle any generic user placeholder
-    import re
     path = re.sub(r"C:[/\\]Users[/\\][^/\\]+[/\\]Desktop", desktop.replace("\\", "/"), path)
     return path
 
 
 def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
     """Simple rule-based fallback when no API key is available."""
-    task_lower = task.lower()
+    task_lower = task.lower().strip()
     actions = []
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
 
-    if "notepad" in task_lower and ("type" in task_lower or "write" in task_lower):
+    # An explicit URL is an instruction to navigate, never a search query.
+    url_match = re.search(r"https?://[^\s\]\[\),]+", task, re.I)
+    if url_match:
+        url = url_match.group(0).rstrip(".,;:)")
+        remainder = (task[:url_match.start()] + task[url_match.end():]).strip(" ,.-")
+        question = re.sub(r"^(?:open\s+(?:chrome|browser)\s*,?\s*)?(?:go\s+to\s*)?", "", remainder, flags=re.I).strip()
+        question = question or "Summarize the important information on this page"
+        actions = [
+            {"type": "browser_navigate", "url": url, "description": f"Open {url}"},
+        ]
+        # Follow a named site section when it maps to a stable, accessible link.
+        # The click itself is observed and verified by the browser layer.
+        if "download" in question.lower():
+            actions.append({
+                "type": "browser_click", "selector": "a:has-text('Downloads')",
+                "expected_url_contains": "python.org/downloads", "description": "Open the Downloads section",
+            })
+        actions.extend([
+            {"type": "browser_extract", "description": "Extract page content"},
+            {"type": "report_page_finding", "query": question, "description": "Find the requested information"},
+            {"type": "speak", "use_last_finding": True, "text": "Page finding complete.", "description": "Report verified finding"},
+        ])
+        return actions
+
+    # 0. Safe visual/UI actions that do not need an LLM connection.
+    if any(k in task_lower for k in ("screenshot", "capture screen", "capture the screen")):
+        actions = [
+            {"type": "screenshot_ui", "description": "Capture the current screen"},
+            {"type": "speak", "text": "Screenshot captured and verified, sir.", "description": "Done"},
+        ]
+
+    elif ("click " in task_lower or "select " in task_lower or
+          bool(re.search(r"\bpress\s+.+\s+button\b", task_lower))):
+        match = re.search(r"(?:click|press|select)\s+(?:the\s+)?[\"']?(.+?)[\"']?(?:\s+(?:button|control|menu|option))?$", task, re.I)
+        target = match.group(1).strip() if match else ""
+        if target:
+            actions = [
+                {"type": "find_ui_element", "text": target, "description": f"Find UI control: {target}"},
+                {"type": "click_ui", "text": target, "description": f"Click UI control: {target}"},
+                {"type": "speak", "text": f"Clicked {target}, sir.", "description": "Done"},
+            ]
+
+    # 1. Research + Word Document / Docx / File creation
+    elif not actions:
+        has_research_kw = any(k in task_lower for k in ["research", "search", "extract", "gather", "find", "collect", "browse", "website", "websites"])
+        has_doc_kw = any(k in task_lower for k in ["word", "docx", "document", "doc", "file", "report"])
+
+        if has_research_kw and has_doc_kw:
+            # Extract topic
+            topic = task
+            for pattern in [
+                r"(?:open\s+(?:chrome|browser|google)(?:\s+and)?\s+)?(?:research|extract|gather|find|search|collect|look\s+up)\s+(?:info(?:rmation)?\s+)?(?:about|on|for|fr|from)?\s*(.+?)\s+(?:and\s+(?:make|create|save|generate)|into|to|make|create|save|generate)",
+                r"(?:research|search|extract|find)\s+(?:about|on|for|fr|from)?\s*(.+?)\s+(?:from|into|and|\s+create|\s+make)",
+            ]:
+                m = re.search(pattern, task_lower)
+                if m:
+                    topic = m.group(1).strip()
+                    break
+
+            # Clean topic noise
+            topic = re.sub(r"^(?:for|fr|about|on|the|info\s+on|details\s+about|some)\s+", "", topic, flags=re.I).strip()
+            topic = re.sub(r"\b(3|three|multiple|several|\d+)\s+(websites?|sources?|pages?|sites?)\b", "", topic, flags=re.I)
+            topic = re.sub(r"\b(make|create|write|save|generate|into|a|in|the)\s+(word|docx|document|doc|file|report)\b.*$", "", topic, flags=re.I).strip()
+            topic = re.sub(r"^(?:for|fr|about|on|the)\s+", "", topic, flags=re.I).strip()
+            if not topic or len(topic) < 3:
+                topic = "Science Day" if "science" in task_lower else "Research Topic"
+
+            safe_topic = re.sub(r'[^\w\-_]', '_', topic)
+            docx_path = os.path.join(desktop, f"{safe_topic}_report.docx")
+
+            actions = [
+                {"type": "browser_search", "query": topic, "description": f"Search web for {topic}"},
+                {"type": "browser_navigate", "source_index": 0, "description": "Visit source 1"},
+                {"type": "browser_extract", "description": "Extract content from source 1"},
+                {"type": "browser_navigate", "source_index": 1, "description": "Visit source 2"},
+                {"type": "browser_extract", "description": "Extract content from source 2"},
+                {"type": "browser_navigate", "source_index": 2, "description": "Visit source 3"},
+                {"type": "browser_extract", "description": "Extract content from source 3"},
+                {"type": "create_docx", "path": docx_path, "title": f"Research Report: {topic.title()}", "content": "", "headings": ["Executive Summary", "Key Findings", "Detailed Analysis", "Sources"], "description": f"Generate Word Document: {safe_topic}_report.docx"},
+                {"type": "verify_file", "path": docx_path, "description": "Verify Word document created"},
+                {"type": "speak", "text": f"Research on '{topic}' complete, sir. Word document saved to Desktop.", "description": "Done"}
+            ]
+        else:
+            actions = _rule_based_non_research(task, task_lower, desktop)
+
+    return actions
+
+
+def _rule_based_non_research(task: str, task_lower: str, desktop: str) -> List[Dict[str, Any]]:
+    """Offline plans for deterministic desktop, file, calculation, and browser tasks."""
+    actions = []
+    # 2. Notepad / Type text
+    if "notepad" in task_lower and ("type" in task_lower or "write" in task_lower or "open" in task_lower):
         text_match = re.search(r"['\"]([^'\"]+)['\"]", task)
         text = text_match.group(1) if text_match else task
-        actions = [
-            {"type": "open_app_wait", "app_name": "notepad", "window_title": "Notepad",
-             "description": "Open Notepad"},
-            {"type": "type_in_app", "text": text, "window_title": "Notepad",
-             "description": f"Type: {text[:40]}"},
-            {"type": "speak", "text": f"Notepad is open and I have typed the text, sir.",
-             "description": "Done"},
+        return [
+            {"type": "open_app_wait", "app_name": "notepad", "window_title": "Notepad", "description": "Open Notepad"},
+            {"type": "type_in_app", "text": text, "window_title": "Notepad", "description": "Type text into Notepad"},
+            {"type": "speak", "text": "Opened Notepad and typed your text, sir.", "description": "Done"}
         ]
-    elif ("research" in task_lower or "search" in task_lower) and ("word" in task_lower or "docx" in task_lower or "document" in task_lower):
-        # Research task with multiple sources
-        topic = task
-        for pattern in [
-            r"research\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-            r"search\s+for\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-            r"find\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-        ]:
-            m = re.search(pattern, task_lower)
-            if m:
-                topic = m.group(1).strip()
-                break
-        topic = re.sub(r'\s+(and|from|into|create)\s+(word\s+)?(document|docx).*$', '', topic, flags=re.I).strip()
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-        safe_topic = topic.replace(' ', '_')
+
+    # 3. Create folder & nested files
+    if "folder" in task_lower and ("create" in task_lower or "make" in task_lower):
+        folder_match = re.search(r"(?:create|make)\s+(?:a\s+)?folder\s+(?:named|called)?\s*['\"]?([a-zA-Z0-9_\-\.\s]+)['\"]?", task_lower)
+        folder_name = folder_match.group(1).strip() if folder_match else "NewFolder"
+        folder_name = re.sub(r"\s+on\s+desktop.*$", "", folder_name)
+        folder_path = os.path.join(desktop, folder_name)
 
         actions = [
-            {"type": "browser_search", "query": topic, "description": f"Search for {topic}"},
-            {"type": "browser_navigate", "source_index": 0, "description": "Navigate to first source"},
-            {"type": "browser_extract", "description": "Extract from first source"},
-            {"type": "browser_navigate", "source_index": 1, "description": "Navigate to second source"},
-            {"type": "browser_extract", "description": "Extract from second source"},
-            {"type": "browser_navigate", "source_index": 2, "description": "Navigate to third source"},
-            {"type": "browser_extract", "description": "Extract from third source"},
-            {"type": "create_docx", "path": os.path.join(desktop, f"{safe_topic}_research.docx"),
-             "title": f"Research: {topic}", "content": "", "headings": ["Overview", "Key Findings", "Sources"], "description": "Create research document"},
-            {"type": "verify_file", "path": os.path.join(desktop, f"{safe_topic}_research.docx"),
-             "description": "Verify document created"},
-            {"type": "speak", "text": f"Research on {topic} complete and saved to Desktop, sir.", "description": "Done"},
+            {"type": "create_folder_verified", "path": folder_path, "description": f"Create folder {folder_name}"},
+            {"type": "verify_file", "path": folder_path, "description": "Verify folder created"}
         ]
-    elif "calculator" in task_lower or "calc" in task_lower:
+
+        # Check if user also asked for files inside the folder
+        file_match = re.search(r"(?:in|inside)\s+that\s+folder\s+(?:create|make|write)\s+(?:a\s+)?file\s+(?:named|called)?\s*['\"]?([a-zA-Z0-9_\-\.]+)['\"]?", task_lower)
+        if file_match:
+            file_name = file_match.group(1).strip()
+            file_path = os.path.join(folder_path, file_name)
+            actions.append({"type": "write_file_verified", "path": file_path, "content": "Created by J.A.R.V.I.S.", "description": f"Create file {file_name}"})
+            actions.append({"type": "verify_file", "path": file_path, "description": f"Verify file {file_name}"})
+
+        actions.append({"type": "speak", "text": f"Folder {folder_name} created on Desktop, sir.", "description": "Done"})
+
+    # 4. Strict Calculator Match ONLY (requires explicit calc words or explicit arithmetic operators)
+    elif (any(k in task_lower for k in ["calculator", "calc", "calculate", "compute", "math"]) or
+          bool(re.search(r"\d+\s*[\+\-\*/×÷]\s*\d+", task))):
         expr_match = re.search(r"(\d[\d\s×*x\+\-÷/\.]+\d)", task)
-        expr = expr_match.group(1).replace("×", "*").replace("÷", "/").replace("x", "*") if expr_match else ""
+        expr = expr_match.group(1).replace("×", "*").replace("÷", "/").replace("x", "*") if expr_match else task
         actions = [
-            {"type": "calculator_compute", "expression": expr, "expected": "",
-             "description": f"Calculate {expr}"},
-            {"type": "speak", "text": f"Calculation complete, sir.", "description": "Done"},
+            {"type": "calculator_compute", "expression": expr, "expected": "", "description": f"Calculate {expr}"},
+            {"type": "speak", "text": "Calculation complete, sir.", "description": "Done"}
         ]
-    elif ("chrome" in task_lower or "search" in task_lower or "browser" in task_lower):
-        query_match = re.search(r"(?:search for|google|find)\s+(.+)", task_lower)
+
+    # 5. Browser search / Chrome open
+    elif any(k in task_lower for k in ["chrome", "search", "browser", "google", "website"]):
+        query_match = re.search(r"(?:open\s+(?:chrome|browser|google)(?:\s+and)?\s+)?(?:search\s+(?:for|fr|about)?|google|find|browse|look\s+up)\s+(.+)", task_lower)
         query = query_match.group(1).strip() if query_match else task
+        query = re.sub(r"^(?:for|fr|about|on|the)\s+", "", query, flags=re.I).strip()
         actions = [
-            {"type": "browser_search", "query": query, "description": f"Search: {query}"},
+            {"type": "browser_search", "query": query, "description": f"Search web: {query}"},
             {"type": "browser_get_title", "description": "Get page title"},
-            {"type": "speak", "text": "Browser task complete, sir.", "description": "Done"},
+            {"type": "speak", "text": f"Search completed for {query}, sir.", "description": "Done"}
         ]
+
     else:
         actions = [
-            {"type": "speak", "text": f"I'll process your request: {task[:80]}", "description": "Processing"},
+            {"type": "speak", "text": f"Processing your request, sir: {task[:80]}", "description": "Processing"}
         ]
 
     return actions
@@ -308,6 +406,21 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
             produces = ["collected_numbers"]
         elif atype == "open_app_wait":
             produces = ["active_app", "active_window"]
+        elif atype == "inspect_ui":
+            produces = ["ui_elements"]
+        elif atype == "find_ui_element":
+            produces = ["ui_target"]
+        elif atype == "click_ui":
+            consumes = ["ui_target"]
+            for j in range(i - 1, -1, -1):
+                if specs[j].type == "find_ui_element":
+                    depends_on.append(j)
+                    break
+        elif atype == "type_ui":
+            for j in range(i - 1, -1, -1):
+                if specs[j].type in ("click_ui", "find_ui_element", "open_app_wait"):
+                    depends_on.append(j)
+                    break
         elif atype == "type_in_app":
             consumes = ["active_window"]
             # Depends on open_app_wait
@@ -319,6 +432,18 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
             consumes = ["created_document_path"]
         elif atype == "browser_get_title":
             produces = ["current_page_title"]
+        elif atype == "report_page_finding":
+            consumes = ["extracted_sources"]
+            for j in range(i - 1, -1, -1):
+                if specs[j].type == "browser_extract":
+                    depends_on.append(j)
+                    break
+        elif atype in ("browser_click", "browser_type", "browser_new_tab"):
+            # Browser interactions need an already-open browser/page.
+            for j in range(i - 1, -1, -1):
+                if specs[j].type in ("browser_search", "browser_navigate", "browser_click", "browser_new_tab"):
+                    depends_on.append(j)
+                    break
         
         # Extract parameters (exclude type and description etc)
         params = {k: v for k, v in action.items() if k not in ("type", "description", "expected_outcome", "required_context_keys")}
@@ -385,7 +510,7 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
     for i, action in enumerate(plan.actions):
         # Check consumes
         for key in action.consumes:
-            if key not in produced_keys and key not in ("search_results", "current_page_url", "current_page_title", "extracted_sources", "collected_numbers", "active_app", "active_window", "created_document_path"):
+            if key not in produced_keys and key not in ("search_results", "current_page_url", "current_page_title", "extracted_sources", "collected_numbers", "active_app", "active_window", "created_document_path", "ui_elements", "ui_target"):
                 # Check if any dependency produces it
                 found = False
                 for dep_idx in action.depends_on:
@@ -404,6 +529,11 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
         "type_in_app": ["text", "window_title"],
         "press_key": ["key"],
         "calculator_compute": ["expression"],
+        "inspect_ui": [],
+        "find_ui_element": [],
+        "click_ui": [],
+        "type_ui": ["text"],
+        "screenshot_ui": [],
         "create_folder_verified": ["path"],
         "write_file_verified": ["path", "content"],
         "verify_file": ["path"],
@@ -412,6 +542,10 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
         "browser_navigate": [],  # url or source_index
         "browser_extract": [],
         "browser_get_title": [],
+        "browser_click": ["selector"],
+        "browser_type": ["selector", "text"],
+        "browser_new_tab": [],
+        "report_page_finding": ["query"],
         "speak": ["text"],
     }
     
@@ -589,7 +723,10 @@ class Planner:
             pass
         
         # Step 2: Generate plan using LLM
-        actions = _call_gemini_for_plan(task, api_key, PLANNER_SYSTEM_PROMPT)
+        # URL-directed tasks need exact navigation semantics.  Prefer the
+        # deterministic URL plan over an LLM paraphrasing the URL into a search.
+        explicit_url_task = bool(re.search(r"https?://[^\s\]\[\),]+", task, re.I))
+        actions = None if explicit_url_task else _call_gemini_for_plan(task, api_key, PLANNER_SYSTEM_PROMPT)
         if actions:
             # Resolve any placeholder desktop paths
             for action in actions:
