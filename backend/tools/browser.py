@@ -837,18 +837,229 @@ class Browser:
             return {"status": "error", "message": f"Failed to extract: {str(e)}"}
 
     async def get_page_text(self) -> Dict[str, Any]:
-        """Get all visible text from the current page body."""
+        """
+        Extract clean, deduplicated article content from the current page.
+        Prioritizes <article>, <main>, and article containers over <body>.
+        Handles Wikipedia main article content separately and strips navigation,
+        ads, cookies, footers, headers, buttons, and UI noise.
+        """
+        if not self.page:
+            return {"status": "error", "message": "No active browser page"}
+
         try:
-            text = await self.page.inner_text("body")
+            # First attempt: execute in-browser DOM parser with noise stripping
+            if hasattr(self.page, "evaluate"):
+                try:
+                    js_extractor = """
+                    () => {
+                        const isWikipedia = window.location.hostname.includes('wikipedia.org');
+                        let rootEl = null;
+
+                        if (isWikipedia) {
+                            rootEl = document.querySelector('#mw-content-text .mw-parser-output') ||
+                                     document.querySelector('#mw-content-text') ||
+                                     document.querySelector('#bodyContent') ||
+                                     document.querySelector('#content');
+                        } else {
+                            const candidateSelectors = [
+                                'article',
+                                'main',
+                                '[role="main"]',
+                                '#main-content',
+                                '#content-main',
+                                '#mainContent',
+                                '#primary',
+                                '.article-body',
+                                '.article-content',
+                                '.entry-content',
+                                '.post-content',
+                                '.story-content',
+                                '.story-body',
+                                '.article__body',
+                                '.post__content',
+                                '.content-article',
+                                '#article',
+                                '#content',
+                                '.content',
+                                '.main'
+                            ];
+                            for (const sel of candidateSelectors) {
+                                const el = document.querySelector(sel);
+                                if (el && (el.innerText || el.textContent || '').trim().length > 200) {
+                                    rootEl = el;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!rootEl) {
+                            rootEl = document.body;
+                        }
+
+                        if (!rootEl) {
+                            return { text: '', title: document.title || '', url: window.location.href || '' };
+                        }
+
+                        const clone = rootEl.cloneNode(true);
+
+                        const noiseSelectors = [
+                            'script', 'style', 'noscript', 'svg', 'canvas', 'iframe', 'form', 'button',
+                            'input', 'select', 'textarea', 'nav', 'header', 'footer', 'aside', 'menu', 'dialog',
+                            '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+                            '[role="complementary"]', '[role="dialog"]', '[role="alert"]',
+                            '.nav', '.navbar', '.navigation', '.menu', '.header', '.footer', '.sidebar',
+                            '.ad', '.ads', '.advertisement', '.ad-container', '.ad-wrapper', '.banner-ad',
+                            '.sponsor', '.sponsored', '.cookie', '.cookie-banner', '.cookie-consent',
+                            '.consent', '.modal', '.popup', '.overlay', '.share', '.social-share',
+                            '.share-buttons', '.social-media', '.newsletter', '.subscription',
+                            '.subscribe', '.comments', '.comment-section', '.related-posts',
+                            '.recommended', '.breadcrumb', '.breadcrumbs'
+                        ];
+
+                        if (isWikipedia) {
+                            noiseSelectors.push(
+                                '.mw-editsection', '.mw-jump-link', '.navbox', '.vertical-navbox',
+                                '.catlinks', '.infobox', '.toc', '#toc', '.reference', '.reflist',
+                                '.mw-references-wrap', '.thumbcaption', '.vector-header',
+                                '.vector-sidebar', '.vector-menu', '#mw-navigation', '#siteNotice',
+                                '.mw-indicators', '.noprint', '.hatnote', '.ambox', '.metadata',
+                                '.gallery', '.printfooter', '.mw-headline-number'
+                            );
+                        }
+
+                        for (const sel of noiseSelectors) {
+                            try {
+                                const elements = clone.querySelectorAll(sel);
+                                elements.forEach(el => el.remove());
+                            } catch(e) {}
+                        }
+
+                        const blocks = [];
+                        const blockElements = clone.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, blockquote');
+                        const boilerplatePatterns = [
+                            /cookie/i, /sign\\s*in/i, /log\\s*in/i, /terms\\s+of\\s+(use|service)/i,
+                            /privacy\\s+policy/i, /all\\s+rights\\s+reserved/i, /subscribe/i,
+                            /share\\s+this/i, /follow\\s+us/i, /advertisement/i, /read\\s+more/i,
+                            /copyright/i, /back\\s+to\\s+top/i
+                        ];
+
+                        if (blockElements.length > 0) {
+                            blockElements.forEach(el => {
+                                const txt = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                                if (txt.length < 15 && !el.tagName.match(/^H[1-6]$/i)) return;
+                                if (txt.length < 120) {
+                                    for (const pat of boilerplatePatterns) {
+                                        if (pat.test(txt)) return;
+                                    }
+                                }
+                                blocks.push(txt);
+                            });
+                        }
+
+                        let extractedText = '';
+                        if (blocks.length > 0) {
+                            const uniqueBlocks = [];
+                            const seen = new Set();
+                            for (const b of blocks) {
+                                const key = b.toLowerCase();
+                                if (!seen.has(key)) {
+                                    seen.add(key);
+                                    uniqueBlocks.push(b);
+                                }
+                            }
+                            extractedText = uniqueBlocks.join('\\n\\n');
+                        } else {
+                            extractedText = (clone.innerText || clone.textContent || '').trim();
+                        }
+
+                        return {
+                            text: extractedText.slice(0, 15000),
+                            title: document.title || '',
+                            url: window.location.href || ''
+                        };
+                    }
+                    """
+                    data = await self.page.evaluate(js_extractor)
+                    if data and data.get("text"):
+                        clean_text = self._clean_extracted_text(data.get("text", ""))
+                        return {
+                            "status": "success",
+                            "text": clean_text[:12000],
+                            "title": data.get("title") or (await self.get_page_title()).get("title", ""),
+                            "url": data.get("url") or (await self.get_page_title()).get("url", "")
+                        }
+                except Exception:
+                    pass
+
+            # Fallback: Playwright inner_text or text_content with Python-side text cleaning
+            raw_text = ""
+            for selector in ["article", "main", "[role='main']", "#mw-content-text", "#content", "body"]:
+                try:
+                    el = self.page.locator(selector).first
+                    if await el.count() > 0:
+                        raw_text = await el.inner_text(timeout=3000)
+                        if raw_text and len(raw_text.strip()) > 150:
+                            break
+                except Exception:
+                    continue
+
+            if not raw_text:
+                try:
+                    raw_text = await self.page.inner_text("body", timeout=5000)
+                except Exception:
+                    raw_text = ""
+
+            clean_text = self._clean_extracted_text(raw_text)
             title_result = await self.get_page_title()
             return {
                 "status": "success",
-                "text": text[:8000] if text else "",
+                "text": clean_text[:12000] if clean_text else "",
                 "title": title_result.get("title", ""),
                 "url": title_result.get("url", "")
             }
         except Exception as e:
             return {"status": "error", "message": f"Failed to get page text: {str(e)}"}
+
+    @staticmethod
+    def _clean_extracted_text(raw_text: str) -> str:
+        """Deduplicate lines and strip navigation/cookie/boilerplate text."""
+        if not raw_text:
+            return ""
+
+        noise_patterns = [
+            re.compile(r"^\s*(home|menu|search|navigation|skip to (content|main)|sign in|log in|register)\s*$", re.I),
+            re.compile(r"^\s*(cookie policy|cookie notice|cookies?|privacy policy|terms of (use|service)|all rights reserved|copyright \d{4})\s*$", re.I),
+            re.compile(r"^\s*(share|tweet|follow us on|subscribe to newsletter|advertisement)\s*$", re.I),
+            re.compile(r"^\s*(edit\s*\[\s*edit\s*\]|\^ jump up to:|retrieved on \d+)\s*$", re.I),
+            re.compile(r"^\[edit\]$", re.I),
+        ]
+
+        lines = [line.strip() for line in raw_text.splitlines()]
+        cleaned_lines = []
+        seen = set()
+
+        for line in lines:
+            line_normalized = re.sub(r"\s+", " ", line).strip()
+            if not line_normalized:
+                continue
+            # Always apply full-line noise check (catches 'Cookie Policy', 'Privacy Policy', etc.)
+            if any(p.match(line_normalized) for p in noise_patterns):
+                continue
+            # Drop very short lines without sentence termination (navigation/UI noise)
+            if len(line_normalized) < 15 and not line_normalized.endswith((".", ":", "?", "!")):
+                continue
+            # Drop medium-length lines that match a noise pattern
+            if any(p.search(line_normalized) for p in noise_patterns) and len(line_normalized) < 80:
+                continue
+
+            line_key = line_normalized.lower()
+            if line_key in seen:
+                continue
+            seen.add(line_key)
+            cleaned_lines.append(line_normalized)
+
+        return "\n\n".join(cleaned_lines)
+
 
     async def get_links(self, limit: int = 20) -> Dict[str, Any]:
         """Get all hyperlinks on the current page."""

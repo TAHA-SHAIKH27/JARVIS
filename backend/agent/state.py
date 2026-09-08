@@ -101,6 +101,9 @@ class TaskState:
     # ── Browser research data passing ────────────────────────────────────────
     search_results: List[Dict[str, Any]] = field(default_factory=list)
     extracted_sources: List[Dict[str, Any]] = field(default_factory=list)
+    source_analyses: List[Dict[str, Any]] = field(default_factory=list)
+    cross_source_analysis: Dict[str, Any] = field(default_factory=dict)
+    synthesized_report: Dict[str, Any] = field(default_factory=dict)
     current_page_url: str = ""
     current_page_title: str = ""
     collected_numbers: List[float] = field(default_factory=list)

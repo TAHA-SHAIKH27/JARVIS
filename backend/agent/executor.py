@@ -391,11 +391,21 @@ class Executor:
         elif atype == "generate_image":
             try:
                 import json as _json
-                cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "config.json"))
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                candidates = [
+                    os.path.join(base_dir, "config.json"),
+                    os.path.join(base_dir, "..", "config.json"),
+                    os.path.join(base_dir, "..", "..", "config.json"),
+                    os.path.join(os.getcwd(), "config.json")
+                ]
                 hf_key = ""
-                if os.path.exists(cfg_path):
-                    with open(cfg_path) as f:
-                        hf_key = _json.load(f).get("huggingface_api_key", "")
+                for cfg_path in candidates:
+                    resolved = os.path.abspath(cfg_path)
+                    if os.path.isfile(resolved):
+                        with open(resolved, "r", encoding="utf-8") as f:
+                            hf_key = _json.load(f).get("huggingface_api_key", "")
+                            if hf_key:
+                                break
                 from agent import generate_image_huggingface
                 return generate_image_huggingface(params.get("prompt", ""), hf_key, params.get("save_name", ""))
             except Exception as e:
@@ -667,7 +677,7 @@ class Executor:
         return {"status": "error", "message": f"File NOT found: {path}"}
 
     async def _create_docx(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Create a Word document using python-docx, synthesizing research content from state if available."""
+        """Create a Word document using python-docx, synthesizing research content from state with AI."""
         path = action.get("path", "")
         title = action.get("title", "Research Report")
         content = action.get("content", "")
@@ -681,51 +691,82 @@ class Executor:
         if not path.endswith(".docx"):
             path += ".docx"
 
-        # If extracted sources exist in state, synthesize them into comprehensive report content
+        from backend.tools.office import Office
+        from backend.agent.research_synthesizer import ResearchSynthesizer
+
+        synthesizer = ResearchSynthesizer()
+
+        # If extracted sources exist in state, synthesize them through AI pipeline
         if state.extracted_sources or state.search_results:
-            sources = state.extracted_sources if state.extracted_sources else state.search_results
-            content_sections = []
+            raw_sources = state.extracted_sources if state.extracted_sources else state.search_results
 
-            # 1. Executive Summary
-            content_sections.append("EXECUTIVE SUMMARY")
-            content_sections.append(f"This document presents comprehensive research findings on '{title}'. Data was gathered from multiple web sources and compiled automatically by J.A.R.V.I.S.")
-            content_sections.append("")
+            # 1. Deduplicate sources
+            unique_sources = []
+            seen_urls = set()
+            for src in raw_sources:
+                u = (src.get("url") or "").strip().lower()
+                if u and u not in seen_urls:
+                    seen_urls.add(u)
+                    unique_sources.append(src)
+                elif not u:
+                    unique_sources.append(src)
 
-            # 2. Key Findings per Source
-            content_sections.append("KEY FINDINGS & EXTRACTED DATA")
-            for idx, src in enumerate(sources, 1):
-                src_title = src.get("title") or src.get("url") or f"Source {idx}"
-                src_url = src.get("url", "")
-                src_text = src.get("text") or src.get("snippet") or "No detailed body text available."
+            if not unique_sources:
+                unique_sources = raw_sources
 
-                content_sections.append(f"Source {idx}: {src_title}")
-                if src_url:
-                    content_sections.append(f"URL: {src_url}")
-                content_sections.append("Summary of Content:")
-                # Clean up snippet/text lines
-                lines = [line.strip() for line in src_text.split("\n") if len(line.strip()) > 30]
-                body_summary = "\n".join(lines[:10]) if lines else src_text[:1500]
-                content_sections.append(body_summary)
-                content_sections.append("")
+            # 2. Analyze each source
+            source_analyses = []
+            for src in unique_sources:
+                s_title = src.get("title") or src.get("url") or "Web Source"
+                s_url = src.get("url") or ""
+                s_content = src.get("text") or src.get("snippet") or ""
+                analysis = synthesizer.analyze_source(s_title, s_url, s_content)
+                source_analyses.append(analysis)
 
-            # 3. References
-            content_sections.append("REFERENCES & SOURCES")
-            for idx, src in enumerate(sources, 1):
-                url = src.get("url", "N/A")
-                t = src.get("title", "Web Resource")
-                content_sections.append(f"[{idx}] {t} — {url}")
+            state.source_analyses = source_analyses
 
-            content = "\n".join(content_sections)
+            # Extract clean topic from title or task
+            clean_topic = title
+            for prefix in ["Research Report:", "Research Report -", "Research:", "Report:"]:
+                if clean_topic.startswith(prefix):
+                    clean_topic = clean_topic[len(prefix):].strip()
+            if not clean_topic:
+                clean_topic = state.task or "Research Topic"
 
+            # 3. Cross-source comparison
+            comparison = synthesizer.compare_sources(clean_topic, source_analyses)
+            state.cross_source_analysis = comparison
+
+            # 4. Deep report synthesis
+            structured_report = synthesizer.synthesize_research_report(
+                topic=clean_topic,
+                sources=unique_sources,
+                source_analyses=source_analyses,
+                comparison=comparison
+            )
+            state.synthesized_report = structured_report
+
+            try:
+                result = await Office.create_docx(
+                    title=title,
+                    structured_report=structured_report,
+                    save_path=path
+                )
+                state.final_outcome_verified = True
+                state.final_outcome_data = {"path": path, "title": title, "report": structured_report}
+                return result
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to create synthesized DOCX: {str(e)}"}
+
+        # Legacy / Non-research document generation
         if not content.strip():
-            content = f"Research report for {title}.\nGenerated by J.A.R.V.I.S. Agentic System."
+            content = f"Report: {title}\n\nGenerated by J.A.R.V.I.S. Agentic System."
 
         try:
-            from backend.tools.office import Office
             result = await Office.create_docx(
                 content=content,
                 title=title,
-                headings=headings if headings else ["Executive Summary", "Key Findings & Extracted Data", "References & Sources"],
+                headings=headings if headings else ["Executive Summary", "Key Findings", "References"],
                 save_path=path
             )
             state.final_outcome_verified = True
@@ -782,18 +823,30 @@ class Executor:
         return res
 
     async def _browser_extract(self, action: Dict, state: TaskState) -> Dict[str, Any]:
-        """Extract text from current page and append to state.extracted_sources."""
+        """Extract clean text from current page, deduplicate, and append to state.extracted_sources."""
         browser = await self._get_browser()
         res = await browser.get_page_text()
         if res.get("status") == "success" and res.get("text"):
             text = res.get("text", "").strip()
+            source_url = res.get("url") or state.current_page_url or ""
+            source_title = res.get("title") or state.current_page_title or "Extracted Web Page"
+
             if len(text) > 30:
-                source_item = {
-                    "url": res.get("url") or state.current_page_url,
-                    "title": res.get("title") or state.current_page_title or "Extracted Web Page",
-                    "text": text
-                }
-                state.extracted_sources.append(source_item)
+                # Deduplicate: check if URL already in state.extracted_sources
+                existing_urls = {s.get("url", "").lower() for s in state.extracted_sources if s.get("url")}
+                if source_url.lower() not in existing_urls:
+                    source_item = {
+                        "url": source_url,
+                        "title": source_title,
+                        "text": text
+                    }
+                    state.extracted_sources.append(source_item)
+                else:
+                    # Update existing source text if longer / better
+                    for s in state.extracted_sources:
+                        if s.get("url", "").lower() == source_url.lower() and len(text) > len(s.get("text", "")):
+                            s["text"] = text
+                            s["title"] = source_title
         return res
 
     def _report_page_finding(self, action: Dict, state: TaskState) -> Dict[str, Any]:

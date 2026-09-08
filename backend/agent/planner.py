@@ -126,11 +126,36 @@ Output:
 }"""
 
 
+def _load_config_gemini_api_key() -> str:
+    """Load Gemini API key from config.json or environment."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "config.json"),
+        os.path.join(base_dir, "..", "config.json"),
+        os.path.join(base_dir, "..", "..", "config.json"),
+        os.path.join(os.getcwd(), "config.json")
+    ]
+    for cfg_path in candidates:
+        resolved = os.path.abspath(cfg_path)
+        if os.path.isfile(resolved):
+            try:
+                with open(resolved, "r", encoding="utf-8") as f:
+                    key = json.load(f).get("gemini_api_key", "")
+                    if key:
+                        return key
+            except Exception:
+                pass
+    return os.environ.get("GEMINI_API_KEY", "")
+
+
 def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Optional[List[Dict[str, Any]]]:
     """Call the Gemini API to get a structured action plan."""
     import urllib.request
     import urllib.error
     import google_oauth
+
+    if not api_key:
+        api_key = _load_config_gemini_api_key()
 
     use_oauth = google_oauth.is_authenticated()
     access_token = ""
@@ -289,7 +314,7 @@ def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
                 {"type": "browser_extract", "description": "Extract content from source 2"},
                 {"type": "browser_navigate", "source_index": 2, "description": "Visit source 3"},
                 {"type": "browser_extract", "description": "Extract content from source 3"},
-                {"type": "create_docx", "path": docx_path, "title": f"Research Report: {topic.title()}", "content": "", "headings": ["Executive Summary", "Key Findings", "Detailed Analysis", "Sources"], "description": f"Generate Word Document: {safe_topic}_report.docx"},
+                {"type": "create_docx", "path": docx_path, "title": f"Research Report: {topic.title()}", "content": "", "headings": ["Executive Summary", "Introduction & Background", "Key Findings & Thematic Analysis", "Detailed Source Insights", "Cross-Source Comparative Analysis", "Conclusion & Implications", "References & Verified Sources"], "description": f"Generate Word Document: {safe_topic}_report.docx"},
                 {"type": "verify_file", "path": docx_path, "description": "Verify Word document created"},
                 {"type": "speak", "text": f"Research on '{topic}' complete, sir. Word document saved to Desktop.", "description": "Done"}
             ]
@@ -577,16 +602,7 @@ class Planner:
             return self._goal_cache[task_key]
         
         # Load API key
-        api_key = ""
-        try:
-            import json as _json
-            import os as _os
-            cfg_path = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "..", "config.json"))
-            if _os.path.exists(cfg_path):
-                with open(cfg_path, "r") as f:
-                    api_key = _json.load(f).get("gemini_api_key", "")
-        except Exception:
-            pass
+        api_key = _load_config_gemini_api_key()
         
         # Try LLM for goal understanding
         goal_analysis = _call_gemini_for_plan(task, api_key, GOAL_UNDERSTANDING_PROMPT)
@@ -711,16 +727,7 @@ class Planner:
         state.task_type = _infer_task_type(task, goal_analysis)
         
         # Load API key
-        api_key = ""
-        try:
-            import json as _json
-            import os as _os
-            cfg_path = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "..", "config.json"))
-            if _os.path.exists(cfg_path):
-                with open(cfg_path, "r") as f:
-                    api_key = _json.load(f).get("gemini_api_key", "")
-        except Exception:
-            pass
+        api_key = _load_config_gemini_api_key()
         
         # Step 2: Generate plan using LLM
         # URL-directed tasks need exact navigation semantics.  Prefer the
@@ -825,16 +832,7 @@ Adjust the plan to:
 4. Maintain dependencies on successful steps
 """
         
-        api_key = ""
-        try:
-            import json as _json
-            import os as _os
-            cfg_path = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "..", "config.json"))
-            if _os.path.exists(cfg_path):
-                with open(cfg_path, "r") as f:
-                    api_key = _json.load(f).get("gemini_api_key", "")
-        except Exception:
-            pass
+        api_key = _load_config_gemini_api_key()
         
         actions = _call_gemini_for_plan(task, api_key, replan_prompt)
         if not actions:
