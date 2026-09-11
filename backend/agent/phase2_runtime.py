@@ -11,27 +11,19 @@ PHASE2_PROMPT_EXTENSION = r'''
 PHASE 2 WINDOWS COMPUTER AGENT:
 Use the existing Windows computer tool for real desktop control. Prefer semantic UI Automation (UIA) over guessed screen coordinates. Observe before acting when the target is ambiguous, and verify the result after actions.
 
-Additional computer actions:
-{"type":"list_windows","description":"List visible Windows applications","expected_outcome":"Visible windows are returned","required_context_keys":[]}
-{"type":"focus_window","window_title":"Notepad","description":"Focus the target application window","expected_outcome":"The requested window is focused","required_context_keys":[]}
-{"type":"inspect_ui","target":"Save","description":"Inspect the target Windows UI","expected_outcome":"Visible UI controls are discovered","required_context_keys":[]}
-{"type":"find_ui_element","text":"Save","description":"Find a visible Windows control","expected_outcome":"The requested control is located","required_context_keys":[]}
-{"type":"click_ui","text":"Save","description":"Click the requested Windows control","expected_outcome":"The control is activated","required_context_keys":[]}
-{"type":"type_ui","text":"Hello","description":"Type into the focused Windows control","expected_outcome":"The text is entered","required_context_keys":[]}
-{"type":"press_key","key":"ctrl+s","description":"Press a keyboard shortcut","expected_outcome":"The shortcut is executed","required_context_keys":[]}
-{"type":"scroll_ui","amount":-5,"description":"Scroll the active Windows application","expected_outcome":"The view scrolls","required_context_keys":[]}
-{"type":"drag_ui","x1":100,"y1":100,"x2":500,"y2":500,"description":"Drag between two screen points","expected_outcome":"The drag operation completes","required_context_keys":[]}
-{"type":"screenshot_ui","description":"Capture the desktop for observation","expected_outcome":"A screenshot is saved","required_context_keys":[]}
-
-COMPUTER USE RULES:
+Computer-use rules:
+- For normal desktop tasks, use open_app_wait -> inspect_ui/find_ui_element -> click_ui/type_ui/press_key as needed -> verification.
 - Prefer finding a named control before clicking it.
-- Do not claim an action succeeded unless the executor/observer verifies it.
+- Use the existing inspect_ui/find_ui_element/click_ui/type_ui/screenshot_ui actions; do not invent new action types.
 - Use screenshot_ui when UIA cannot expose the required control; treat it as observation/fallback, not proof by itself.
+- Do not claim an action succeeded unless the executor/observer verifies it.
 - For multi-step tasks, keep the plan minimal and ordered.
+- For File Explorer or normal Windows applications, operate the visible application rather than pretending a command completed.
 '''
 
 
 async def _execute_phase2_action(executor: Any, action: Any, state: Any):
+    """Provide additional computer primitives while preserving existing actions."""
     computer = executor._computer()
     params = executor._inject_state_data(action, state)
     atype = action.type
@@ -40,38 +32,10 @@ async def _execute_phase2_action(executor: Any, action: Any, state: Any):
         return await computer.list_windows(state)
     if atype == "focus_window":
         return await computer.focus_window(params.get("window_title", params.get("title", "")), state)
-    if atype == "inspect_ui":
-        result = await computer.inspect_ui(params.get("target", ""), state)
-        if result.get("status") == "success":
-            state.update_context("ui_elements", result.get("elements", result.get("element", {})))
-        return result
-    if atype == "find_ui_element":
-        result = await computer.find_element({
-            "text": params.get("text", params.get("target", "")),
-            "class": params.get("class", ""),
-            "control_type": params.get("control_type", ""),
-        }, state)
-        if result.get("status") == "success":
-            state.update_context("ui_target", result.get("element"))
-        return result
-    if atype == "click_ui":
-        element = params.get("element") or state.get_context("ui_target")
-        if not element and params.get("text"):
-            found = await computer.find_element({"text": params["text"]}, state)
-            if found.get("status") != "success":
-                return found
-            element = found.get("element")
-            state.update_context("ui_target", element)
-        return await computer.click(x=params.get("x"), y=params.get("y"), element=element, state=state)
-    if atype == "type_ui":
-        element = params.get("element") or state.get_context("ui_target")
-        return await computer.type_text(params.get("text", ""), element=element, state=state)
     if atype == "scroll_ui":
         return await computer.scroll(int(params.get("amount", 0)), state)
     if atype == "drag_ui":
         return await computer.drag(int(params.get("x1", 0)), int(params.get("y1", 0)), int(params.get("x2", 0)), int(params.get("y2", 0)), state)
-    if atype == "screenshot_ui":
-        return await computer.screenshot(state)
     return None
 
 
