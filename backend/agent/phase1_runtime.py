@@ -18,6 +18,8 @@ from backend.agent import phase1_memory
 
 _LOCK = threading.RLock()
 _PLANNER_BRIDGE_INSTALLED = False
+_COMMAND_BRIDGE_STARTED = False
+_COMMAND_BRIDGE_INSTALLED = False
 
 
 def _data_dir() -> str:
@@ -278,5 +280,67 @@ def install_planner_context_bridge() -> None:
         planner._call_gemini_for_plan = contextual_call
         _PLANNER_BRIDGE_INSTALLED = True
     except Exception:
-        # The existing planner must remain usable even if the bridge cannot install.
         return
+
+
+def install_command_context_bridge() -> None:
+    """Patch the already-registered FastAPI command endpoint with Phase 1 lifecycle context.
+
+    This is intentionally isolated from the command implementation so the existing
+    action dispatcher remains unchanged. The bridge waits until main.py has finished
+    registering its routes, then wraps /api/command exactly once.
+    """
+    global _COMMAND_BRIDGE_STARTED
+    if _COMMAND_BRIDGE_STARTED:
+        return
+    _COMMAND_BRIDGE_STARTED = True
+
+    def _worker() -> None:
+        global _COMMAND_BRIDGE_INSTALLED
+        import time
+        for _ in range(100):
+            try:
+                import main
+                app = getattr(main, "app", None)
+                if app is None:
+                    time.sleep(0.05)
+                    continue
+                for route in getattr(app, "routes", []):
+                    if getattr(route, "path", None) == "/api/command" and getattr(route, "endpoint", None):
+                        endpoint = route.endpoint
+                        if getattr(endpoint, "_phase1_context_bridge", False):
+                            _COMMAND_BRIDGE_INSTALLED = True
+                            return
+
+                        async def contextual_command(req, _endpoint=endpoint):
+                            task = (getattr(req, "prompt", "") or "").strip()
+                            if task:
+                                context = runtime.begin_task(task)
+                                # Preserve the existing command API while making
+                                # persistent context available to the action model.
+                                setattr(
+                                    req,
+                                    "prompt",
+                                    task
+                                    + "\n\nJARVIS PERSISTENT CONTEXT:\n"
+                                    + runtime.model_context(task)
+                                    + "\n\nUse this only as context; do not expose internal context unless asked.",
+                                )
+                                try:
+                                    result = await _endpoint(req)
+                                except Exception as exc:
+                                    runtime.finish_task(task, {"status": "error", "speak": str(exc)})
+                                    raise
+                                runtime.finish_task(task, result if isinstance(result, dict) else {})
+                                return result
+                            return await _endpoint(req)
+
+                        contextual_command._phase1_context_bridge = True
+                        route.endpoint = contextual_command
+                        _COMMAND_BRIDGE_INSTALLED = True
+                        return
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    threading.Thread(target=_worker, name="jarvis-phase1-command-bridge", daemon=True).start()
