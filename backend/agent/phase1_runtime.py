@@ -70,6 +70,67 @@ def normalize_intent(text: str) -> Dict[str, Any]:
     return {"text": original, "normalized": lower, "intent": intent}
 
 
+def _extract_memory_text(task: str) -> str:
+    """Extract the user's memory payload from common natural-language commands."""
+    text = (task or "").strip()
+    lower = text.casefold()
+    prefixes = (
+        "remember that ",
+        "remember this: ",
+        "remember this ",
+        "remember: ",
+        "remember ",
+        "don't forget that ",
+        "don't forget ",
+        "do not forget that ",
+        "do not forget ",
+        "keep in mind that ",
+        "keep in mind ",
+    )
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            return text[len(prefix):].strip().rstrip(".")
+    return ""
+
+
+def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
+    """Handle explicit memory commands without sending them to Gemini.
+
+    This is intentionally deterministic: a request to remember something must
+    modify the persistent store, not merely cause the model to say it did.
+    """
+    normalized = normalize_intent(task)
+    if normalized["intent"] != "remember":
+        return None
+    memory_text = _extract_memory_text(task)
+    if not memory_text:
+        return {
+            "speak": "Please tell me what you want me to remember, sir.",
+            "logs": ["MEMORY: No memory content supplied"],
+            "file_data": None,
+            "refresh_files": False,
+            "image_data": None,
+        }
+    result = phase1_memory.remember(memory_text, category="general", source="jarvis-ui")
+    if result.get("status") != "success":
+        return {
+            "speak": result.get("message", "I could not save that memory, sir."),
+            "logs": [f"MEMORY ERROR: {result.get('message', 'unknown error')}"],
+            "file_data": None,
+            "refresh_files": False,
+            "image_data": None,
+        }
+    return {
+        "speak": f"Understood, sir. I will remember that: {memory_text}",
+        "logs": [f"MEMORY SAVED: {memory_text}"],
+        "file_data": None,
+        "refresh_files": False,
+        "image_data": None,
+        "memory_saved": True,
+        "memory": result.get("memory"),
+    }
+
+
 class ConversationContext:
     def __init__(self, max_turns: int = 20):
         self.max_turns = max(2, int(max_turns))
@@ -298,8 +359,6 @@ def install_command_context_bridge() -> None:
                         task = (getattr(req, "prompt", "") or "").strip()
                         reset = _reset_command(task)
                         if reset:
-                            # Never inject context into reset commands. This preserves the
-                            # original API's exact reset semantics and prevents stale context.
                             if reset in {"clear memory", "forget everything", "reset"}:
                                 phase1_memory.clear()
                             runtime.conversation.clear()
@@ -308,6 +367,15 @@ def install_command_context_bridge() -> None:
                                 result = dict(result)
                                 result["phase1_reset"] = True
                             return result
+
+                        # Explicit memory requests are handled locally and deterministically.
+                        # They must update memory.json rather than depend on Gemini choosing
+                        # the correct action schema.
+                        direct_memory = _direct_memory_command(task)
+                        if direct_memory is not None:
+                            runtime.conversation.add("user", task, {"intent": "remember"})
+                            runtime.conversation.add("assistant", direct_memory["speak"], {"memory_saved": direct_memory.get("memory_saved", False)})
+                            return direct_memory
 
                         if not task:
                             return await _endpoint(req)
