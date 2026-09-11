@@ -2,6 +2,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
+# Import the Phase 1 runtime during application import so its command bridge
+# can attach after main.py finishes registering FastAPI routes.
+from backend.agent import phase1_runtime as _phase1_runtime
+
 
 class BrowserPageState(Enum):
     NORMAL_SERP = "normal_serp"
@@ -133,8 +137,6 @@ class TaskState:
     def __setattr__(self, name: str, value: Any) -> None:
         """Attach Phase 1 context automatically when a real task starts."""
         object.__setattr__(self, name, value)
-        # Dataclass construction assigns task before _context exists. Only
-        # initialize Phase 1 after the instance is fully initialized.
         if (
             name == "task"
             and value
@@ -144,8 +146,6 @@ class TaskState:
             try:
                 self.initialize_phase1(value)
             except Exception:
-                # Phase 1 persistence must never prevent the core agent from
-                # running when its optional state store is unavailable.
                 object.__setattr__(self, "phase1_initialized", False)
 
     def initialize_phase1(self, task: Optional[str] = None) -> Dict[str, Any]:
@@ -191,3 +191,8 @@ class TaskState:
 
     def get_context(self, key: str, default: Any = None) -> Any:
         return self._context.get(key, default)
+
+
+# Start after this module is imported; the bridge waits for main.py to finish
+# registering /api/command before replacing only that route's endpoint.
+_phase1_runtime.install_command_context_bridge()
