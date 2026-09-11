@@ -5,6 +5,7 @@ from enum import Enum
 # Import the Phase 1 runtime during application import so its command bridge
 # can attach after main.py finishes registering FastAPI routes.
 from backend.agent import phase1_runtime as _phase1_runtime
+from backend.agent import phase2_runtime as _phase2_runtime
 
 
 class BrowserPageState(Enum):
@@ -193,6 +194,7 @@ class TaskState:
         return self._context.get(key, default)
 
 
-# Start after this module is imported; the bridge waits for main.py to finish
-# registering /api/command before replacing only that route's endpoint.
+# Start after this module is imported; the bridges wait for the required
+# planner/executor components and main.py routes to become available.
 _phase1_runtime.install_command_context_bridge()
+_phase2_runtime.install_phase2()
