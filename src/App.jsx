@@ -981,7 +981,7 @@ export default function App() {
 
           <div className="panel hud-panel-sphere">
             <div className="core-display-container">
-              <CoreSphere state={sphereState} />
+              <CoreSphere state={sphereState} agentMode={agentMode} />
             </div>
           </div>
 
