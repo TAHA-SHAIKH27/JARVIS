@@ -2,11 +2,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
-# Import the Phase 1 runtime during application import so its command bridge
-# can attach after main.py finishes registering FastAPI routes.
-from backend.agent import phase1_runtime as _phase1_runtime
-from backend.agent import phase2_runtime as _phase2_runtime
-
 
 class BrowserPageState(Enum):
     NORMAL_SERP = "normal_serp"
@@ -124,7 +119,6 @@ class TaskState:
     final_verification_passed: bool = False
     final_outcome_data: Dict[str, Any] = field(default_factory=dict)
 
-    # Phase 1 persistent runtime context.
     memory_context: str = ""
     conversation_context: str = ""
     reminders_context: str = ""
@@ -172,7 +166,6 @@ class TaskState:
         return context
 
     def finalize_phase1(self, status: str, summary: str = "") -> None:
-        """Persist the assistant-side outcome for future conversation context."""
         from backend.agent.phase1_runtime import runtime
         runtime.finish_task(self.task, {"status": status, "speak": summary})
 
@@ -194,7 +187,11 @@ class TaskState:
         return self._context.get(key, default)
 
 
-# Start after this module is imported; the bridges wait for the required
-# planner/executor components and main.py routes to become available.
+# Install bridges only after all state classes are defined. Importing phase2_runtime
+# earlier caused a circular import through executor -> state, which prevented the
+# Phase 2 executor bridge from being installed.
+from backend.agent import phase1_runtime as _phase1_runtime
+from backend.agent import phase2_runtime as _phase2_runtime
+
 _phase1_runtime.install_command_context_bridge()
 _phase2_runtime.install_phase2()
