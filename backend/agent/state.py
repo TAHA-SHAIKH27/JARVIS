@@ -122,6 +122,7 @@ class TaskState:
     # Phase 1 persistent runtime context.
     memory_context: str = ""
     conversation_context: str = ""
+    reminders_context: str = ""
     intent: Dict[str, Any] = field(default_factory=dict)
     task_id: str = ""
     task_started_at: str = ""
@@ -132,7 +133,14 @@ class TaskState:
     def __setattr__(self, name: str, value: Any) -> None:
         """Attach Phase 1 context automatically when a real task starts."""
         object.__setattr__(self, name, value)
-        if name == "task" and value and not getattr(self, "phase1_initialized", False):
+        # Dataclass construction assigns task before _context exists. Only
+        # initialize Phase 1 after the instance is fully initialized.
+        if (
+            name == "task"
+            and value
+            and "_context" in self.__dict__
+            and not getattr(self, "phase1_initialized", False)
+        ):
             try:
                 self.initialize_phase1(value)
             except Exception:
@@ -141,21 +149,25 @@ class TaskState:
                 object.__setattr__(self, "phase1_initialized", False)
 
     def initialize_phase1(self, task: Optional[str] = None) -> Dict[str, Any]:
-        """Load persistent memory/conversation context for the current task."""
+        """Load persistent context and connect it to the AI planning layer."""
         if task is not None:
             object.__setattr__(self, "task", task)
-        from backend.agent.phase1_runtime import runtime
+        from backend.agent.phase1_runtime import runtime, install_planner_context_bridge
+
         context = runtime.begin_task(self.task)
         object.__setattr__(self, "task_id", context["task_id"])
         object.__setattr__(self, "task_started_at", context["started_at"])
         object.__setattr__(self, "intent", context["intent"])
         object.__setattr__(self, "memory_context", context["memory_context"])
         object.__setattr__(self, "conversation_context", context["conversation_context"])
+        object.__setattr__(self, "reminders_context", context.get("reminders_context", "No active reminders."))
         object.__setattr__(self, "phase1_initialized", True)
         self.update_context("memory_context", self.memory_context)
         self.update_context("conversation_context", self.conversation_context)
+        self.update_context("reminders_context", self.reminders_context)
         self.update_context("intent", self.intent)
         self.update_context("task_id", self.task_id)
+        install_planner_context_bridge()
         return context
 
     def finalize_phase1(self, status: str, summary: str = "") -> None:
