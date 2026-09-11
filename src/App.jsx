@@ -851,7 +851,7 @@ export default function App() {
       )}
 
       {/* ── Core view (hidden when phone/files active) ── */}
-      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+      <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
 
       {/* TOP BAR */}
 <Header
@@ -1011,7 +1011,7 @@ export default function App() {
 
         {/* ── RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ── */}
         <div className="hud-right">
-          <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} />
+          <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} agentMode={agentMode} />
           <PhonePanel />
         </div>
       </div>
