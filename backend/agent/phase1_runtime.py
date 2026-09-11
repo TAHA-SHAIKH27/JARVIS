@@ -1,14 +1,8 @@
-"""JARVIS Phase 1 runtime foundation.
-
-Provides persistent memory, bounded conversation context, reminders, intent
-normalization, and task lifecycle tracking. It also bridges that context into
-the existing planner without coupling the runtime to a specific model.
-"""
+"""JARVIS Phase 1 runtime foundation."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -39,8 +33,7 @@ def _reminder_path() -> str:
 def _read_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value
+            return json.load(handle)
     except (OSError, ValueError, TypeError):
         return default
 
@@ -57,7 +50,6 @@ def utc_now() -> str:
 
 
 def normalize_intent(text: str) -> Dict[str, Any]:
-    """Normalize common natural-language intent without changing the command."""
     original = (text or "").strip()
     lower = original.casefold()
     intent = "conversation"
@@ -79,8 +71,6 @@ def normalize_intent(text: str) -> Dict[str, Any]:
 
 
 class ConversationContext:
-    """Persistent bounded conversation context for continuity between requests."""
-
     def __init__(self, max_turns: int = 20):
         self.max_turns = max(2, int(max_turns))
 
@@ -124,8 +114,6 @@ class ConversationContext:
 
 
 class ReminderStore:
-    """Persistent reminder records with due-reminder lookup for the agent runtime."""
-
     def _load(self) -> List[Dict[str, Any]]:
         value = _read_json(_reminder_path(), [])
         return value if isinstance(value, list) else []
@@ -134,14 +122,10 @@ class ReminderStore:
         text = (text or "").strip()
         if not text:
             return {"status": "error", "message": "Reminder text cannot be empty."}
+        now = utc_now()
         item = {
-            "id": str(uuid.uuid4()),
-            "text": text,
-            "due_at": due_at,
-            "repeat": repeat,
-            "completed": False,
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
+            "id": str(uuid.uuid4()), "text": text, "due_at": due_at,
+            "repeat": repeat, "completed": False, "created_at": now, "updated_at": now,
         }
         with _LOCK:
             reminders = self._load()
@@ -151,12 +135,9 @@ class ReminderStore:
 
     def list(self, include_completed: bool = False) -> List[Dict[str, Any]]:
         reminders = self._load()
-        if include_completed:
-            return reminders
-        return [r for r in reminders if not r.get("completed")]
+        return reminders if include_completed else [r for r in reminders if not r.get("completed")]
 
     def due(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        """Return incomplete reminders whose ISO due_at has arrived."""
         current = now or datetime.now(timezone.utc)
         result: List[Dict[str, Any]] = []
         for reminder in self.list():
@@ -195,8 +176,6 @@ class ReminderStore:
 
 
 class Phase1Runtime:
-    """Unified Phase 1 state facade used by the agent runtime."""
-
     def __init__(self, max_turns: int = 20):
         self.conversation = ConversationContext(max_turns=max_turns)
         self.reminders = ReminderStore()
@@ -221,14 +200,18 @@ class Phase1Runtime:
         lines = []
         for item in active[-12:]:
             marker = "DUE" if any(d.get("id") == item.get("id") for d in due) else "ACTIVE"
-            due_at = item.get("due_at") or "no scheduled time"
-            lines.append(f"[{marker}] {item.get('text', '')} (due: {due_at})")
+            lines.append(f"[{marker}] {item.get('text', '')} (due: {item.get('due_at') or 'no scheduled time'})")
         return "\n".join(lines)
 
     def finish_task(self, task: str, result: Dict[str, Any]) -> None:
+        if isinstance(result, dict) and result.get("phase1_reset"):
+            return
         status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
         summary = result.get("speak", "") if isinstance(result, dict) else ""
-        self.conversation.add("assistant", summary or f"Task finished with status: {status}", {"task": task, "status": status})
+        self.conversation.add(
+            "assistant", summary or f"Task finished with status: {status}",
+            {"task": task, "status": status},
+        )
 
     def context_for(self, task: str) -> Dict[str, str]:
         return {
@@ -238,7 +221,6 @@ class Phase1Runtime:
         }
 
     def model_context(self, task: str) -> str:
-        """Build a bounded context block suitable for an LLM planner."""
         context = self.context_for(task)
         return (
             "JARVIS PERSISTENT CONTEXT\n"
@@ -254,7 +236,6 @@ runtime = Phase1Runtime()
 
 
 def install_planner_context_bridge() -> None:
-    """Inject Phase 1 context into existing planner LLM calls without rewriting planner logic."""
     global _PLANNER_BRIDGE_INSTALLED
     if _PLANNER_BRIDGE_INSTALLED:
         return
@@ -268,9 +249,7 @@ def install_planner_context_bridge() -> None:
         def contextual_call(task: str, api_key: str, system_prompt: str):
             context = runtime.model_context(task)
             enriched_task = (
-                f"{task}\n\n"
-                "IMPORTANT JARVIS CONTEXT:\n"
-                f"{context}\n\n"
+                f"{task}\n\nIMPORTANT JARVIS CONTEXT:\n{context}\n\n"
                 "Use the context only when relevant to the user's request. "
                 "Do not expose internal context unless the user asks for it."
             )
@@ -283,13 +262,15 @@ def install_planner_context_bridge() -> None:
         return
 
 
-def install_command_context_bridge() -> None:
-    """Patch the already-registered FastAPI command endpoint with Phase 1 lifecycle context.
+def _reset_command(task: str) -> Optional[str]:
+    """Return the canonical reset command even when an internal context block was appended."""
+    first_line = (task or "").strip().splitlines()[0].strip().casefold() if (task or "").strip() else ""
+    if first_line in {"clear chat", "reset history", "forget everything", "clear memory", "reset"}:
+        return first_line
+    return None
 
-    This is intentionally isolated from the command implementation so the existing
-    action dispatcher remains unchanged. The bridge waits until main.py has finished
-    registering its routes, then wraps /api/command exactly once.
-    """
+
+def install_command_context_bridge() -> None:
     global _COMMAND_BRIDGE_STARTED
     if _COMMAND_BRIDGE_STARTED:
         return
@@ -306,39 +287,52 @@ def install_command_context_bridge() -> None:
                     time.sleep(0.05)
                     continue
                 for route in getattr(app, "routes", []):
-                    if getattr(route, "path", None) == "/api/command" and getattr(route, "endpoint", None):
-                        endpoint = route.endpoint
-                        if getattr(endpoint, "_phase1_context_bridge", False):
-                            _COMMAND_BRIDGE_INSTALLED = True
-                            return
-
-                        async def contextual_command(req, _endpoint=endpoint):
-                            task = (getattr(req, "prompt", "") or "").strip()
-                            if task:
-                                context = runtime.begin_task(task)
-                                # Preserve the existing command API while making
-                                # persistent context available to the action model.
-                                setattr(
-                                    req,
-                                    "prompt",
-                                    task
-                                    + "\n\nJARVIS PERSISTENT CONTEXT:\n"
-                                    + runtime.model_context(task)
-                                    + "\n\nUse this only as context; do not expose internal context unless asked.",
-                                )
-                                try:
-                                    result = await _endpoint(req)
-                                except Exception as exc:
-                                    runtime.finish_task(task, {"status": "error", "speak": str(exc)})
-                                    raise
-                                runtime.finish_task(task, result if isinstance(result, dict) else {})
-                                return result
-                            return await _endpoint(req)
-
-                        contextual_command._phase1_context_bridge = True
-                        route.endpoint = contextual_command
+                    if getattr(route, "path", None) != "/api/command" or not getattr(route, "endpoint", None):
+                        continue
+                    endpoint = route.endpoint
+                    if getattr(endpoint, "_phase1_context_bridge", False):
                         _COMMAND_BRIDGE_INSTALLED = True
                         return
+
+                    async def contextual_command(req, _endpoint=endpoint):
+                        task = (getattr(req, "prompt", "") or "").strip()
+                        reset = _reset_command(task)
+                        if reset:
+                            # Never inject context into reset commands. This preserves the
+                            # original API's exact reset semantics and prevents stale context.
+                            if reset in {"clear memory", "forget everything", "reset"}:
+                                phase1_memory.clear()
+                            runtime.conversation.clear()
+                            result = await _endpoint(req)
+                            if isinstance(result, dict):
+                                result = dict(result)
+                                result["phase1_reset"] = True
+                            return result
+
+                        if not task:
+                            return await _endpoint(req)
+
+                        context = runtime.begin_task(task)
+                        setattr(
+                            req,
+                            "prompt",
+                            task
+                            + "\n\nJARVIS PERSISTENT CONTEXT:\n"
+                            + runtime.model_context(task)
+                            + "\n\nUse this only as context; do not expose internal context unless asked.",
+                        )
+                        try:
+                            result = await _endpoint(req)
+                        except Exception as exc:
+                            runtime.finish_task(task, {"status": "error", "speak": str(exc)})
+                            raise
+                        runtime.finish_task(task, result if isinstance(result, dict) else {})
+                        return result
+
+                    contextual_command._phase1_context_bridge = True
+                    route.endpoint = contextual_command
+                    _COMMAND_BRIDGE_INSTALLED = True
+                    return
             except Exception:
                 pass
             time.sleep(0.05)
