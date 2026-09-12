@@ -410,6 +410,29 @@ def _parse_new_commands(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"I need the exact Android package name to launch {app_hint}, sir (e.g. com.whatsapp). Please provide it or use a Gemini-connected session."})
         return actions
 
+    # --- Code Core & Developer Mode Natural Language Patterns ---
+    if any(x in prompt_clean for x in ['audit your own code', 'find errors in yourself', 'show me what is wrong', 'audit code', 'check code', 'scan codebase', 'check for bugs']):
+        actions.append({"type": "code_audit"})
+        actions.append({"type": "speak", "text": "Running a complete read-only codebase self-audit now, sir."})
+        return actions
+
+    if any(x in prompt_clean for x in ['fix those errors', 'fix errors', 'repair code', 'fix all errors', 'fix the bugs']):
+        actions.append({"type": "code_fix", "target": "all"})
+        actions.append({"type": "speak", "text": "Beginning autonomous self-repair with rollback safety enabled, sir."})
+        return actions
+
+    fix_file_match = re.search(r'fix\s+(?:file\s+)?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)', prompt_clean)
+    if fix_file_match:
+        target_file = fix_file_match.group(1).strip()
+        actions.append({"type": "code_fix", "target": target_file})
+        actions.append({"type": "speak", "text": f"Inspecting and repairing {target_file}, sir."})
+        return actions
+
+    if any(x in prompt_clean for x in ['test yourself after the fix', 'test yourself', 'validate code', 'run validation']):
+        actions.append({"type": "code_test"})
+        actions.append({"type": "speak", "text": "Executing self-validation diagnostics, sir."})
+        return actions
+
     return []
 
 
@@ -766,6 +789,11 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       // Add multiple speak actions to give live status during long-running tasks.
       // First speak = what you're about to do. Subsequent speaks = progress updates.
 
+      // --- Code Core & Developer Engine ---
+      {"type": "code_audit"},
+      {"type": "code_fix", "target": "all or specific filepath"},
+      {"type": "code_test"},
+
       // --- Memory ---
       {"type": "clear_history"}
     ]
@@ -810,6 +838,11 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     19. LIVE NARRATION — For multi-step tasks (WhatsApp, file operations, etc.), include MULTIPLE speak actions to narrate each step:
        - WhatsApp example: first speak="Right away, sir. Opening WhatsApp and searching for [contact].", then the send action, the backend will add further narration.
        - Keep each narration speak SHORT (1 sentence). The goal is the user hears progress, not silence.
+    20. CODE CORE & SELF-DEVELOPER MODE:
+       - If user asks to audit codebase, check own code, or find bugs ("audit your own code", "find errors in yourself", "show me what is wrong") -> use code_audit.
+       - If user explicitly tells you to fix errors ("fix those errors", "fix all errors", "fix the bugs") -> use code_fix with target="all".
+       - If user asks to fix a specific file ("fix agent.py", "fix main.py") -> use code_fix with target=the filename.
+       - If user asks to test or validate itself ("test yourself after the fix", "run validation") -> use code_test. The goal is the user hears progress, not silence.
     
     CRITICAL — DATA ACTIONS SPEAK TEXT RULE:
     For actions that fetch live data (weather, datetime_info, battery, network_info, clipboard_read), the backend

@@ -51,6 +51,7 @@ import document_intel
 import google_oauth
 import phone_control
 import whatsapp_ops
+import code_core
 import json
 import asyncio
 
@@ -168,6 +169,22 @@ class ConfigModel(BaseModel):
     huggingface_api_key: str
     gemini_project_id: Optional[str] = ""
     groq_api_key: str = ""
+    nvidia_api_key: Optional[str] = ""
+    nvidia_model: Optional[str] = "meta/llama-3.3-70b-instruct"
+
+# ── Code Core request models ────────────────────────────────────────────────
+class CodePreviewFixRequest(BaseModel):
+    file: str
+    issue: Optional[str] = ""
+
+class CodeApplyFixRequest(BaseModel):
+    file: str
+    proposed_content: str
+
+class CodeProcessFileRequest(BaseModel):
+    filename: str
+    content: str
+    instructions: Optional[str] = ""
 
 # ── Phone control request models ────────────────────────────────────────────
 class PhoneTapRequest(BaseModel):
@@ -206,9 +223,37 @@ def post_config(req: ConfigModel):
         "gemini_api_key": req.gemini_api_key,
         "huggingface_api_key": req.huggingface_api_key,
         "gemini_project_id": req.gemini_project_id or "",
-        "groq_api_key": req.groq_api_key or ""
+        "groq_api_key": req.groq_api_key or "",
+        "nvidia_api_key": req.nvidia_api_key or "",
+        "nvidia_model": req.nvidia_model or "meta/llama-3.3-70b-instruct"
     })
     return {"status": "success", "message": "Configuration saved."}
+
+
+# ── Code Core Endpoints ─────────────────────────────────────────────────────
+
+@app.post("/api/code/audit")
+def code_audit():
+    return code_core.audit_codebase()
+
+@app.post("/api/code/preview-fix")
+def code_preview_fix(req: CodePreviewFixRequest):
+    return code_core.preview_file_fix(req.file, req.issue)
+
+@app.post("/api/code/apply-fix")
+def code_apply_fix(req: CodeApplyFixRequest):
+    return code_core.apply_file_fix(req.file, req.proposed_content)
+
+@app.post("/api/code/process-file")
+def code_process_file(req: CodeProcessFileRequest):
+    return code_core.process_uploaded_code_file(req.filename, req.content, req.instructions)
+
+@app.get("/api/code/download/{filename}")
+def code_download(filename: str):
+    file_path = os.path.join(code_core.DOWNLOADS_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, filename=filename)
 
 
 # ===== Google OAuth (alternative to the raw Gemini API key) =====
@@ -1029,6 +1074,52 @@ async def process_command(req: CommandRequest):
                 speak_text = f"Done, sir. Message sent to {contact} from your phone."
             else:
                 speak_text = res["message"]
+
+        elif act_type == "code_audit":
+            execution_logs.append("ACTION: Running complete read-only codebase self-audit")
+            audit_res = code_core.audit_codebase()
+            execution_logs.append(f"RESULT: Codebase audit finished. Health score: {audit_res['health_score']}% ({audit_res['issues_count']} issues found).")
+            if audit_res["issues_count"] == 0:
+                speak_text = f"Codebase audit complete, sir. All {audit_res['total_files_checked']} source files are completely healthy with zero syntax errors."
+            else:
+                speak_text = f"Audit complete, sir. I detected {audit_res['issues_count']} potential issues. I have not applied any modifications. You can review and approve fixes in the Code Core tab."
+
+        elif act_type == "code_fix":
+            target = action.get("target", "all")
+            execution_logs.append(f"ACTION: Applying safe patch and validation to: {target}")
+            if target in ["all", "errors", "issues"]:
+                audit_res = code_core.audit_codebase()
+                fixed_count = 0
+                for issue in audit_res.get("issues", []):
+                    fpath = issue["file"]
+                    preview = code_core.preview_file_fix(fpath, issue.get("message", ""))
+                    if preview.get("status") == "success":
+                        app_res = code_core.apply_file_fix(fpath, preview["proposed_content"])
+                        if app_res.get("status") == "success":
+                            fixed_count += 1
+                            execution_logs.append(f"RESULT: Repaired {fpath} with validation verified.")
+                speak_text = f"Self-repair complete, sir. Successfully fixed and validated {fixed_count} files with automatic rollback safety enabled."
+            else:
+                preview = code_core.preview_file_fix(target, action.get("issue", ""))
+                if preview.get("status") == "success":
+                    app_res = code_core.apply_file_fix(target, preview["proposed_content"])
+                    if app_res.get("status") == "success":
+                        speak_text = f"File {target} has been successfully repaired and validated, sir."
+                        execution_logs.append(f"RESULT: {app_res['message']}")
+                    else:
+                        speak_text = f"Could not safely apply fix to {target}. Automatic rollback was executed."
+                        execution_logs.append(f"RESULT: {app_res['message']}")
+                else:
+                    speak_text = f"Could not generate patch for {target}: {preview.get('message')}"
+
+        elif act_type == "code_test":
+            execution_logs.append("ACTION: Executing comprehensive self-validation suite")
+            audit_res = code_core.audit_codebase()
+            if audit_res["status"] == "healthy":
+                speak_text = "All system validation tests passed, sir. Python syntax, AST trees, and frontend builds are nominal."
+            else:
+                speak_text = f"Validation completed with warnings, sir. {audit_res['issues_count']} warnings detected."
+            execution_logs.append(f"RESULT: Self-validation finished. Health Score: {audit_res['health_score']}%.")
 
         else:
             execution_logs.append(f"ACTION: Unknown command type \"{act_type}\"")
