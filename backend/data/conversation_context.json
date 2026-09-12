@@ -7,5 +7,14 @@
       "intent": "conversation"
     },
     "timestamp": "2026-09-12T05:33:43.281317+00:00"
+  },
+  {
+    "id": "82d8622e-0a5e-4992-b755-739735e6d83b",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-12T06:40:25.806494+00:00"
   }
 ]

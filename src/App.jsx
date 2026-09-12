@@ -195,6 +195,7 @@ export default function App() {
   const [agentRunId, setAgentRunId] = useState('')
   const [agentWaitingForHuman, setAgentWaitingForHuman] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(true)
+  const [clarificationPending, setClarificationPending] = useState(null)
 
   useEffect(() => {
     const timer = setTimeout(() => setBooting(false), 4000)
@@ -484,6 +485,14 @@ export default function App() {
       setImageData(data.image_data || null)
       if (data.timer_data) setTimerData(data.timer_data)
       if (data.refresh_files) refreshFiles()
+      if (data.clarification_needed) {
+        setClarificationPending({
+          ...data.clarification_needed,
+          originalPrompt: text
+        })
+      } else {
+        setClarificationPending(null)
+      }
       const logLines = data.logs || []
 
     } catch {
@@ -755,9 +764,36 @@ export default function App() {
   function handleSend() {
     if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
     if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
+    if (clarificationPending) {
+      const option = prompt.trim()
+      const orig = clarificationPending.originalPrompt || ''
+      setClarificationPending(null)
+      const fullPrompt = orig ? `${orig} via ${option}` : option
+      if (agentMode) runAgentMode(fullPrompt)
+      else if (chatMode) runStreamingChat(fullPrompt)
+      else runCommand(fullPrompt)
+      return
+    }
     if (agentMode) { runAgentMode(prompt); return }
     if (chatMode) runStreamingChat(prompt)
     else runCommand(prompt)
+  }
+
+  function handleClarificationSelect(option) {
+    const orig = clarificationPending?.originalPrompt || ''
+    const ctx = clarificationPending?.context || ''
+    setClarificationPending(null)
+    let fullPrompt = option
+    if (orig) {
+      if (ctx === 'messaging_app') {
+        fullPrompt = `${orig} via ${option}`
+      } else {
+        fullPrompt = `${orig} (${option})`
+      }
+    }
+    if (agentMode) runAgentMode(fullPrompt)
+    else if (chatMode) runStreamingChat(fullPrompt)
+    else runCommand(fullPrompt)
   }
 
   async function saveKeys() {
@@ -944,8 +980,35 @@ export default function App() {
             )}
             {extracting && <div className="listening-hint">Extracting documentΓÇª</div>}
 
+            {/* Clarification prompt panel */}
+            {clarificationPending && (
+              <div className="clarification-panel">
+                <div className="clarification-hint">
+                  <Brain className="clarification-icon" size={13} />
+                  <span>CLARIFICATION REQUIRED</span>
+                </div>
+                <div style={{ color: 'var(--text)', fontSize: '12px', marginBottom: '8px', fontWeight: 500 }}>
+                  {clarificationPending.question}
+                </div>
+                {clarificationPending.options && clarificationPending.options.length > 0 && (
+                  <div className="clarification-options">
+                    {clarificationPending.options.map((opt, idx) => (
+                      <button
+                        key={idx}
+                        className="quick-reply-btn"
+                        onClick={() => handleClarificationSelect(opt)}
+                        disabled={busy}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Input row */}
-            <div className="input-row">
+            <div className={`input-row ${clarificationPending ? 'awaiting-clarification' : ''}`}>
               <input
                 type="file"
                 ref={fileInputRef}
@@ -968,10 +1031,10 @@ export default function App() {
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-                placeholder={chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
+                placeholder={clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
                 disabled={busy}
               />
-              <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument)}>
+              <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument && !clarificationPending)}>
                 {busy ? '…' : 'SEND'}
               </button>
             </div>

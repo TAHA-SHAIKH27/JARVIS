@@ -658,6 +658,8 @@ async def process_command(req: CommandRequest):
     file_data = None
     refresh_files = False
     image_data = None  # For generated images
+    clarification_needed = None  # Populated when JARVIS needs to ask a follow-up
+    narration_steps = []  # Sequential spoken updates for multi-step tasks
     
     execution_logs.append(f"INPUT RECEIVED: \"{req.prompt}\"")
     
@@ -988,22 +990,44 @@ async def process_command(req: CommandRequest):
             if not speak_text:
                 speak_text = res["message"]
 
+        elif act_type == "ask_clarification":
+            question = action.get("question", "What would you like me to do, sir?")
+            context = action.get("context", "general")
+            options = action.get("options", [])
+            execution_logs.append(f"ACTION: Asking for clarification — {question}")
+            # Store clarification data to return to frontend
+            clarification_needed = {
+                "question": question,
+                "context": context,
+                "options": options,
+            }
+            speak_text = question  # Jarvis speaks the question too
+
         elif act_type == "send_whatsapp":
             contact = action.get("contact", "")
             message = action.get("message", "")
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (desktop)")
+            # Add progressive narration steps
+            narration_steps.append(f"Right away, sir. Opening WhatsApp and searching for {contact}.")
             res = whatsapp_ops.send_whatsapp_message(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if res.get("status") != "success" or not speak_text:
+            if res.get("status") == "success":
+                narration_steps.append(f"Message sent to {contact} on WhatsApp, sir. Done.")
+                speak_text = f"Done, sir. Message delivered to {contact} on WhatsApp."
+            else:
                 speak_text = res["message"]
 
         elif act_type == "send_whatsapp_phone":
             contact = action.get("contact", "")
             message = action.get("message", "")
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (phone)")
+            narration_steps.append(f"On it, sir. Sending via your phone to {contact}.")
             res = whatsapp_ops.send_whatsapp_message_via_phone(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if res.get("status") != "success" or not speak_text:
+            if res.get("status") == "success":
+                narration_steps.append(f"Message sent to {contact} via your phone, sir.")
+                speak_text = f"Done, sir. Message sent to {contact} from your phone."
+            else:
                 speak_text = res["message"]
 
         else:
@@ -1033,6 +1057,8 @@ async def process_command(req: CommandRequest):
         "refresh_files": refresh_files,
         "image_data": image_data,
         "timer_data": timer_data,
+        "clarification_needed": clarification_needed,
+        "narration_steps": narration_steps,
     }
 
 

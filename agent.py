@@ -756,6 +756,16 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "send_whatsapp", "contact": "contact name or phone number with country code", "message": "message text to send"},
       {"type": "send_whatsapp_phone", "contact": "contact name or phone number with country code", "message": "message text to send"},
 
+      // --- Clarification (ask user for missing info before proceeding) ---
+      // Use this when a required detail is missing and cannot be safely assumed.
+      // 'options' is an optional list of quick-reply choices shown as buttons.
+      // 'context' is a short tag so the frontend knows what kind of clarification this is.
+      {"type": "ask_clarification", "question": "Which app should I send through, sir?", "context": "messaging_app", "options": ["WhatsApp", "Telegram", "Gmail", "Outlook", "Skype"]},
+
+      // --- Step narration (speak mid-task updates to user) ---
+      // Add multiple speak actions to give live status during long-running tasks.
+      // First speak = what you're about to do. Subsequent speaks = progress updates.
+
       // --- Memory ---
       {"type": "clear_history"}
     ]
@@ -789,8 +799,17 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     14. For phone control: "mirror my phone" / "show my phone screen" -> phone_mirror (opens a live scrcpy window). "screenshot my phone" -> phone_screenshot. Touch input -> phone_tap/phone_swipe with pixel coordinates the user gives you. "type X on my phone" -> phone_text. "press back/home/enter on my phone" -> phone_key. "open <app> on my phone" -> phone_launch_app with the Android package name if you know it (e.g. com.whatsapp, com.spotify.music, com.google.android.youtube, com.instagram.android); if unsure, ask for the package name via speak instead of guessing wrong. "is my phone connected" -> phone_devices.
     15. For "unlock my phone" / "unlock phone": use phone_unlock. If the user includes a PIN in the same sentence (e.g. "unlock my phone with pin 1234" or "unlock my phone, pin is 8842"), extract just the digits into the "pin" field. If no PIN is mentioned, omit the "pin" field entirely — the backend will fall back to a saved default PIN (if configured) or a plain swipe-unlock.
     16. For "test tap X on phone" / "test tap X on the pin pad" (calibration only, X being a single digit 0-9): use phone_test_pin_tap with that digit — this just taps where that digit should be, without swiping or submitting a full PIN.
-    17. For "send message to X saying/as Y" / "whatsapp X saying Y" / "text X on whatsapp: Y": use send_whatsapp with contact=X (name or phone number) and message=Y. If the user explicitly says "on my phone" / "from my phone" (e.g. "message X on my phone saying Y", "whatsapp X on my phone: Y"), use send_whatsapp_phone instead — same fields, but sent via the connected Android device over ADB rather than WhatsApp Desktop. Do NOT invent any other action type for WhatsApp.
+    17. MESSAGING — CRITICAL RULE (READ CAREFULLY):
+       - If user says "send message" or "message X" or "text X" WITHOUT specifying an app → use ask_clarification with question="Which app should I send it through, sir?" and options=["WhatsApp", "Telegram", "Gmail", "Outlook", "Skype"] and context="messaging_app". Also include a speak action like "I can send that message, sir — which platform should I use?"
+       - If user says "whatsapp X" / "send whatsapp to X" / "send a whatsapp message to X" / "via whatsapp" → proceed directly with send_whatsapp, no clarification needed.
+       - If user says "telegram X" / "send telegram to X" → use launch_app with app_name="Telegram" then speak explaining to continue manually (we don't yet have telegram automation).
+       - If user says "email X" / "send email to X" / "gmail" / "outlook" → use launch_app with the email client.
+       - If user says "on my phone" / "from my phone" → use send_whatsapp_phone (ADB route).
+       - NEVER guess the app — always ask if it's not specified.
     18. For "save/add/remember X's number as +91..." / "remember X is +91...": use add_whatsapp_contact with name=X and phone=the full number including country code. This saves the contact permanently so future send_whatsapp/send_whatsapp_phone calls can resolve X by name alone.
+    19. LIVE NARRATION — For multi-step tasks (WhatsApp, file operations, etc.), include MULTIPLE speak actions to narrate each step:
+       - WhatsApp example: first speak="Right away, sir. Opening WhatsApp and searching for [contact].", then the send action, the backend will add further narration.
+       - Keep each narration speak SHORT (1 sentence). The goal is the user hears progress, not silence.
     
     CRITICAL — DATA ACTIONS SPEAK TEXT RULE:
     For actions that fetch live data (weather, datetime_info, battery, network_info, clipboard_read), the backend

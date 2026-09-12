@@ -161,6 +161,27 @@ def _find_message_composer(whatsapp_ctrl=None):
     return None
 
 
+def _click_whatsapp_search_button() -> bool:
+    """Try to click the New Chat or Search button in WhatsApp via UI Automation."""
+    try:
+        import uiautomation as auto
+        ctrl = _find_whatsapp_control()
+        if not ctrl:
+            return False
+        # Walk all buttons looking for search / new-chat / pencil icon
+        search_keywords = ("search", "new chat", "compose", "new conversation", "pencil")
+        for btn in ctrl.WalkChildren():
+            ctype = (btn.ControlTypeName or "").lower()
+            label = (btn.Name or "").lower()
+            if ctype in ("buttoncontrol", "button") and any(k in label for k in search_keywords):
+                btn.Click()
+                time.sleep(0.6)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _search_whatsapp_contact(contact: str) -> Dict[str, Any]:
     """Open WhatsApp, search for the contact, select the chat, and verify."""
     name = (contact or "").strip()
@@ -170,24 +191,29 @@ def _search_whatsapp_contact(contact: str) -> Dict[str, Any]:
     if not _ensure_whatsapp_open():
         return {"status": "error", "message": "I could not launch or find WhatsApp on your desktop, sir."}
 
-    time.sleep(1.5)
+    # Give WhatsApp more time to fully render before sending keystrokes
+    time.sleep(2.5)
     _bring_whatsapp_to_foreground()
+    time.sleep(0.5)
 
     try:
-        # Trigger New Chat / Search in WhatsApp Desktop
-        pyautogui.hotkey("ctrl", "alt", "n")
-        time.sleep(0.6)
+        # Open the search bar in WhatsApp Desktop (Ctrl+F confirmed working)
+        pyautogui.hotkey("ctrl", "f")
+        time.sleep(1.0)
 
-        # Paste contact name to avoid typing delays or character dropping
+        # Paste the contact name into the search box
         pyperclip.copy(name)
+        time.sleep(0.2)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(CONTACT_SEARCH_DELAY_SECONDS)
+        time.sleep(CONTACT_SEARCH_DELAY_SECONDS + 0.5)  # wait for results to load
 
-        # Select the matching contact
+        # Move to first result and open it
+        pyautogui.press("down")
+        time.sleep(0.3)
         pyautogui.press("enter")
-        time.sleep(1.2)
+        time.sleep(1.5)
 
-        # Verify chat window is active
+        # Bring back to foreground after chat opens
         _bring_whatsapp_to_foreground()
         return {"status": "success", "display_name": name}
     except Exception as e:
