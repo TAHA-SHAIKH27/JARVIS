@@ -23,7 +23,15 @@ def _data_dir() -> str:
 
 
 def _conversation_path() -> str:
-    return os.path.join(_data_dir(), "conversation_context.json")
+    path = os.path.join(_data_dir(), "current_session_memory.json")
+    legacy = os.path.join(_data_dir(), "conversation_context.json")
+    if not os.path.exists(path) and os.path.exists(legacy):
+        return legacy
+    return path
+
+
+def _conversation_save_path() -> str:
+    return os.path.join(_data_dir(), "current_session_memory.json")
 
 
 def _reminder_path() -> str:
@@ -99,7 +107,7 @@ def _extract_memory_text(task: str) -> str:
     for prefix in prefixes:
         if lower.startswith(prefix):
             return text[len(prefix):].strip().rstrip(".")
-    return ""
+    return text
 
 
 def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
@@ -118,7 +126,7 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
             "image_data": None,
         }
 
-    result = phase1_memory.remember(memory_text, category="general", source="jarvis-ui")
+    result = phase1_memory.remember(memory_text, category="general", source="jarvis-ui", source_text=task)
     if result.get("status") != "success":
         return {
             "speak": result.get("message", "I could not save that memory, sir."),
@@ -128,14 +136,16 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
             "image_data": None,
         }
 
+    memory_item = result.get("memory") or {}
+    logged_text = memory_item.get("text", memory_text)
     return {
         "speak": f"Understood, sir. I will remember that: {memory_text}",
-        "logs": [f"MEMORY SAVED: {memory_text}"],
+        "logs": [f"MEMORY SAVED: {logged_text}"],
         "file_data": None,
         "refresh_files": False,
         "image_data": None,
         "memory_saved": True,
-        "memory": result.get("memory"),
+        "memory": memory_item,
     }
 
 

@@ -38,7 +38,7 @@ def test_reminder_store_round_trip(tmp_path, monkeypatch):
 
 
 def test_memory_store_remains_available(tmp_path, monkeypatch):
-    path = tmp_path / "memory.json"
+    path = tmp_path / "persistent_memory.json"
     monkeypatch.setattr(phase1_memory, "_memory_path", lambda: str(path))
     saved = phase1_memory.remember("JARVIS Phase 1 test memory", category="test")
     assert saved["status"] == "success"

@@ -623,6 +623,13 @@ async def process_command(req: CommandRequest):
     if prompt_lower in ["clear chat", "reset history", "forget everything", "clear memory", "reset"]:
         import agent
         agent.conversation_history.clear()
+        try:
+            from backend.agent import phase1_memory, phase1_runtime
+            if prompt_lower in ["clear memory", "forget everything", "reset"]:
+                phase1_memory.clear()
+            phase1_runtime.runtime.conversation.clear()
+        except Exception:
+            pass
         return {
             "speak": "Memory banks cleared, sir. Starting fresh.",
             "logs": ["ACTION: Cleared conversation history"],

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "ca03c28c-09c0-4346-b59a-0113c5a88e56",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-12T05:33:43.281317+00:00"
+  }
+]

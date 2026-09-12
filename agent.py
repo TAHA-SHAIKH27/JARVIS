@@ -172,7 +172,28 @@ def parse_local_command(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"Launching {app_name} for you, sir."})
         return actions
 
-    # 10. Basic conversations matching
+    # 10. Check persistent memory for personal facts/questions (offline fallback)
+    try:
+        from backend.agent import phase1_memory
+        recalled = phase1_memory.recall(prompt, limit=1)
+        memories = recalled.get("memories", [])
+        if memories:
+            top_mem = memories[0]
+            key = top_mem.get("key", "").strip()
+            val = top_mem.get("value", "").strip()
+            text = top_mem.get("text", "").strip()
+            prompt_tokens = phase1_memory._tokens(prompt)
+            key_tokens = phase1_memory._tokens(key)
+            if key and (key in prompt_clean or (key_tokens and key_tokens.issubset(prompt_tokens))):
+                actions.append({"type": "speak", "text": f"Your {key} is {val}, sir."})
+                return actions
+            elif prompt_tokens and any(token in phase1_memory._tokens(text) for token in prompt_tokens):
+                actions.append({"type": "speak", "text": f"According to my memory banks, sir: {text}."})
+                return actions
+    except Exception:
+        pass
+
+    # 11. Basic conversations matching
     for key, response in OFFLINE_RESPONSES.items():
         if key in prompt_clean:
             actions.append({"type": "speak", "text": response})
@@ -641,6 +662,13 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     # Build conversation history context
     history_text = get_history_text()
     
+    # Retrieve persistent memory context for prompt
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
     # Build prompt instructions with available system operations
     system_instruction = """
     You are J.A.R.V.I.S., a witty, respectful, and advanced AI assistant like the one from Iron Man.
@@ -648,7 +676,8 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     You MUST output a valid JSON array of actions and NOTHING else. No markdown block wrapper, no explanations.
     
     CRITICAL RULES FOR SPEED AND CONTEXT:
-    - You have CONVERSATION HISTORY below. Use it to understand follow-up commands!
+    - You have CONVERSATION HISTORY and USER PERSISTENT MEMORY below. Use them to understand context and answer personal questions!
+    - If the user asks about personal facts (e.g. favorite color, name, preferences, location), ALWAYS check the USER PERSISTENT MEMORY first and answer with accurate facts!
     - If the user says something related to a previous command, use context to figure out what they mean.
     - Keep responses SHORT and snappy. Don't ask for clarification if context makes it obvious.
     - Be decisive. If you can reasonably infer what the user wants, DO IT.
@@ -776,6 +805,9 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     
     CONVERSATION HISTORY (most recent messages):
     """ + history_text + """
+    
+    USER PERSISTENT MEMORY:
+    """ + memory_ctx + """
     
     Current workspace files context:
     """ + json.dumps(context or {})
@@ -914,7 +946,13 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
             return
 
     history_text = get_history_text()
-    full_prompt = f"{CHAT_SYSTEM_INSTRUCTION}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser: {prompt}"
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
+    full_prompt = f"{CHAT_SYSTEM_INSTRUCTION}\n\nUSER PERSISTENT MEMORY:\n{memory_ctx}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser: {prompt}"
 
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
@@ -1074,7 +1112,13 @@ def stream_gemini_actions(prompt: str, api_key: str, project_id: str = ""):
             return
 
     history_text = get_history_text()
-    full_prompt = f"{COMMAND_STREAM_SYSTEM_INSTRUCTION}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser request: {prompt}"
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
+    full_prompt = f"{COMMAND_STREAM_SYSTEM_INSTRUCTION}\n\nUSER PERSISTENT MEMORY:\n{memory_ctx}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser request: {prompt}"
 
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
