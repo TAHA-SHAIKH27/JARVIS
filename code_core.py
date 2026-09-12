@@ -82,14 +82,14 @@ def call_nvidia_nim(prompt: str, system_prompt: str = "", model: str = None) -> 
         "messages": messages,
         "temperature": 0.1,
         "top_p": 0.7,
-        "max_tokens": 4096
+        "max_tokens": 8192
     }
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req, timeout=50) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             resp_body = resp.read().decode("utf-8")
             res_json = json.loads(resp_body)
             return res_json["choices"][0]["message"]["content"]
@@ -111,12 +111,12 @@ def call_gemini_fallback(prompt: str, system_prompt: str = "") -> str:
     combined = (f"System: {system_prompt}\n\n" if system_prompt else "") + prompt
     payload = {
         "contents": [{"parts": [{"text": combined}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096}
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with urllib.request.urlopen(req, timeout=90) as resp:
         resp_body = resp.read().decode("utf-8")
         res_json = json.loads(resp_body)
         candidates = res_json.get("candidates", [])
@@ -440,16 +440,17 @@ def process_uploaded_code_file(filename: str, file_content: str, user_instructio
         "You are an expert code refactoring and bug fixing engine for J.A.R.V.I.S.\n"
         "Your task: Inspect the uploaded user code file, identify bugs, syntax errors, and edge cases, "
         "and refactor it according to user instructions.\n"
-        "Provide:\n"
-        "1. A summary of errors found and fixes applied.\n"
-        "2. The COMPLETE corrected code inside a ```...``` block."
+        "OUTPUT FORMAT REQUIREMENTS:\n"
+        "1. First provide ONLY a concise bulleted summary of errors found and fixes applied.\n"
+        "2. Do NOT say 'followed by the complete corrected code' or paste raw source code in the textual explanation.\n"
+        "3. Provide the entire corrected file content ONLY inside a single ```...``` block at the very end. The system will save it directly as a downloadable file for the user."
     )
 
     prompt = (
         f"FILENAME: {filename}\n"
         f"USER INSTRUCTIONS: {user_instructions or 'Find and fix all errors, syntax bugs, and improvements.'}\n\n"
         f"FILE CONTENT:\n```\n{file_content}\n```\n\n"
-        f"Please provide the summary of fixes and the complete corrected code inside ```...```."
+        f"Please provide your concise bulleted summary of fixes, followed by the complete corrected code inside a single ```...``` block."
     )
 
     llm_response = call_nvidia_nim(prompt, system_prompt)
@@ -469,15 +470,21 @@ def process_uploaded_code_file(filename: str, file_content: str, user_instructio
 
     diff = generate_unified_diff(file_content, fixed_code, filename=filename)
 
-    # Extract explanation text (text before the code block)
-    summary = re.split(r"```", llm_response)[0].strip() or "Code analyzed and refactored."
+    # Extract clean explanation text (text before the code block)
+    summary_raw = re.split(r"```", llm_response)[0].strip() or "Code analyzed and refactored."
+    # Strip any trailing boilerplate phrases pointing to the code block or diff headers
+    cleaned_summary = re.sub(
+        r"(?i)(###\s*(?:Corrected|Updated|Fixed)\s*Code.*|Here(?:'s| is) the (?:complete )?(?:corrected|fixed) code.*|---\s*a/.*|followed by the complete corrected code.*)",
+        "",
+        summary_raw
+    ).strip()
 
     return {
         "status": "success",
         "original_filename": filename,
         "download_filename": out_filename,
         "download_url": f"/api/code/download/{out_filename}",
-        "summary": summary,
+        "summary": cleaned_summary or "Code analyzed and refactored successfully.",
         "diff": diff,
         "fixed_code": fixed_code
     }

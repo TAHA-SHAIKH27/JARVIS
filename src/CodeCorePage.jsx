@@ -22,6 +22,7 @@ export default function CodeCorePage({ setActiveView }) {
   const [uploadInstructions, setUploadInstructions] = useState('');
   const [processingUpload, setProcessingUpload] = useState(false);
   const [uploadResult, setUploadResult] = useState(null);
+  const [showUploadDiff, setShowUploadDiff] = useState(false);
 
   useEffect(() => {
     runAudit();
@@ -142,7 +143,7 @@ export default function CodeCorePage({ setActiveView }) {
         alert(data.message || 'File processing failed.');
       }
     } catch (err) {
-      alert('Error during uploaded file refactoring.');
+      alert(`Error during uploaded file refactoring: ${err.message || 'Check if backend server is running.'}`);
     } finally {
       setProcessingUpload(false);
     }
@@ -362,17 +363,32 @@ export default function CodeCorePage({ setActiveView }) {
 
                 <div className="result-summary">{uploadResult.summary}</div>
 
-                <div className="diff-viewer mini">
-                  <pre className="diff-content">
-                    {uploadResult.diff.split('\n').map((line, i) => {
-                      let cl = 'diff-line';
-                      if (line.startsWith('+') && !line.startsWith('+++')) cl += ' diff-add';
-                      else if (line.startsWith('-') && !line.startsWith('---')) cl += ' diff-del';
-                      else if (line.startsWith('@@')) cl += ' diff-hdr';
-                      return <div key={i} className={cl}>{line}</div>;
-                    })}
-                  </pre>
+                <div style={{ marginTop: '12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', letterSpacing: '0.5px' }}>
+                    Fixed file saved to downloads. Ready for instant download.
+                  </span>
+                  <button
+                    className="codecore-btn secondary"
+                    style={{ fontSize: '11px', padding: '4px 10px' }}
+                    onClick={() => setShowUploadDiff(!showUploadDiff)}
+                  >
+                    <Eye size={12} /> {showUploadDiff ? 'HIDE DIFF' : 'VIEW DIFF'}
+                  </button>
                 </div>
+
+                {showUploadDiff && (
+                  <div className="diff-viewer mini" style={{ marginTop: '10px' }}>
+                    <pre className="diff-content">
+                      {uploadResult.diff.split('\n').map((line, i) => {
+                        let cl = 'diff-line';
+                        if (line.startsWith('+') && !line.startsWith('+++')) cl += ' diff-add';
+                        else if (line.startsWith('-') && !line.startsWith('---')) cl += ' diff-del';
+                        else if (line.startsWith('@@')) cl += ' diff-hdr';
+                        return <div key={i} className={cl}>{line}</div>;
+                      })}
+                    </pre>
+                  </div>
+                )}
               </div>
             )}
           </div>
