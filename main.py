@@ -994,7 +994,7 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (desktop)")
             res = whatsapp_ops.send_whatsapp_message(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if not speak_text:
+            if res.get("status") != "success" or not speak_text:
                 speak_text = res["message"]
 
         elif act_type == "send_whatsapp_phone":
@@ -1003,7 +1003,7 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (phone)")
             res = whatsapp_ops.send_whatsapp_message_via_phone(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if not speak_text:
+            if res.get("status") != "success" or not speak_text:
                 speak_text = res["message"]
 
         else:

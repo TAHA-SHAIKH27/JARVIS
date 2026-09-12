@@ -14,8 +14,8 @@ from backend.tools.browser import Browser, BrowserPageState
 
 
 class Observer:
-    def __init__(self, registry: ToolRegistry):
-        self.registry = registry
+    def __init__(self, registry: Optional[ToolRegistry] = None):
+        self.registry = registry or ToolRegistry()
 
     async def observe(self, state: TaskState, focus: str = "general") -> Dict[str, Any]:
         """Lightweight general observation (used at start of each loop iteration)."""
@@ -299,7 +299,10 @@ class Observer:
             return {"verified": True, "message": f"Phone action {atype} executed", "classification": "success"}
 
         elif atype in ("send_whatsapp", "send_whatsapp_phone", "add_whatsapp_contact"):
-            return {"verified": True, "message": f"WhatsApp action {atype} executed", "classification": "success"}
+            if result and result.get("status") == "success":
+                return {"verified": True, "message": result.get("message", f"WhatsApp action {atype} executed successfully"), "classification": "success"}
+            msg = result.get("message", f"WhatsApp action {atype} failed") if isinstance(result, dict) else f"WhatsApp action {atype} returned no result"
+            return {"verified": False, "message": msg, "classification": "retryable"}
 
         elif atype == "generate_image":
             if result and result.get("status") == "success":
