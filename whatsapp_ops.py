@@ -19,6 +19,7 @@ import pyautogui
 
 SEND_DELAY_SECONDS = 4.5
 CONTACT_SEARCH_DELAY_SECONDS = 1.5
+SEND_VERIFY_DELAY_SECONDS = 1.0
 
 
 def _looks_like_phone(text: str) -> bool:
@@ -38,6 +39,75 @@ def _launch_whatsapp() -> bool:
         return True
     except Exception:
         return False
+
+
+def _whatsapp_window():
+    """Return the visible WhatsApp UIA window when available."""
+    try:
+        from pywinauto import Desktop
+        root = Desktop(backend="uia").window(title_re=r".*WhatsApp.*")
+        if root.exists(timeout=2):
+            return root
+    except Exception:
+        pass
+    return None
+
+
+def _get_edit_controls(root):
+    """Return visible enabled Edit controls, ordered top-to-bottom."""
+    try:
+        edits = root.descendants(control_type="Edit")
+        visible = []
+        for edit in edits:
+            try:
+                if not edit.is_visible() or not edit.is_enabled():
+                    continue
+                rect = edit.rectangle()
+                visible.append((rect.top, rect.bottom, rect.left, edit))
+            except Exception:
+                pass
+        visible.sort(key=lambda item: (item[0], item[2]))
+        return visible
+    except Exception:
+        return []
+
+
+def _find_message_editor(root):
+    """Find the bottom-most WhatsApp Edit control, normally the message composer."""
+    edits = _get_edit_controls(root)
+    if not edits:
+        return None
+    # The message composer is normally the lowest Edit control in the chat view.
+    return edits[-1][3]
+
+
+def _editor_text(editor) -> str:
+    """Read a UIA Edit value without failing the whole send operation."""
+    for getter in ("get_value", "window_text"):
+        try:
+            value = getattr(editor, getter)()
+            if value is not None:
+                return str(value)
+        except Exception:
+            pass
+    return ""
+
+
+def _verify_message_send(message: str) -> bool:
+    """Verify that WhatsApp's composer was cleared after pressing Enter.
+
+    Clearing the composer is a useful local UI confirmation that WhatsApp
+    accepted the send. If the UI cannot be inspected, we do NOT report success.
+    """
+    time.sleep(SEND_VERIFY_DELAY_SECONDS)
+    root = _whatsapp_window()
+    if root is None:
+        return False
+    editor = _find_message_editor(root)
+    if editor is None:
+        return False
+    current = _editor_text(editor).strip()
+    return current == ""
 
 
 def _search_whatsapp_contact(contact: str) -> dict:
@@ -151,10 +221,10 @@ def send_whatsapp_message(contact: str, message: str, auto_send: bool = True) ->
             pyautogui.press("enter")
         except Exception as e:
             return {
-                "status": "success",
+                "status": "error",
                 "message": f"Opened the chat for {display_name} and filled your message, but auto-send failed ({e}). Please press Enter manually."
             }
-        return {"status": "success", "message": f"Message sent to {display_name} on WhatsApp, sir."}
+        return {"status": "success", "message": f"Message sent to {display_name} on WhatsApp, sir.", "sent_verified": True}
 
     # Name flow: search the contact inside WhatsApp itself.
     searched = _search_whatsapp_contact(display_name)
@@ -167,17 +237,43 @@ def send_whatsapp_message(contact: str, message: str, auto_send: bool = True) ->
             "message": f"Opened the WhatsApp contact search for {display_name} and selected the matching chat. Review the message before sending, sir."
         }
 
+    root = _whatsapp_window()
+    editor = _find_message_editor(root) if root is not None else None
+    if editor is not None:
+        try:
+            editor.click_input()
+        except Exception:
+            try:
+                pyautogui.click(*pyautogui.position())
+            except Exception:
+                pass
+    else:
+        return {
+            "status": "error",
+            "message": f"I opened {display_name}'s WhatsApp chat, but I could not find the message box. I did not report the message as sent."
+        }
+
     try:
         pyautogui.write(message, interval=0.01)
         time.sleep(0.3)
         pyautogui.press("enter")
     except Exception as e:
         return {
-            "status": "success",
-            "message": f"Opened {display_name}'s WhatsApp chat, but I couldn't type/send automatically ({e}). Please finish it manually."
+            "status": "error",
+            "message": f"Opened {display_name}'s WhatsApp chat, but I couldn't type/send automatically ({e}). The message was not verified as sent."
         }
 
-    return {"status": "success", "message": f"Message sent to {display_name} on WhatsApp, sir."}
+    if not _verify_message_send(message):
+        return {
+            "status": "error",
+            "message": f"I attempted to send the WhatsApp message to {display_name}, but WhatsApp did not confirm that the message was sent. I will not claim it was sent."
+        }
+
+    return {
+        "status": "success",
+        "message": f"Message sent to {display_name} on WhatsApp, sir.",
+        "sent_verified": True,
+    }
 
 
 def send_whatsapp_message_via_phone(contact: str, message: str) -> dict:
