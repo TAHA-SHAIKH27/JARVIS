@@ -928,8 +928,7 @@ export default function App() {
 
       {/* ── Core view (hidden when phone/files active) ── */}
       <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
-      {/* ── Core view (hidden when phone/files/code active) ── */}
-      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+
 
       {/* TOP BAR */}
 <Header
