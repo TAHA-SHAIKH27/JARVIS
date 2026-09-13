@@ -104,9 +104,10 @@ def parse_local_command(prompt: str) -> list:
         return actions
 
     # 6. Web Search
-    search_match = re.search(r'(?:search for|google|search web for)\s+(.+)', prompt_clean)
+    search_match = re.search(r'(?:open\s+(?:chrome|browser|google)(?:\s+and)?\s+)?(?:search\s+(?:for|fr|about|web\s+for)?|google|search web for)\s+(.+)', prompt_clean)
     if search_match:
         query = search_match.group(1).strip()
+        query = re.sub(r'^(?:for|fr|about|on|the)\s+', '', query, flags=re.I).strip()
         actions.append({"type": "search_web", "query": query})
         actions.append({"type": "speak", "text": f"Searching Google for {query}, sir."})
         return actions
@@ -163,15 +164,36 @@ def parse_local_command(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"Saving the image as {save_name} to your desktop, sir."})
         return actions
 
-    # Launch app (offline fallback)
-    launch_match = re.search(r'(?:launch|open|start|run)\s+(.+)', prompt_clean)
-    if launch_match:
+    # Launch app (offline fallback - only for actual app launches, not research/folder commands)
+    launch_match = re.search(r'(?:launch|open|start|run)\s+([a-zA-Z0-9_\-\s]{2,30})$', prompt_clean)
+    if launch_match and not any(k in prompt_clean for k in ['website', 'websites', 'folder', 'file', 'word', 'docx', 'search', 'research']):
         app_name = launch_match.group(1).strip()
         actions.append({"type": "launch_app", "app_name": app_name})
         actions.append({"type": "speak", "text": f"Launching {app_name} for you, sir."})
         return actions
 
-    # 10. Basic conversations matching
+    # 10. Check persistent memory for personal facts/questions (offline fallback)
+    try:
+        from backend.agent import phase1_memory
+        recalled = phase1_memory.recall(prompt, limit=1)
+        memories = recalled.get("memories", [])
+        if memories:
+            top_mem = memories[0]
+            key = top_mem.get("key", "").strip()
+            val = top_mem.get("value", "").strip()
+            text = top_mem.get("text", "").strip()
+            prompt_tokens = phase1_memory._tokens(prompt)
+            key_tokens = phase1_memory._tokens(key)
+            if key and (key in prompt_clean or (key_tokens and key_tokens.issubset(prompt_tokens))):
+                actions.append({"type": "speak", "text": f"Your {key} is {val}, sir."})
+                return actions
+            elif prompt_tokens and any(token in phase1_memory._tokens(text) for token in prompt_tokens):
+                actions.append({"type": "speak", "text": f"According to my memory banks, sir: {text}."})
+                return actions
+    except Exception:
+        pass
+
+    # 11. Basic conversations matching
     for key, response in OFFLINE_RESPONSES.items():
         if key in prompt_clean:
             actions.append({"type": "speak", "text": response})
@@ -388,6 +410,29 @@ def _parse_new_commands(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"I need the exact Android package name to launch {app_hint}, sir (e.g. com.whatsapp). Please provide it or use a Gemini-connected session."})
         return actions
 
+    # --- Code Core & Developer Mode Natural Language Patterns ---
+    if any(x in prompt_clean for x in ['audit your own code', 'find errors in yourself', 'show me what is wrong', 'audit code', 'check code', 'scan codebase', 'check for bugs']):
+        actions.append({"type": "code_audit"})
+        actions.append({"type": "speak", "text": "Running a complete read-only codebase self-audit now, sir."})
+        return actions
+
+    if any(x in prompt_clean for x in ['fix those errors', 'fix errors', 'repair code', 'fix all errors', 'fix the bugs']):
+        actions.append({"type": "code_fix", "target": "all"})
+        actions.append({"type": "speak", "text": "Beginning autonomous self-repair with rollback safety enabled, sir."})
+        return actions
+
+    fix_file_match = re.search(r'fix\s+(?:file\s+)?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)', prompt_clean)
+    if fix_file_match:
+        target_file = fix_file_match.group(1).strip()
+        actions.append({"type": "code_fix", "target": target_file})
+        actions.append({"type": "speak", "text": f"Inspecting and repairing {target_file}, sir."})
+        return actions
+
+    if any(x in prompt_clean for x in ['test yourself after the fix', 'test yourself', 'validate code', 'run validation']):
+        actions.append({"type": "code_test"})
+        actions.append({"type": "speak", "text": "Executing self-validation diagnostics, sir."})
+        return actions
+
     return []
 
 
@@ -461,13 +506,57 @@ def generate_image_huggingface(prompt: str, hf_api_key: str, save_name: str = ""
     }
 
 
-# Models tried in priority order. If one is rate-limited (429) or unavailable
-# (404 / 503), the next one is attempted automatically.
-# List confirmed by querying the API key's available models.
-_GEMINI_MODELS = [
-    "gemini-2.5-flash",       # newest + fastest + highest quality
-    "gemini-1.5-flash",       # fallback
+# Static fallback, only used if live ListModels lookup fails (e.g. offline).
+# Kept intentionally short-lived — Google deprecates dated models over time,
+# which is exactly what caused the original 404s.
+_GEMINI_MODELS_FALLBACK = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
+
+_MODEL_LIST_CACHE = {"models": None, "ts": 0.0}
+_MODEL_LIST_TTL = 3600  # re-check available models once an hour
+
+
+def _fetch_available_models(api_key: str, use_oauth: bool, access_token: str, project_id: str = "") -> list:
+    """Query Gemini's ListModels endpoint and return generateContent-capable
+    model names, flash models first. Falls back to the static list above if
+    the lookup itself fails (network issue, bad auth, etc.)."""
+    now = time.time()
+    if _MODEL_LIST_CACHE["models"] and (now - _MODEL_LIST_CACHE["ts"] < _MODEL_LIST_TTL):
+        return _MODEL_LIST_CACHE["models"]
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    headers = {"Content-Type": "application/json"}
+    if use_oauth:
+        headers["Authorization"] = f"Bearer {access_token}"
+        if project_id:
+            headers["x-goog-user-project"] = project_id
+    else:
+        url += f"?key={api_key}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        names = []
+        for m in data.get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            name = m["name"].replace("models/", "")
+            # Skip variants we don't want to auto-select for chat/actions
+            if any(x in name for x in ("embedding", "aqa", "vision", "tts", "image-generation")):
+                continue
+            names.append(name)
+        # Prefer flash models (cheaper/faster) first; keep API's own ordering within each group
+        names.sort(key=lambda n: "flash" not in n)
+        if names:
+            _MODEL_LIST_CACHE["models"] = names
+            _MODEL_LIST_CACHE["ts"] = now
+            return names
+    except Exception as e:
+        print(f"[Gemini] ListModels lookup failed, using static fallback: {e}")
+    return list(_GEMINI_MODELS_FALLBACK)
 
 
 def _call_gemini(url: str, headers: dict, payload: dict, max_retries: int = 1, backoff_seconds: float = 3.0):
@@ -501,16 +590,19 @@ _GEMINI_WORKING_MODEL: str | None = None  # Cached last-working model for fast s
 
 def _call_gemini_with_fallback(base_url_template: str, headers_template: dict, payload: dict, api_key: str, use_oauth: bool):
     """
-    Try each model in _GEMINI_MODELS in order. Skips a model on 429 (quota)
-    or 404 (unavailable/deprecated) and moves to the next. Raises the last
-    error if all models are exhausted.
+    Tries each live, generateContent-capable model (fetched via ListModels,
+    cached hourly) in order. Skips a model on 429 (quota) or 404
+    (unavailable/deprecated) and moves to the next. Raises the last error
+    if all models are exhausted.
 
     Caches the last working model so subsequent calls skip straight to it,
     eliminating redundant 404 round-trips each time JARVIS starts up.
     """
     global _GEMINI_WORKING_MODEL
+    access_token = headers_template.get("Authorization", "").replace("Bearer ", "")
+    project_id = headers_template.get("x-goog-user-project", "")
     # Build ordered list: try last-known-good model first
-    ordered = list(_GEMINI_MODELS)
+    ordered = _fetch_available_models(api_key, use_oauth, access_token, project_id)
     if _GEMINI_WORKING_MODEL and _GEMINI_WORKING_MODEL in ordered:
         ordered.remove(_GEMINI_WORKING_MODEL)
         ordered.insert(0, _GEMINI_WORKING_MODEL)
@@ -593,6 +685,13 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     # Build conversation history context
     history_text = get_history_text()
     
+    # Retrieve persistent memory context for prompt
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
     # Build prompt instructions with available system operations
     system_instruction = """
     You are J.A.R.V.I.S., a witty, respectful, and advanced AI assistant like the one from Iron Man.
@@ -600,7 +699,8 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     You MUST output a valid JSON array of actions and NOTHING else. No markdown block wrapper, no explanations.
     
     CRITICAL RULES FOR SPEED AND CONTEXT:
-    - You have CONVERSATION HISTORY below. Use it to understand follow-up commands!
+    - You have CONVERSATION HISTORY and USER PERSISTENT MEMORY below. Use them to understand context and answer personal questions!
+    - If the user asks about personal facts (e.g. favorite color, name, preferences, location), ALWAYS check the USER PERSISTENT MEMORY first and answer with accurate facts!
     - If the user says something related to a previous command, use context to figure out what they mean.
     - Keep responses SHORT and snappy. Don't ask for clarification if context makes it obvious.
     - Be decisive. If you can reasonably infer what the user wants, DO IT.
@@ -679,6 +779,21 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "send_whatsapp", "contact": "contact name or phone number with country code", "message": "message text to send"},
       {"type": "send_whatsapp_phone", "contact": "contact name or phone number with country code", "message": "message text to send"},
 
+      // --- Clarification (ask user for missing info before proceeding) ---
+      // Use this when a required detail is missing and cannot be safely assumed.
+      // 'options' is an optional list of quick-reply choices shown as buttons.
+      // 'context' is a short tag so the frontend knows what kind of clarification this is.
+      {"type": "ask_clarification", "question": "Which app should I send through, sir?", "context": "messaging_app", "options": ["WhatsApp", "Telegram", "Gmail", "Outlook", "Skype"]},
+
+      // --- Step narration (speak mid-task updates to user) ---
+      // Add multiple speak actions to give live status during long-running tasks.
+      // First speak = what you're about to do. Subsequent speaks = progress updates.
+
+      // --- Code Core & Developer Engine ---
+      {"type": "code_audit"},
+      {"type": "code_fix", "target": "all or specific filepath"},
+      {"type": "code_test"},
+
       // --- Memory ---
       {"type": "clear_history"}
     ]
@@ -712,8 +827,22 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     14. For phone control: "mirror my phone" / "show my phone screen" -> phone_mirror (opens a live scrcpy window). "screenshot my phone" -> phone_screenshot. Touch input -> phone_tap/phone_swipe with pixel coordinates the user gives you. "type X on my phone" -> phone_text. "press back/home/enter on my phone" -> phone_key. "open <app> on my phone" -> phone_launch_app with the Android package name if you know it (e.g. com.whatsapp, com.spotify.music, com.google.android.youtube, com.instagram.android); if unsure, ask for the package name via speak instead of guessing wrong. "is my phone connected" -> phone_devices.
     15. For "unlock my phone" / "unlock phone": use phone_unlock. If the user includes a PIN in the same sentence (e.g. "unlock my phone with pin 1234" or "unlock my phone, pin is 8842"), extract just the digits into the "pin" field. If no PIN is mentioned, omit the "pin" field entirely — the backend will fall back to a saved default PIN (if configured) or a plain swipe-unlock.
     16. For "test tap X on phone" / "test tap X on the pin pad" (calibration only, X being a single digit 0-9): use phone_test_pin_tap with that digit — this just taps where that digit should be, without swiping or submitting a full PIN.
-    17. For "send message to X saying/as Y" / "whatsapp X saying Y" / "text X on whatsapp: Y": use send_whatsapp with contact=X (name or phone number) and message=Y. If the user explicitly says "on my phone" / "from my phone" (e.g. "message X on my phone saying Y", "whatsapp X on my phone: Y"), use send_whatsapp_phone instead — same fields, but sent via the connected Android device over ADB rather than WhatsApp Desktop. Do NOT invent any other action type for WhatsApp.
+    17. MESSAGING — CRITICAL RULE (READ CAREFULLY):
+       - If user says "send message" or "message X" or "text X" WITHOUT specifying an app → use ask_clarification with question="Which app should I send it through, sir?" and options=["WhatsApp", "Telegram", "Gmail", "Outlook", "Skype"] and context="messaging_app". Also include a speak action like "I can send that message, sir — which platform should I use?"
+       - If user says "whatsapp X" / "send whatsapp to X" / "send a whatsapp message to X" / "via whatsapp" → proceed directly with send_whatsapp, no clarification needed.
+       - If user says "telegram X" / "send telegram to X" → use launch_app with app_name="Telegram" then speak explaining to continue manually (we don't yet have telegram automation).
+       - If user says "email X" / "send email to X" / "gmail" / "outlook" → use launch_app with the email client.
+       - If user says "on my phone" / "from my phone" → use send_whatsapp_phone (ADB route).
+       - NEVER guess the app — always ask if it's not specified.
     18. For "save/add/remember X's number as +91..." / "remember X is +91...": use add_whatsapp_contact with name=X and phone=the full number including country code. This saves the contact permanently so future send_whatsapp/send_whatsapp_phone calls can resolve X by name alone.
+    19. LIVE NARRATION — For multi-step tasks (WhatsApp, file operations, etc.), include MULTIPLE speak actions to narrate each step:
+       - WhatsApp example: first speak="Right away, sir. Opening WhatsApp and searching for [contact].", then the send action, the backend will add further narration.
+       - Keep each narration speak SHORT (1 sentence). The goal is the user hears progress, not silence.
+    20. CODE CORE & SELF-DEVELOPER MODE:
+       - If user asks to audit codebase, check own code, or find bugs ("audit your own code", "find errors in yourself", "show me what is wrong") -> use code_audit.
+       - If user explicitly tells you to fix errors ("fix those errors", "fix all errors", "fix the bugs") -> use code_fix with target="all".
+       - If user asks to fix a specific file ("fix agent.py", "fix main.py") -> use code_fix with target=the filename.
+       - If user asks to test or validate itself ("test yourself after the fix", "run validation") -> use code_test. The goal is the user hears progress, not silence.
     
     CRITICAL — DATA ACTIONS SPEAK TEXT RULE:
     For actions that fetch live data (weather, datetime_info, battery, network_info, clipboard_read), the backend
@@ -729,11 +858,14 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     CONVERSATION HISTORY (most recent messages):
     """ + history_text + """
     
+    USER PERSISTENT MEMORY:
+    """ + memory_ctx + """
+    
     Current workspace files context:
     """ + json.dumps(context or {})
 
     # Use Gemini API (v1beta endpoint) with automatic model fallback.
-    # Models are tried in order defined by _GEMINI_MODELS (see top of file).
+    # Models are tried in order returned by _fetch_available_models() (see top of file).
     base_model_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
 
     if use_oauth:
@@ -866,7 +998,13 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
             return
 
     history_text = get_history_text()
-    full_prompt = f"{CHAT_SYSTEM_INSTRUCTION}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser: {prompt}"
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
+    full_prompt = f"{CHAT_SYSTEM_INSTRUCTION}\n\nUSER PERSISTENT MEMORY:\n{memory_ctx}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser: {prompt}"
 
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
@@ -885,7 +1023,7 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1026,7 +1164,13 @@ def stream_gemini_actions(prompt: str, api_key: str, project_id: str = ""):
             return
 
     history_text = get_history_text()
-    full_prompt = f"{COMMAND_STREAM_SYSTEM_INSTRUCTION}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser request: {prompt}"
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(prompt, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
+    full_prompt = f"{COMMAND_STREAM_SYSTEM_INSTRUCTION}\n\nUSER PERSISTENT MEMORY:\n{memory_ctx}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser request: {prompt}"
 
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
@@ -1049,7 +1193,7 @@ def stream_gemini_actions(prompt: str, api_key: str, project_id: str = ""):
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1177,7 +1321,7 @@ def stream_image_analysis(image_base64: str, mime_type: str, prompt: str, api_ke
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"
@@ -1293,7 +1437,7 @@ def stream_document_analysis(document_text: str, filename: str, prompt: str, api
     full_reply = ""
     last_error = None
 
-    for model in _GEMINI_MODELS:
+    for model in _fetch_available_models(api_key, use_oauth, access_token, project_id):
         url = base_url_template.replace("__MODEL__", model)
         if not use_oauth:
             url += f"&key={api_key}"

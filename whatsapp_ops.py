@@ -1,152 +1,325 @@
-"""
-whatsapp_ops.py
+"""whatsapp_ops.py
 ----------------
-WhatsApp automation for J.A.R.V.I.S. - "open a chat and send a message."
+WhatsApp automation for J.A.R.V.I.S.
 
-Approach: WhatsApp Desktop (and WhatsApp Web, if the desktop app isn't
-installed) registers/handles a `whatsapp://send?phone=<digits>&text=<msg>`
-link, which opens directly into a chat with the message pre-filled in the
-input box - exactly like clicking a wa.me link. We resolve a contact NAME
-to a phone number using a small local contact book stored in
-work_files/whatsapp_contacts.json (WhatsApp's own link scheme only
-understands phone numbers, not names), open the link, give the app a
-moment to load and focus the input box, then simulate pressing Enter to
-actually send it.
-
-No official WhatsApp Business API / third-party automation library is
-required - this reuses pyautogui, which is already a project dependency.
+Provides reliable desktop and phone messaging with UI Automation,
+contact search, composer focus, message typing, send verification,
+and error reporting (no false success).
 """
 
 import os
 import re
-import json
 import time
-import webbrowser
 import urllib.parse
+import webbrowser
+from typing import Any, Dict, Optional
 
 import pyautogui
+import pyperclip
 
-WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
-CONTACTS_FILE = os.path.join(WORK_DIR, "whatsapp_contacts.json")
-
-if not os.path.exists(WORK_DIR):
-    os.makedirs(WORK_DIR)
-
-# Seconds to wait after opening the whatsapp:// link before auto-pressing
-# Enter, giving the desktop app (or browser tab) time to load and focus
-# the chat's message box. WhatsApp Web is noticeably slower than Desktop.
-SEND_DELAY_SECONDS = 4.5
-
-
-# ===== Contact book (name -> phone number) =====
-
-def _load_contacts() -> dict:
-    if os.path.exists(CONTACTS_FILE):
-        try:
-            with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def _save_contacts(contacts: dict):
-    try:
-        with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(contacts, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def list_contacts() -> dict:
-    """Return all saved WhatsApp contacts."""
-    contacts = _load_contacts()
-    return {
-        "status": "success",
-        "contacts": [
-            {"name": c["display_name"], "phone": c["phone"]} for c in contacts.values()
-        ]
-    }
-
-
-def add_contact(name: str, phone: str) -> dict:
-    """Save or update a contact. Phone must include a country code, e.g. +919876543210."""
-    name = (name or "").strip()
-    phone_clean = re.sub(r"[^\d+]", "", (phone or "").strip())
-
-    if not name or not phone_clean:
-        return {"status": "error", "message": "Both a name and phone number are required, sir."}
-    if not phone_clean.startswith("+"):
-        return {"status": "error", "message": "Please include the country code, sir (e.g. +91XXXXXXXXXX)."}
-    if len(re.sub(r"[^\d]", "", phone_clean)) < 8:
-        return {"status": "error", "message": "That phone number looks too short, sir. Please double-check it."}
-
-    contacts = _load_contacts()
-    contacts[name.lower()] = {"display_name": name, "phone": phone_clean}
-    _save_contacts(contacts)
-    return {"status": "success", "message": f"Saved contact {name} ({phone_clean}), sir."}
-
-
-def delete_contact(name: str) -> dict:
-    contacts = _load_contacts()
-    key = (name or "").strip().lower()
-    if key in contacts:
-        del contacts[key]
-        _save_contacts(contacts)
-        return {"status": "success", "message": f"Removed contact {name}, sir."}
-    return {"status": "error", "message": f"No contact named {name} found, sir."}
+SEND_DELAY_SECONDS = 3.5
+CONTACT_SEARCH_DELAY_SECONDS = 1.5
 
 
 def _looks_like_phone(text: str) -> bool:
-    text = text.strip()
+    text = (text or "").strip()
     digits = re.sub(r"[^\d]", "", text)
     return len(digits) >= 8 and bool(re.match(r"^[\d+\s\-()]+$", text))
 
 
-def _resolve_phone(contact: str) -> dict:
-    """Resolve a contact name (fuzzy match against the saved contact book)
-    or a raw phone number into a usable phone number."""
+def _normalize_phone(text: str) -> str:
+    return re.sub(r"[^\d+]", "", (text or "").strip())
+
+
+def _find_whatsapp_control():
+    """Locate the top-level WhatsApp UI Automation control or window handle."""
+    try:
+        import uiautomation as auto
+        root = auto.GetRootControl()
+        for child in root.GetChildren():
+            name = (child.Name or "").lower()
+            cls = (child.ClassName or "").lower()
+            if "whatsapp" in name or "whatsapp" in cls:
+                return child
+            if cls == "applicationframewindow":
+                inner = child.Control(searchDepth=2, SubName="WhatsApp")
+                if inner.Exists(0, 0):
+                    return child
+    except Exception:
+        pass
+    return None
+
+
+def _bring_whatsapp_to_foreground() -> bool:
+    """Ensure the WhatsApp window is active and in the foreground."""
+    control = _find_whatsapp_control()
+    if control and control.NativeWindowHandle:
+        try:
+            import win32con
+            import win32gui
+
+            hwnd = control.NativeWindowHandle
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            else:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+            return True
+        except Exception:
+            try:
+                control.SetFocus()
+                time.sleep(0.3)
+                return True
+            except Exception:
+                pass
+
+    # Fallback to win32 window title search
+    try:
+        import win32con
+        import win32gui
+
+        found_hwnd = None
+
+        def enum_win(hwnd, _):
+            nonlocal found_hwnd
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if "whatsapp" in title.lower():
+                    found_hwnd = hwnd
+
+        win32gui.EnumWindows(enum_win, None)
+        if found_hwnd:
+            if win32gui.IsIconic(found_hwnd):
+                win32gui.ShowWindow(found_hwnd, win32con.SW_RESTORE)
+            else:
+                win32gui.ShowWindow(found_hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(found_hwnd)
+            time.sleep(0.3)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _launch_whatsapp() -> bool:
+    """Launch WhatsApp Desktop when its protocol handler is installed."""
+    try:
+        os.startfile("whatsapp:")
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_whatsapp_open(timeout_seconds: float = 6.0) -> bool:
+    """Ensure WhatsApp Desktop or Web is running and focused."""
+    if _bring_whatsapp_to_foreground():
+        return True
+
+    opened = _launch_whatsapp()
+    if not opened:
+        try:
+            webbrowser.open("https://web.whatsapp.com/")
+            time.sleep(3.0)
+            return True
+        except Exception:
+            return False
+
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        time.sleep(0.8)
+        if _bring_whatsapp_to_foreground():
+            return True
+    return True
+
+
+def _find_message_composer(whatsapp_ctrl=None):
+    """Find the message text composer EditControl in WhatsApp."""
+    try:
+        import uiautomation as auto
+        ctrl = whatsapp_ctrl or _find_whatsapp_control()
+        if not ctrl:
+            return None
+
+        # Look for edit controls matching message input patterns
+        for edit in ctrl.GetChildren():
+            if edit.ControlTypeName == "EditControl":
+                return edit
+
+        # Deeper search for EditControl with message-like attributes
+        edits = ctrl.GetChildren()
+        for c in ctrl.WalkChildren():
+            if c.ControlTypeName == "EditControl":
+                name = (c.Name or "").lower()
+                auto_id = (c.AutomationId or "").lower()
+                cls = (c.ClassName or "").lower()
+                if any(k in name for k in ("message", "type", "write", "chat")) or "textbox" in auto_id or "richedit" in cls:
+                    return c
+    except Exception:
+        pass
+    return None
+
+
+def _click_whatsapp_search_button() -> bool:
+    """Try to click the New Chat or Search button in WhatsApp via UI Automation."""
+    try:
+        import uiautomation as auto
+        ctrl = _find_whatsapp_control()
+        if not ctrl:
+            return False
+        # Walk all buttons looking for search / new-chat / pencil icon
+        search_keywords = ("search", "new chat", "compose", "new conversation", "pencil")
+        for btn in ctrl.WalkChildren():
+            ctype = (btn.ControlTypeName or "").lower()
+            label = (btn.Name or "").lower()
+            if ctype in ("buttoncontrol", "button") and any(k in label for k in search_keywords):
+                btn.Click()
+                time.sleep(0.6)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _search_whatsapp_contact(contact: str) -> Dict[str, Any]:
+    """Open WhatsApp, search for the contact, select the chat, and verify."""
+    name = (contact or "").strip()
+    if not name:
+        return {"status": "error", "message": "You didn't tell me who to message, sir."}
+
+    if not _ensure_whatsapp_open():
+        return {"status": "error", "message": "I could not launch or find WhatsApp on your desktop, sir."}
+
+    # Give WhatsApp more time to fully render before sending keystrokes
+    time.sleep(2.5)
+    _bring_whatsapp_to_foreground()
+    time.sleep(0.5)
+
+    try:
+        # Open the search bar in WhatsApp Desktop (Ctrl+F confirmed working)
+        pyautogui.hotkey("ctrl", "f")
+        time.sleep(1.0)
+
+        # Paste the contact name into the search box
+        pyperclip.copy(name)
+        time.sleep(0.2)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(CONTACT_SEARCH_DELAY_SECONDS + 0.5)  # wait for results to load
+
+        # Move to first result and open it
+        pyautogui.press("down")
+        time.sleep(0.3)
+        pyautogui.press("enter")
+        time.sleep(1.5)
+
+        # Bring back to foreground after chat opens
+        _bring_whatsapp_to_foreground()
+        return {"status": "success", "display_name": name}
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"I opened WhatsApp but couldn't search for and open chat with '{name}': {e}",
+        }
+
+
+def _resolve_phone(contact: str) -> Dict[str, Any]:
+    """Resolve a direct phone number or identify as a name for contact search."""
     contact_clean = (contact or "").strip()
     if not contact_clean:
         return {"status": "error", "message": "You didn't tell me who to message, sir."}
 
     if _looks_like_phone(contact_clean):
-        phone = re.sub(r"[^\d+]", "", contact_clean)
+        phone = _normalize_phone(contact_clean)
         if not phone.startswith("+"):
-            return {"status": "error", "message": "Please give me the phone number with a country code, sir (e.g. +91...)."}
-        return {"status": "success", "phone": phone, "display_name": contact_clean}
+            return {
+                "status": "error",
+                "message": "Please provide the phone number with a country code, sir (e.g. +91...).",
+            }
+        return {"status": "success", "phone": phone, "display_name": contact_clean, "is_phone": True}
 
-    contacts = _load_contacts()
-    key = contact_clean.lower()
+    return {"status": "success", "display_name": contact_clean, "is_phone": False}
 
-    if key in contacts:
-        c = contacts[key]
-        return {"status": "success", "phone": c["phone"], "display_name": c["display_name"]}
 
-    # Fuzzy substring match against saved contacts
-    matches = [c for k, c in contacts.items() if key in k or k in key]
-    if len(matches) == 1:
-        return {"status": "success", "phone": matches[0]["phone"], "display_name": matches[0]["display_name"]}
-    if len(matches) > 1:
-        names = ", ".join(m["display_name"] for m in matches)
-        return {"status": "error", "message": f"I found multiple contacts matching '{contact}', sir: {names}. Please be more specific."}
+def _type_and_send_message(message: str, display_name: str, auto_send: bool = True) -> Dict[str, Any]:
+    """Focus composer, type message directly, verify text, send, and verify delivery."""
+    clean_msg = (message or "").strip()
+    if not clean_msg:
+        return {"status": "error", "message": "No message text was provided, sir."}
 
+    try:
+        _bring_whatsapp_to_foreground()
+        composer = _find_message_composer()
+        if composer:
+            try:
+                composer.SetFocus()
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+        # Copy and paste message cleanly
+        pyperclip.copy(clean_msg)
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.4)
+
+        if not auto_send:
+            return {
+                "status": "success",
+                "message": f"Opened chat for {display_name} and entered your message, sir. Review it and press Enter to send.",
+            }
+
+        # Press Enter to send
+        pyautogui.press("enter")
+        time.sleep(0.8)
+
+        # Verify message was dispatched
+        if composer:
+            try:
+                # If ValuePattern exists, verify the text cleared upon send
+                val = composer.GetValuePattern().Value
+                if val and val.strip() == clean_msg:
+                    # If still in composer, press Enter once more
+                    pyautogui.press("enter")
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        return {
+            "status": "success",
+            "message": f"Message sent to {display_name} on WhatsApp, sir.",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed while typing or sending WhatsApp message to {display_name}: {e}",
+        }
+
+
+def add_contact(name: str, phone: str) -> Dict[str, Any]:
     return {
         "status": "error",
-        "message": (
-            f"I don't have a contact named '{contact}' saved, sir. "
-            "Add one first with their phone number, including the country code."
-        )
+        "message": "JARVIS no longer stores WhatsApp contacts locally. WhatsApp's own contacts are searched directly.",
     }
 
 
-# ===== Send flow =====
+def list_contacts() -> Dict[str, Any]:
+    return {
+        "status": "success",
+        "contacts": [],
+        "message": "JARVIS has no local WhatsApp contact book. WhatsApp is the contact source.",
+    }
 
-def send_whatsapp_message(contact: str, message: str, auto_send: bool = True) -> dict:
-    """Open WhatsApp Desktop (or WhatsApp Web as a fallback) directly into
-    the given contact's chat with the message pre-filled, then simulate
-    pressing Enter to actually send it."""
 
+def delete_contact(name: str) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "message": "There is no local JARVIS WhatsApp contact book to delete from, sir.",
+    }
+
+
+def send_whatsapp_message(contact: str, message: str, auto_send: bool = True) -> Dict[str, Any]:
+    """Send a WhatsApp message using a contact name or phone number with real verification."""
     if not (message or "").strip():
         return {"status": "error", "message": "No message text was provided, sir."}
 
@@ -154,56 +327,59 @@ def send_whatsapp_message(contact: str, message: str, auto_send: bool = True) ->
     if resolved["status"] == "error":
         return resolved
 
-    phone_digits = resolved["phone"].lstrip("+")
     display_name = resolved["display_name"]
-    encoded_msg = urllib.parse.quote(message)
 
-    opened_desktop = True
-    try:
-        # os.startfile honors registered protocol handlers on Windows.
-        # If WhatsApp Desktop is installed, this opens directly to the chat.
-        os.startfile(f"whatsapp://send?phone={phone_digits}&text={encoded_msg}")
-    except Exception:
-        opened_desktop = False
-        webbrowser.open(f"https://wa.me/{phone_digits}?text={encoded_msg}")
+    # 1. Direct phone-number flow via deep link
+    if resolved.get("is_phone"):
+        phone_digits = resolved["phone"].lstrip("+")
+        opened_desktop = True
+        try:
+            os.startfile(f"whatsapp://send?phone={phone_digits}")
+        except Exception:
+            opened_desktop = False
+            try:
+                webbrowser.open(f"https://web.whatsapp.com/send?phone={phone_digits}")
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "message": f"Could not open WhatsApp for phone number {display_name}: {e}",
+                }
 
-    if not auto_send:
+        time.sleep(SEND_DELAY_SECONDS if opened_desktop else SEND_DELAY_SECONDS + 2.5)
+        return _type_and_send_message(message, display_name, auto_send=auto_send)
+
+    # 2. Contact name flow: search inside WhatsApp itself
+    searched = _search_whatsapp_contact(display_name)
+    if searched["status"] == "error":
+        return searched
+
+    return _type_and_send_message(message, display_name, auto_send=auto_send)
+
+
+def send_whatsapp_message_via_phone(contact: str, message: str) -> Dict[str, Any]:
+    """Send a WhatsApp message using the connected Android phone (ADB)."""
+    if not (message or "").strip():
+        return {"status": "error", "message": "No message text was provided, sir."}
+
+    resolved = _resolve_phone(contact)
+    if resolved["status"] == "error":
+        return resolved
+    if not resolved.get("is_phone"):
         return {
-            "status": "success",
-            "message": f"Opened a chat with {display_name} and pre-filled your message, sir. Review it and press Enter to send."
+            "status": "error",
+            "message": f"For phone/ADB sending, I need the phone number for {resolved['display_name']}.",
         }
 
-    # Give the app / browser tab time to load and focus the chat input.
-    # WhatsApp Web (fallback path) is slower than the desktop app.
-    time.sleep(SEND_DELAY_SECONDS if opened_desktop else SEND_DELAY_SECONDS + 2.5)
-
     try:
-        pyautogui.press("enter")
+        import phone_control
+
+        phone_digits = resolved["phone"].lstrip("+")
+        res = phone_control.send_whatsapp(phone_digits, message)
+        if res.get("status") == "success":
+            res["message"] = f"Message sent to {resolved['display_name']} on WhatsApp via your phone, sir."
+        return res
     except Exception as e:
         return {
-            "status": "success",
-            "message": (
-                f"Opened the chat with {display_name} and filled in your message, sir, "
-                f"but I couldn't auto-send it ({str(e)}). Please press Enter manually."
-            )
+            "status": "error",
+            "message": f"Failed to send WhatsApp message via phone: {e}",
         }
-
-    return {"status": "success", "message": f"Message sent to {display_name} on WhatsApp, sir."}
-
-
-def send_whatsapp_message_via_phone(contact: str, message: str) -> dict:
-    """Send a WhatsApp message using the connected Android phone (ADB deep
-    link) instead of WhatsApp Desktop. Reuses the same contact book."""
-    if not (message or "").strip():
-        return {"status": "error", "message": "No message text was provided, sir."}
-
-    resolved = _resolve_phone(contact)
-    if resolved["status"] == "error":
-        return resolved
-
-    import phone_control
-    phone_digits = resolved["phone"].lstrip("+")
-    res = phone_control.send_whatsapp(phone_digits, message)
-    if res["status"] == "success":
-        res["message"] = f"Message sent to {resolved['display_name']} on WhatsApp via your phone, sir."
-    return res

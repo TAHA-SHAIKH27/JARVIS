@@ -16,3 +16,6 @@ playwright==1.48.0; python_version < "3.10"
 # Windows desktop automation is unavailable on Vercel's Linux build image.
 uiautomation==2.0.18; sys_platform == "win32"
 pywinauto==0.6.8; sys_platform == "win32"
+playwright>=1.62.0
+uiautomation==2.0.18
+pywinauto==0.6.8

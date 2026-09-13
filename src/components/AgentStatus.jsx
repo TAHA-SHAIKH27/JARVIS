@@ -8,6 +8,7 @@ function AgentStatus({ status }) {
     executing: { color: 'var(--orange)', icon: Clock },
     observing: { color: 'var(--cyan)', icon: Clock },
     completed: { color: 'var(--green)', icon: Check },
+    blocked: { color: 'var(--orange)', icon: AlertCircle },
     error: { color: 'var(--red)', icon: AlertCircle },
   };
 

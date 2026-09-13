@@ -12,6 +12,7 @@ import struct
 import numpy as np
 import wave
 import io
+import uuid
 
 # Import local helper modules
 from system_ops import (
@@ -50,6 +51,7 @@ import document_intel
 import google_oauth
 import phone_control
 import whatsapp_ops
+import code_core
 import json
 import asyncio
 
@@ -167,6 +169,22 @@ class ConfigModel(BaseModel):
     huggingface_api_key: str
     gemini_project_id: Optional[str] = ""
     groq_api_key: str = ""
+    nvidia_api_key: Optional[str] = ""
+    nvidia_model: Optional[str] = "meta/llama-3.3-70b-instruct"
+
+# ── Code Core request models ────────────────────────────────────────────────
+class CodePreviewFixRequest(BaseModel):
+    file: str
+    issue: Optional[str] = ""
+
+class CodeApplyFixRequest(BaseModel):
+    file: str
+    proposed_content: str
+
+class CodeProcessFileRequest(BaseModel):
+    filename: str
+    content: str
+    instructions: Optional[str] = ""
 
 # ── Phone control request models ────────────────────────────────────────────
 class PhoneTapRequest(BaseModel):
@@ -205,9 +223,37 @@ def post_config(req: ConfigModel):
         "gemini_api_key": req.gemini_api_key,
         "huggingface_api_key": req.huggingface_api_key,
         "gemini_project_id": req.gemini_project_id or "",
-        "groq_api_key": req.groq_api_key or ""
+        "groq_api_key": req.groq_api_key or "",
+        "nvidia_api_key": req.nvidia_api_key or "",
+        "nvidia_model": req.nvidia_model or "meta/llama-3.3-70b-instruct"
     })
     return {"status": "success", "message": "Configuration saved."}
+
+
+# ── Code Core Endpoints ─────────────────────────────────────────────────────
+
+@app.post("/api/code/audit")
+def code_audit():
+    return code_core.audit_codebase()
+
+@app.post("/api/code/preview-fix")
+def code_preview_fix(req: CodePreviewFixRequest):
+    return code_core.preview_file_fix(req.file, req.issue)
+
+@app.post("/api/code/apply-fix")
+def code_apply_fix(req: CodeApplyFixRequest):
+    return code_core.apply_file_fix(req.file, req.proposed_content)
+
+@app.post("/api/code/process-file")
+def code_process_file(req: CodeProcessFileRequest):
+    return code_core.process_uploaded_code_file(req.filename, req.content, req.instructions)
+
+@app.get("/api/code/download/{filename}")
+def code_download(filename: str):
+    file_path = os.path.join(code_core.DOWNLOADS_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, filename=filename)
 
 
 # ===== Google OAuth (alternative to the raw Gemini API key) =====
@@ -622,6 +668,13 @@ async def process_command(req: CommandRequest):
     if prompt_lower in ["clear chat", "reset history", "forget everything", "clear memory", "reset"]:
         import agent
         agent.conversation_history.clear()
+        try:
+            from backend.agent import phase1_memory, phase1_runtime
+            if prompt_lower in ["clear memory", "forget everything", "reset"]:
+                phase1_memory.clear()
+            phase1_runtime.runtime.conversation.clear()
+        except Exception:
+            pass
         return {
             "speak": "Memory banks cleared, sir. Starting fresh.",
             "logs": ["ACTION: Cleared conversation history"],
@@ -650,6 +703,8 @@ async def process_command(req: CommandRequest):
     file_data = None
     refresh_files = False
     image_data = None  # For generated images
+    clarification_needed = None  # Populated when JARVIS needs to ask a follow-up
+    narration_steps = []  # Sequential spoken updates for multi-step tasks
     
     execution_logs.append(f"INPUT RECEIVED: \"{req.prompt}\"")
     
@@ -980,23 +1035,91 @@ async def process_command(req: CommandRequest):
             if not speak_text:
                 speak_text = res["message"]
 
+        elif act_type == "ask_clarification":
+            question = action.get("question", "What would you like me to do, sir?")
+            context = action.get("context", "general")
+            options = action.get("options", [])
+            execution_logs.append(f"ACTION: Asking for clarification — {question}")
+            # Store clarification data to return to frontend
+            clarification_needed = {
+                "question": question,
+                "context": context,
+                "options": options,
+            }
+            speak_text = question  # Jarvis speaks the question too
+
         elif act_type == "send_whatsapp":
             contact = action.get("contact", "")
             message = action.get("message", "")
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (desktop)")
+            # Add progressive narration steps
+            narration_steps.append(f"Right away, sir. Opening WhatsApp and searching for {contact}.")
             res = whatsapp_ops.send_whatsapp_message(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if not speak_text:
+            if res.get("status") == "success":
+                narration_steps.append(f"Message sent to {contact} on WhatsApp, sir. Done.")
+                speak_text = f"Done, sir. Message delivered to {contact} on WhatsApp."
+            else:
                 speak_text = res["message"]
 
         elif act_type == "send_whatsapp_phone":
             contact = action.get("contact", "")
             message = action.get("message", "")
             execution_logs.append(f"ACTION: Sending WhatsApp message to '{contact}' (phone)")
+            narration_steps.append(f"On it, sir. Sending via your phone to {contact}.")
             res = whatsapp_ops.send_whatsapp_message_via_phone(contact, message)
             execution_logs.append(f"RESULT: {res['message']}")
-            if not speak_text:
+            if res.get("status") == "success":
+                narration_steps.append(f"Message sent to {contact} via your phone, sir.")
+                speak_text = f"Done, sir. Message sent to {contact} from your phone."
+            else:
                 speak_text = res["message"]
+
+        elif act_type == "code_audit":
+            execution_logs.append("ACTION: Running complete read-only codebase self-audit")
+            audit_res = code_core.audit_codebase()
+            execution_logs.append(f"RESULT: Codebase audit finished. Health score: {audit_res['health_score']}% ({audit_res['issues_count']} issues found).")
+            if audit_res["issues_count"] == 0:
+                speak_text = f"Codebase audit complete, sir. All {audit_res['total_files_checked']} source files are completely healthy with zero syntax errors."
+            else:
+                speak_text = f"Audit complete, sir. I detected {audit_res['issues_count']} potential issues. I have not applied any modifications. You can review and approve fixes in the Code Core tab."
+
+        elif act_type == "code_fix":
+            target = action.get("target", "all")
+            execution_logs.append(f"ACTION: Applying safe patch and validation to: {target}")
+            if target in ["all", "errors", "issues"]:
+                audit_res = code_core.audit_codebase()
+                fixed_count = 0
+                for issue in audit_res.get("issues", []):
+                    fpath = issue["file"]
+                    preview = code_core.preview_file_fix(fpath, issue.get("message", ""))
+                    if preview.get("status") == "success":
+                        app_res = code_core.apply_file_fix(fpath, preview["proposed_content"])
+                        if app_res.get("status") == "success":
+                            fixed_count += 1
+                            execution_logs.append(f"RESULT: Repaired {fpath} with validation verified.")
+                speak_text = f"Self-repair complete, sir. Successfully fixed and validated {fixed_count} files with automatic rollback safety enabled."
+            else:
+                preview = code_core.preview_file_fix(target, action.get("issue", ""))
+                if preview.get("status") == "success":
+                    app_res = code_core.apply_file_fix(target, preview["proposed_content"])
+                    if app_res.get("status") == "success":
+                        speak_text = f"File {target} has been successfully repaired and validated, sir."
+                        execution_logs.append(f"RESULT: {app_res['message']}")
+                    else:
+                        speak_text = f"Could not safely apply fix to {target}. Automatic rollback was executed."
+                        execution_logs.append(f"RESULT: {app_res['message']}")
+                else:
+                    speak_text = f"Could not generate patch for {target}: {preview.get('message')}"
+
+        elif act_type == "code_test":
+            execution_logs.append("ACTION: Executing comprehensive self-validation suite")
+            audit_res = code_core.audit_codebase()
+            if audit_res["status"] == "healthy":
+                speak_text = "All system validation tests passed, sir. Python syntax, AST trees, and frontend builds are nominal."
+            else:
+                speak_text = f"Validation completed with warnings, sir. {audit_res['issues_count']} warnings detected."
+            execution_logs.append(f"RESULT: Self-validation finished. Health Score: {audit_res['health_score']}%.")
 
         else:
             execution_logs.append(f"ACTION: Unknown command type \"{act_type}\"")
@@ -1025,6 +1148,8 @@ async def process_command(req: CommandRequest):
         "refresh_files": refresh_files,
         "image_data": image_data,
         "timer_data": timer_data,
+        "clarification_needed": clarification_needed,
+        "narration_steps": narration_steps,
     }
 
 
@@ -1101,7 +1226,9 @@ def serve_work_file(path: str):
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────
-agent_core = AgentCore()
+# Each task owns its state and tools. Sharing an Executor also shares its
+# Playwright browser, which lets concurrent tasks corrupt each other.
+agent_runs = {}
 
 
 class AgentRunRequest(BaseModel):
@@ -1123,11 +1250,18 @@ async def agent_run(req: AgentRunRequest):
     # Create a per-request event queue
     event_queue: asyncio.Queue = asyncio.Queue()
     state = TaskState()
+    run_id = str(uuid.uuid4())
+    core = AgentCore()
+    agent_runs[run_id] = {"state": state, "core": core, "task": task}
 
     async def run_agent():
         """Run agent in background, putting results into the queue."""
         try:
-            await agent_core.process(task, state, event_queue)
+            await event_queue.put({
+                "type": "run_started", "message": "Agent run started", "icon": ">",
+                "data": {"run_id": run_id}, "ts": __import__('time').time()
+            })
+            await core.process(task, state, event_queue)
         except Exception as e:
             await event_queue.put({
                 "type": "error",
@@ -1137,6 +1271,10 @@ async def agent_run(req: AgentRunRequest):
                 "ts": __import__('time').time()
             })
         finally:
+            # A human-blocked run must remain addressable by /resume. Finished
+            # runs are removed promptly and their browser is closed by AgentCore.
+            if not state.waiting_for_user:
+                agent_runs.pop(run_id, None)
             # Sentinel to signal end of stream
             await event_queue.put(None)
 
@@ -1177,15 +1315,18 @@ async def agent_execute(req: dict):
     """Execute a natural language task through the agent core (non-streaming legacy)."""
     task = req.get("text", "")
     state = TaskState()
-    result = await agent_core.process(task, state)
+    result = await AgentCore().process(task, state)
     return {"status": result.get("status", "error"), "data": result}
 
 
 @app.get("/api/agent/status")
-async def agent_status():
-    """Get the current agent state status."""
-    state = TaskState()
+async def agent_status(run_id: str = ""):
+    """Get status for an active agent run."""
+    run = agent_runs.get(run_id)
+    state = run["state"] if run else TaskState()
     return {
+        "run_id": run_id,
+        "active": bool(run),
         "task": state.task,
         "completed_steps": state.completed_steps,
         "errors": state.errors,
@@ -1208,9 +1349,15 @@ async def agent_plan(req: dict):
 @app.post("/api/agent/resume")
 async def agent_resume(req: dict):
     """Resume agent after human intervention."""
-    # This would need a way to persist state across requests
-    # For now, return a placeholder
-    return {"status": "success", "message": "Resume endpoint - state persistence needed"}
+    run_id = req.get("run_id", "")
+    run = agent_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="No paused agent run found for this run_id.")
+    state = run["state"]
+    if not state.waiting_for_user:
+        raise HTTPException(status_code=409, detail="This agent run is not waiting for human intervention.")
+    result = await run["core"].resume_after_human(state, req.get("resolution", {}))
+    return {"status": "success", "run_id": run_id, "data": result}
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────

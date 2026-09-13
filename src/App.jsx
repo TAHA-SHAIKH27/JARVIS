@@ -10,7 +10,7 @@ import {
 
   Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
 
-  Mic, MicOff, Brain
+  Mic, MicOff, Brain, Terminal
 
 } from 'lucide-react'
 
@@ -27,6 +27,8 @@ import PhonePanel from './PhonePanel';
 import PhoneMirrorPage from './PhoneMirrorPage';
 
 import GalleryPage from './GalleryPage';
+
+import CodeCorePage from './CodeCorePage';
 
 import { useVoice } from './hooks/useVoice';
 
@@ -169,6 +171,8 @@ export default function App() {
   const [geminiProjectId, setGeminiProjectId] = useState('')
 
   const [groqKey, setGroqKey] = useState('')
+  const [nvidiaKey, setNvidiaKey] = useState('')
+  const [nvidiaModel, setNvidiaModel] = useState('meta/llama-3.3-70b-instruct')
 
   const [saveNote, setSaveNote] = useState('')
 
@@ -192,7 +196,10 @@ export default function App() {
   const [agentMode, setAgentMode] = useState(false)
   const [agentStatus, setAgentStatus] = useState('ready')
   const [agentEvents, setAgentEvents] = useState([])
+  const [agentRunId, setAgentRunId] = useState('')
+  const [agentWaitingForHuman, setAgentWaitingForHuman] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(true)
+  const [clarificationPending, setClarificationPending] = useState(null)
 
   useEffect(() => {
     const timer = setTimeout(() => setBooting(false), 4000)
@@ -410,6 +417,8 @@ export default function App() {
         setHfKey(cfg.huggingface_api_key || '')
         setGeminiProjectId(cfg.gemini_project_id || '')
         setGroqKey(cfg.groq_api_key || '')
+        setNvidiaKey(cfg.nvidia_api_key || '')
+        if (cfg.nvidia_model) setNvidiaModel(cfg.nvidia_model)
       }
     }).catch(() => { })
   }, [])
@@ -482,6 +491,14 @@ export default function App() {
       setImageData(data.image_data || null)
       if (data.timer_data) setTimerData(data.timer_data)
       if (data.refresh_files) refreshFiles()
+      if (data.clarification_needed) {
+        setClarificationPending({
+          ...data.clarification_needed,
+          originalPrompt: text
+        })
+      } else {
+        setClarificationPending(null)
+      }
       const logLines = data.logs || []
 
     } catch {
@@ -541,6 +558,8 @@ export default function App() {
     setPrompt('')
     setBusy(true)
     setAgentEvents([])
+    setAgentRunId('')
+    setAgentWaitingForHuman(false)
     setAgentStatus('planning')
 
     try {
@@ -580,13 +599,16 @@ export default function App() {
             const event = JSON.parse(raw)
             const { type, message, icon } = event
 
+            if (type === 'run_started' && event.data?.run_id) setAgentRunId(event.data.run_id)
+            if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentWaitingForHuman(true)
+
             // Update agent status
-            if (type === 'planning') setAgentStatus('planning')
-            else if (type === 'action_start') setAgentStatus('executing')
-            else if (type === 'action_done') setAgentStatus('observing')
-            else if (type === 'action_error') setAgentStatus('error')
-            else if (type === 'complete' || type === 'done') setAgentStatus('completed')
-            else if (type === 'error') setAgentStatus('error')
+            if (type === 'planning' || type === 'plan_created' || type === 'plan_validated') setAgentStatus('planning')
+            else if (type === 'step_started' || type === 'tool_started' || type === 'retrying' || type === 'replanning') setAgentStatus('executing')
+            else if (type === 'observing' || type === 'verification_started') setAgentStatus('observing')
+            else if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentStatus('blocked')
+            else if (type === 'step_failed' || type === 'verification_failed' || type === 'task_failed' || type === 'error') setAgentStatus('error')
+            else if (type === 'task_completed' || type === 'task_partial' || type === 'done') setAgentStatus('completed')
 
             // Accumulate event log
             if (type !== 'done') {
@@ -598,8 +620,9 @@ export default function App() {
             }
 
             // Capture final speak text
-            if (type === 'complete') {
+            if (type === 'task_completed' || type === 'task_partial' || type === 'task_failed') {
               finalSpeak = message
+              setAgentWaitingForHuman(false)
             }
           } catch { /* ignore parse errors */ }
         }
@@ -616,6 +639,27 @@ export default function App() {
       setAgentStatus('error')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function resumeAgentAfterHuman() {
+    if (!agentRunId || !agentWaitingForHuman) return
+    try {
+      const res = await fetch('/api/agent/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: agentRunId, resolution: { completed: true } })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setAgentEvents(ev => [...ev, { text: `✕ Could not resume: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
+        return
+      }
+      setAgentWaitingForHuman(false)
+      setAgentStatus('executing')
+      setAgentEvents(ev => [...ev, { text: '▶ Human verification acknowledged; resuming agent.', type: 'resuming' }])
+    } catch {
+      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent resume endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -726,9 +770,36 @@ export default function App() {
   function handleSend() {
     if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
     if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
+    if (clarificationPending) {
+      const option = prompt.trim()
+      const orig = clarificationPending.originalPrompt || ''
+      setClarificationPending(null)
+      const fullPrompt = orig ? `${orig} via ${option}` : option
+      if (agentMode) runAgentMode(fullPrompt)
+      else if (chatMode) runStreamingChat(fullPrompt)
+      else runCommand(fullPrompt)
+      return
+    }
     if (agentMode) { runAgentMode(prompt); return }
     if (chatMode) runStreamingChat(prompt)
     else runCommand(prompt)
+  }
+
+  function handleClarificationSelect(option) {
+    const orig = clarificationPending?.originalPrompt || ''
+    const ctx = clarificationPending?.context || ''
+    setClarificationPending(null)
+    let fullPrompt = option
+    if (orig) {
+      if (ctx === 'messaging_app') {
+        fullPrompt = `${orig} via ${option}`
+      } else {
+        fullPrompt = `${orig} (${option})`
+      }
+    }
+    if (agentMode) runAgentMode(fullPrompt)
+    else if (chatMode) runStreamingChat(fullPrompt)
+    else runCommand(fullPrompt)
   }
 
   async function saveKeys() {
@@ -740,7 +811,9 @@ export default function App() {
           gemini_api_key: geminiKey,
           huggingface_api_key: hfKey,
           gemini_project_id: geminiProjectId,
-          groq_api_key: groqKey
+          groq_api_key: groqKey,
+          nvidia_api_key: nvidiaKey,
+          nvidia_model: nvidiaModel
         })
       })
       if (res.ok) {
@@ -849,9 +922,14 @@ export default function App() {
       {activeView === 'files' && (
         <GalleryPage setActiveView={setActiveView} />
       )}
+      {activeView === 'code' && (
+        <CodeCorePage setActiveView={setActiveView} />
+      )}
 
       {/* ── Core view (hidden when phone/files active) ── */}
       <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+      {/* ── Core view (hidden when phone/files/code active) ── */}
+      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
 
       {/* TOP BAR */}
 <Header
@@ -873,6 +951,7 @@ export default function App() {
       {/* MAIN 3-COLUMN GRID */}
       <nav className="module-rail" aria-label="JARVIS modules">
         <button className={activeView === 'core' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('core')}><Activity size={16} /><span>CORE</span></button>
+        <button className={activeView === 'code' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('code')}><Terminal size={16} /><span>CODE CORE</span></button>
         <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
         <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
       </nav>
@@ -915,8 +994,35 @@ export default function App() {
             )}
             {extracting && <div className="listening-hint">Extracting documentΓÇª</div>}
 
+            {/* Clarification prompt panel */}
+            {clarificationPending && (
+              <div className="clarification-panel">
+                <div className="clarification-hint">
+                  <Brain className="clarification-icon" size={13} />
+                  <span>CLARIFICATION REQUIRED</span>
+                </div>
+                <div style={{ color: 'var(--text)', fontSize: '12px', marginBottom: '8px', fontWeight: 500 }}>
+                  {clarificationPending.question}
+                </div>
+                {clarificationPending.options && clarificationPending.options.length > 0 && (
+                  <div className="clarification-options">
+                    {clarificationPending.options.map((opt, idx) => (
+                      <button
+                        key={idx}
+                        className="quick-reply-btn"
+                        onClick={() => handleClarificationSelect(opt)}
+                        disabled={busy}
+                      >
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Input row */}
-            <div className="input-row">
+            <div className={`input-row ${clarificationPending ? 'awaiting-clarification' : ''}`}>
               <input
                 type="file"
                 ref={fileInputRef}
@@ -939,10 +1045,10 @@ export default function App() {
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-                placeholder={chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
+                placeholder={clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
                 disabled={busy}
               />
-              <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument)}>
+              <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument && !clarificationPending)}>
                 {busy ? '…' : 'SEND'}
               </button>
             </div>
@@ -988,8 +1094,14 @@ export default function App() {
           {/* Show agent events in Agent Mode, otherwise show normal logs */}
           {agentMode && agentEvents.length > 0 && (
             <div className="panel log-ticker">
+              {agentWaitingForHuman && (
+                <div className="line exec">
+                  Human verification is required in the browser or app. Complete it, then{' '}
+                  <button className="btn-secondary" onClick={resumeAgentAfterHuman}>RESUME AGENT</button>
+                </div>
+              )}
               {[...agentEvents].reverse().map((ev, i) => (
-                <div key={i} className={`line ${ev.type === 'action_done' ? 'result' : ev.type === 'action_error' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
+                <div key={i} className={`line ${ev.type === 'step_completed' ? 'result' : ev.type === 'step_failed' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
                   {ev.text}
                 </div>
               ))}
@@ -1076,9 +1188,28 @@ export default function App() {
                 type="password"
                 value={groqKey}
                 onChange={e => setGroqKey(e.target.value)}
-                placeholder="gsk_ΓÇª"
+                placeholder="gsk_..."
               />
-              <p className="oauth-hint">Get free key at console.groq.com ΓÇö used as cloud fallback for voice transcription.</p>
+              <p className="oauth-hint">Get free key at console.groq.com — used as cloud fallback for voice transcription.</p>
+            </div>
+            <div className="field">
+              <label>NVIDIA NIM API Key (Autonomous Code Core)</label>
+              <input
+                type="password"
+                value={nvidiaKey}
+                onChange={e => setNvidiaKey(e.target.value)}
+                placeholder="nvapi-..."
+              />
+              <p className="oauth-hint">Get free key at build.nvidia.com — powers specialized code audits, bug repairs, and refactoring.</p>
+            </div>
+            <div className="field">
+              <label>NVIDIA NIM Coding Model</label>
+              <input
+                value={nvidiaModel}
+                onChange={e => setNvidiaModel(e.target.value)}
+                placeholder="meta/llama-3.3-70b-instruct"
+              />
+              <p className="oauth-hint">Examples: meta/llama-3.3-70b-instruct, deepseek-ai/deepseek-r1, qwen/qwen2.5-coder-32b-instruct</p>
             </div>
             <div className="modal-actions">
               <button className="btn-secondary" onClick={() => setSettingsOpen(false)}>Cancel</button>
