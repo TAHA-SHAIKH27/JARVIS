@@ -926,8 +926,9 @@ export default function App() {
         <CodeCorePage setActiveView={setActiveView} />
       )}
 
-      {/* ── Core view (hidden when phone/files/code active) ── */}
-      <div style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+      {/* ── Core view (hidden when phone/files active) ── */}
+      <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
+
 
       {/* TOP BAR */}
 <Header
@@ -1085,7 +1086,7 @@ export default function App() {
 
           <div className="panel hud-panel-sphere">
             <div className="core-display-container">
-              <CoreSphere state={sphereState} />
+              <CoreSphere state={sphereState} agentMode={agentMode} />
             </div>
           </div>
 
@@ -1121,7 +1122,7 @@ export default function App() {
 
         {/* ── RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ── */}
         <div className="hud-right">
-          <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} />
+          <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} agentMode={agentMode} />
           <PhonePanel />
         </div>
       </div>

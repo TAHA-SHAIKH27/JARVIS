@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react'
 
 const COLORS = { idle: '#43d9ff', listening: '#54a8ff', wake: '#72f0b0', processing: '#ffb45c', speaking: '#72f0b0' }
+const AGENT_COLORS = { idle: '#ffe04f', listening: '#fff06a', wake: '#fff7a8', processing: '#ffd32f', speaking: '#fff06a' }
 const TAU = Math.PI * 2
 
 function seeded(i) {
@@ -8,7 +9,7 @@ function seeded(i) {
   return x - Math.floor(x)
 }
 
-export default function CoreSphere({ state = 'idle' }) {
+export default function CoreSphere({ state = 'idle', agentMode = false }) {
   const canvasRef = useRef(null)
   const rotationOffsetRef = useRef({ yaw: 0, pitch: 0 })
   const draggingRef = useRef(false)
@@ -48,7 +49,7 @@ export default function CoreSphere({ state = 'idle' }) {
       const input = Math.min(1, Math.max(0, Number(window.jarvisAudioLevel) || 0))
       const fallback = .08 + (Math.sin(t * 3.2) * .5 + .5) * .04
       smoothed += ((input > .015 ? input : fallback) - smoothed) * .14
-      const color = COLORS[state] || COLORS.idle
+      const color = (agentMode ? AGENT_COLORS : COLORS)[state] || (agentMode ? AGENT_COLORS : COLORS).idle
       const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
       const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
       const rotation = t * (state === 'processing' ? 1.9 : .68) + rotationOffsetRef.current.yaw
@@ -117,9 +118,9 @@ export default function CoreSphere({ state = 'idle' }) {
     }
     render()
     return () => cancelAnimationFrame(raf)
-  }, [state])
+  }, [state, agentMode])
 
-  const color = COLORS[state] || COLORS.idle
+  const color = (agentMode ? AGENT_COLORS : COLORS)[state] || (agentMode ? AGENT_COLORS : COLORS).idle
   const handlePointerDown = (event) => {
     draggingRef.current = true
     lastPointerRef.current = { x: event.clientX, y: event.clientY }

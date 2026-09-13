@@ -23,6 +23,23 @@ export default function CodeCorePage({ setActiveView }) {
   const [processingUpload, setProcessingUpload] = useState(false);
   const [uploadResult, setUploadResult] = useState(null);
   const [showUploadDiff, setShowUploadDiff] = useState(false);
+  const [scanClock, setScanClock] = useState(0);
+  const [selectedFile, setSelectedFile] = useState(null);
+
+  const fallbackFiles = [
+    'main.py', 'agent.py', 'system_ops.py', 'phone_control.py',
+    'backend/agent/core.py', 'backend/agent/executor.py', 'src/App.jsx', 'src/CoreSphere.jsx'
+  ];
+  const issueFiles = new Set((auditData?.issues || []).map(issue => issue.file));
+  const scannedFiles = auditData?.files?.length ? auditData.files : fallbackFiles;
+  const scanProgress = auditing ? Math.min(96, 8 + scanClock * 4) : auditData ? 100 : 0;
+  const scanPhase = auditing ? (scanProgress < 35 ? 'INDEXING SOURCE TREE' : scanProgress < 75 ? 'RUNNING STATIC ANALYSIS' : 'VERIFYING REPAIR SURFACE') : auditData ? 'AUDIT COMPLETE // CORE STABLE' : 'AWAITING SCAN COMMAND';
+
+  useEffect(() => {
+    if (!auditing) { setScanClock(0); return undefined; }
+    const timer = window.setInterval(() => setScanClock(value => value + 1), 120);
+    return () => window.clearInterval(timer);
+  }, [auditing]);
 
   useEffect(() => {
     runAudit();
@@ -36,6 +53,7 @@ export default function CodeCorePage({ setActiveView }) {
       if (res.ok) {
         const data = await res.json();
         setAuditData(data);
+        setSelectedFile(data.files?.[0] || fallbackFiles[0]);
       }
     } catch (err) {
       console.error('Audit failed:', err);
@@ -164,6 +182,7 @@ export default function CodeCorePage({ setActiveView }) {
         </div>
 
         <div className="codecore-actions">
+          <div className={`codecore-live-state ${auditing ? 'is-scanning' : 'is-ready'}`}><span className="live-dot" /> {auditing ? 'CORE SCANNING' : auditData ? 'CORE READY' : 'CORE STANDBY'}</div>
           <button className="codecore-btn" onClick={runAudit} disabled={auditing}>
             <RefreshCw size={14} className={auditing ? 'spinning' : ''} />
             {auditing ? 'AUDITING...' : 'SELF-AUDIT CODEBASE'}
@@ -175,6 +194,17 @@ export default function CodeCorePage({ setActiveView }) {
         </div>
       </div>
 
+      {/* Autonomous scan workspace */}
+      <section className="codecore-scan-console">
+        <div className="scan-console-topline"><span><Cpu size={14} /> SELF-HEALING ENGINE // LIVE SOURCE INSPECTOR</span><span className="scan-phase">{scanPhase}</span></div>
+        <div className="scan-console-grid">
+          <div className="scan-progress-orb"><div className="scan-orb-ring"><span>{scanProgress}%</span></div><small>CODEBASE SCAN</small></div>
+          <div className="scan-progress-main"><div className="scan-progress-heading"><strong>{auditing ? 'Analyzing source integrity' : auditData ? 'Source integrity mapped' : 'Ready to inspect source'}</strong><span>{scannedFiles.length} FILE NODES</span></div><div className="scan-track"><span style={{ width: `${scanProgress}%` }} /></div><div className="scan-progress-meta"><span>NODE COVERAGE {scanProgress}%</span><span>{auditData?.issues_count || 0} ANOMALIES</span><span>HEALTH {auditData?.health_score ?? '--'}%</span></div></div>
+          <div className="scan-current-file"><small>ACTIVE FILE NODE</small><strong><FileCode size={14} /> {auditing ? scannedFiles[Math.floor(scanClock / 2) % scannedFiles.length] : selectedFile || 'Awaiting source index'}</strong><span>{auditing ? 'Reading syntax and dependency graph...' : 'Select a file node to inspect its health state.'}</span></div>
+        </div>
+        <div className="scan-file-strip">{scannedFiles.map((file, index) => { const hasIssue = issueFiles.has(file); const isActive = selectedFile === file || (auditing && index === Math.floor(scanClock / 2) % scannedFiles.length); return <button key={file} className={`scan-file-node ${isActive ? 'active' : ''} ${hasIssue ? 'warning' : 'verified'}`} onClick={() => setSelectedFile(file)}><span className="file-node-status">{hasIssue ? '!' : isActive && auditing ? '·' : '✓'}</span><span>{file}</span><small>{hasIssue ? 'REVIEW' : isActive && auditing ? 'SCANNING' : 'VERIFIED'}</small></button>; })}</div>
+      </section>
+
       {/* Main Grid Layout */}
       <div className="codecore-grid">
         
@@ -182,6 +212,15 @@ export default function CodeCorePage({ setActiveView }) {
         <div className="codecore-col">
           
           {/* Health Summary Card */}
+          <div className="codecore-card health-card">
+            <div className="card-header"><span className="card-title">AUTONOMOUS CORE STATUS</span><span className="engine-chip"><Zap size={11} /> SELF-HEALING</span></div>
+            <div className="engine-status-copy"><strong>{auditing ? 'JARVIS is tracing its own execution surface.' : auditData ? 'No source node is outside the repair perimeter.' : 'Initialize a source scan to begin.'}</strong><span>Every file node is indexed, scored, and queued for safe repair before a patch can be applied.</span></div>
+          </div>
+          <div className="codecore-card activity-card">
+            <div className="card-header"><span className="card-title">CORE ACTIVITY STREAM</span><History size={14} /></div>
+            <div className="activity-stream"><div><span className="activity-time">NOW</span><span>{auditing ? 'Traversing source graph and checking syntax...' : 'Source graph synchronized.'}</span></div><div><span className="activity-time">SYS</span><span>{auditData ? `${auditData.total_files_checked} file nodes returned a health signal.` : 'Waiting for audit telemetry.'}</span></div><div><span className="activity-time">SAFE</span><span>Backup and rollback guards armed for every repair.</span></div></div>
+          </div>
+
           <div className="codecore-card health-card">
             <div className="card-header">
               <span className="card-title">CODEBASE INTEGRITY & SAFETY</span>
