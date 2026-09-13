@@ -52,6 +52,8 @@ export default function CoreSphere({ state = 'idle', agentMode = false }) {
       const color = (agentMode ? AGENT_COLORS : COLORS)[state] || (agentMode ? AGENT_COLORS : COLORS).idle
       const cx = w / 2, cy = h / 2, base = Math.min(w, h) * .36
       const pulse = 1 + smoothed * .24 + Math.sin(t * 4) * smoothed * .025
+      // Keep the outer orbital system inside the canvas while the inner core reacts strongly to voice.
+      const orbitPulse = state === 'listening' ? .88 + smoothed * .1 : pulse
       const rotation = t * (state === 'processing' ? 1.9 : .68) + rotationOffsetRef.current.yaw
       const pitch = rotationOffsetRef.current.pitch + Math.sin(t * .35) * .12
       t += state === 'idle' ? .022 : .04
@@ -91,7 +93,7 @@ export default function CoreSphere({ state = 'idle', agentMode = false }) {
       const drawOrbit = (rx, ry, tilt, phase, alpha, dash = []) => {
         ctx.save(); ctx.rotate(tilt + Math.sin(t * .35 + phase) * .08)
         ctx.scale(1, ry / rx); ctx.rotate(phase)
-        ctx.beginPath(); ctx.arc(0, 0, rx * pulse, 0, TAU)
+        ctx.beginPath(); ctx.arc(0, 0, rx * orbitPulse, 0, TAU)
         ctx.strokeStyle = color; ctx.globalAlpha = alpha + smoothed * .24; ctx.lineWidth = 1.35 + smoothed * 2; ctx.shadowBlur = 10 + smoothed * 16; ctx.shadowColor = color; ctx.setLineDash(dash); ctx.stroke(); ctx.restore()
       }
       drawOrbit(base * 1.27, base * .57, .24, rotation * .36, .38, [3, 8])
