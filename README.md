@@ -159,7 +159,7 @@ Use environment variables or local secret storage instead.
 
 ## Status
 
-JARVIS is under active development. Phase 1 and the Phase 2 architecture are implemented, while Windows end-to-end testing and later-generation features continue to evolve.
+JARVIS is under active development. Architecture are being implemented, while Windows end-to-end testing and later-generation features continue to evolve.
 
 ## License
 
