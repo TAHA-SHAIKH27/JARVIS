@@ -3,8 +3,9 @@ recovery_engine.py — Independent Self-Healing & Crash Recovery Module for J.A.
 ====================================================================================
 STANDALONE ARCHITECTURE:
 - Zero dependency on main.py, agent.py, or any third-party framework (uses only Python standard library).
-- Reads config.json directly for NVIDIA / Gemini credentials.
-- Safe Patch Workflow: Backup -> NVIDIA NIM Diagnostic -> Apply Minimal Patch -> Validate (py_compile) -> Auto-Rollback on failure.
+- Reads config.json directly for Nemotron (NVIDIA NIM) credentials.
+- Safe Patch Workflow: Backup -> Nemotron Diagnostic -> Apply Minimal Patch -> Validate (py_compile) -> Auto-Rollback on failure.
+- NO GEMINI FALLBACK for self-healing. Nemotron failures are logged, retried (limited), then escalated to human.
 """
 
 import os
@@ -26,6 +27,25 @@ PROTECTED_FILES = {
 
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".backup")
 
+# Self-healing configuration (can be overridden by config.json)
+MAX_NEMOTRON_RETRIES = 3
+NEMOTRON_RETRY_BACKOFF = 5  # seconds
+NEED_HUMAN_NOTIFICATION = True
+
+
+def _get_retry_config() -> tuple[int, int]:
+    """Load retry config from config.json with defaults."""
+    config = load_config()
+    max_retries = config.get("nemotron_max_retries", MAX_NEMOTRON_RETRIES)
+    backoff = config.get("nemotron_retry_backoff_seconds", NEMOTRON_RETRY_BACKOFF)
+    try:
+        max_retries = int(max_retries)
+        backoff = int(backoff)
+    except (ValueError, TypeError):
+        max_retries = MAX_NEMOTRON_RETRIES
+        backoff = NEMOTRON_RETRY_BACKOFF
+    return max_retries, backoff
+
 
 def load_config() -> dict:
     """Safely load config.json using standard library only."""
@@ -37,6 +57,130 @@ def load_config() -> dict:
         except Exception as e:
             print(f"[RECOVERY] Warning: Could not read config.json: {e}", file=sys.stderr)
     return {}
+
+
+def log_recovery_event(event_type: str, message: str, details: dict = None):
+    """Structured logging for recovery events with timestamps."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = {
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "message": message,
+        "details": details or {}
+    }
+    log_line = f"[{timestamp}] [RECOVERY:{event_type}] {message}"
+    print(log_line, file=sys.stderr)
+    
+    # Also append to recovery log file
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recovery.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception:
+        pass
+
+
+def call_nemotron(prompt: str, system_prompt: str = "", model: str = None) -> str:
+    """Query Nemotron (via NVIDIA NIM API) using standard urllib.
+    
+    This is the DEDICATED self-healing engine. NO GEMINI FALLBACK.
+    On failure: retry with backoff, log failure, notify human.
+    """
+    config = load_config()
+    api_key = config.get("nvidia_api_key", "").strip() or os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        error_msg = "Nemotron (NVIDIA NIM) API key not configured in config.json. Self-healing cannot proceed."
+        log_recovery_event("NEMOTRON_CONFIG_ERROR", error_msg, {"has_nvidia_key": False})
+        raise RuntimeError(error_msg)
+
+    raw_model = model or config.get("nvidia_model", "")
+    if not raw_model or raw_model in ["meta/llama-3.3-70b-instruct", "qwen/qwen2.5-coder-32b-instruct", "deepseek-ai/deepseek-r1"]:
+        model_name = "z-ai/glm-5.3-flash"
+    else:
+        model_name = raw_model
+
+    # Load retry config from config.json
+    max_retries, backoff = _get_retry_config()
+
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.1,
+        "top_p": 0.7,
+        "max_tokens": 4096
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            log_recovery_event("NEMOTRON_REQUEST", f"Attempt {attempt}/{max_retries}", {"model": model_name})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp_body = resp.read().decode("utf-8")
+                res_json = json.loads(resp_body)
+                choices = res_json.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
+                    if content:
+                        log_recovery_event("NEMOTRON_SUCCESS", f"Nemotron responded successfully on attempt {attempt}")
+                        return content
+                raise RuntimeError("Empty response from Nemotron")
+        except Exception as e:
+            last_error = e
+            log_recovery_event("NEMOTRON_ERROR", f"Attempt {attempt} failed: {str(e)}", {"attempt": attempt, "max_retries": max_retries})
+            if attempt < max_retries:
+                time.sleep(backoff * attempt)  # Exponential backoff
+                continue
+    
+    # All retries exhausted
+    error_msg = f"Nemotron failed after {max_retries} attempts. Last error: {last_error}"
+    log_recovery_event("NEMOTRON_EXHAUSTED", error_msg, {"max_retries": max_retries, "last_error": str(last_error)})
+    
+    if NEED_HUMAN_NOTIFICATION:
+        notify_human_self_healing_failed(error_msg)
+    
+    raise RuntimeError(error_msg)
+
+
+def notify_human_self_healing_failed(error_message: str):
+    """Notify human operator that self-healing could not complete."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    notification = (
+        f"\n{'='*60}\n"
+        f"[HUMAN NOTIFICATION] {timestamp}\n"
+        f"J.A.R.V.I.S. Self-Healing Engine (Nemotron) could not complete recovery.\n"
+        f"Error: {error_message}\n"
+        f"Action Required: Manual intervention needed.\n"
+        f"Check recovery.log and watchdog_crash.log for details.\n"
+        f"{'='*60}\n"
+    )
+    print(notification, file=sys.stderr)
+    
+    # Write to a dedicated notification file for external monitoring
+    try:
+        notify_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_notification.txt")
+        with open(notify_path, "a", encoding="utf-8") as f:
+            f.write(notification + "\n")
+    except Exception:
+        pass
+
+
+# REMOVED: call_gemini_fallback() - Self-healing must NOT fall back to Gemini.
+# Gemini is for NORMAL JARVIS OPERATIONS ONLY.
 
 
 def is_protected(filepath: str) -> bool:
@@ -76,76 +220,6 @@ def restore_backup(backup_path: str, target_path: str) -> bool:
     except Exception as e:
         print(f"[RECOVERY] Error during backup restoration: {e}", file=sys.stderr)
         return False
-
-
-def call_nvidia_nim(prompt: str, system_prompt: str = "", model: str = None) -> str:
-    """Query NVIDIA NIM API (OpenAI-compatible) using standard urllib."""
-    config = load_config()
-    api_key = config.get("nvidia_api_key", "").strip() or os.environ.get("NVIDIA_API_KEY", "").strip()
-    if not api_key:
-        print("[RECOVERY] No NVIDIA API key found; attempting Gemini fallback...", file=sys.stderr)
-        return call_gemini_fallback(prompt, system_prompt)
-
-    model_name = model or config.get("nvidia_model", "meta/llama-3.3-70b-instruct")
-    url = "https://integrate.api.nvidia.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0.1,
-        "top_p": 0.7,
-        "max_tokens": 4096
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            resp_body = resp.read().decode("utf-8")
-            res_json = json.loads(resp_body)
-            return res_json["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[RECOVERY] NVIDIA NIM error: {e}, trying Gemini fallback...", file=sys.stderr)
-        return call_gemini_fallback(prompt, system_prompt)
-
-
-def call_gemini_fallback(prompt: str, system_prompt: str = "") -> str:
-    """Fallback LLM caller using Gemini API when NVIDIA is unavailable."""
-    config = load_config()
-    api_key = config.get("gemini_api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("No NVIDIA or Gemini API key configured in config.json")
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    headers = {"Content-Type": "application/json"}
-    
-    combined = (f"System: {system_prompt}\n\n" if system_prompt else "") + prompt
-    payload = {
-        "contents": [{"parts": [{"text": combined}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096}
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        resp_body = resp.read().decode("utf-8")
-        res_json = json.loads(resp_body)
-        candidates = res_json.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-    return ""
 
 
 def parse_traceback(traceback_text: str) -> dict:
@@ -249,7 +323,7 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
 
     current_error = error_summary
     for attempt in range(1, max_retries + 1):
-        print(f"\n[RECOVERY] Attempt {attempt}/{max_retries} — Querying NVIDIA AI...")
+        print(f"\n[RECOVERY] Attempt {attempt}/{max_retries} — Querying Nemotron (Self-Healing Engine)...")
 
         prompt = (
             f"FILE TO REPAIR: {target_file}\n"
@@ -260,11 +334,13 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
         )
 
         try:
-            llm_response = call_nvidia_nim(prompt, system_prompt)
+            llm_response = call_nemotron(prompt, system_prompt)
             fixed_code = extract_code_from_llm_response(llm_response)
 
             if not fixed_code or len(fixed_code) < 20:
-                print(f"[RECOVERY] Attempt {attempt}: Received invalid/empty response from LLM.")
+                print(f"[RECOVERY] Attempt {attempt}: Received invalid/empty response from Nemotron.")
+                current_error = "Empty or invalid response from Nemotron"
+                time.sleep(1)
                 continue
 
             # Write fixed code
@@ -274,6 +350,7 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
             # Validate
             is_valid, val_msg = validate_python_file(target_file)
             if is_valid:
+                log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated on attempt {attempt}")
                 print(f"[RECOVERY] SUCCESS: File {os.path.basename(target_file)} repaired and validated!")
                 return {
                     "status": "success",
@@ -287,6 +364,17 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
                 current_error = f"Validation py_compile error: {val_msg}"
                 time.sleep(1)
 
+        except RuntimeError as e:
+            # Nemotron exhausted retries - this is a terminal failure for self-healing
+            print(f"\n[RECOVERY] Nemotron self-healing engine unavailable: {e}")
+            log_recovery_event("RECOVERY_NEMOTRON_UNAVAILABLE", str(e))
+            restore_backup(backup_path, target_file)
+            return {
+                "status": "nemotron_unavailable",
+                "file": target_file,
+                "backup": backup_path,
+                "message": f"Nemotron self-healing engine unavailable after retries. Rolled back safely. Human intervention required."
+            }
         except Exception as e:
             print(f"[RECOVERY] Attempt {attempt} error: {e}")
             current_error = str(e)
@@ -294,6 +382,7 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
 
     # If all attempts failed, execute automatic rollback
     print(f"\n[RECOVERY] FAILED: All {max_retries} attempts failed. Rolling back to original state...")
+    log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All {max_retries} repair attempts failed for {os.path.basename(target_file)}")
     restore_backup(backup_path, target_file)
 
     return {
@@ -306,12 +395,13 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--check":
-        print("[RECOVERY] Recovery Engine is operational and ready.")
+        print("[RECOVERY] Recovery Engine (Nemotron Self-Healing) is operational and ready.")
         cfg = load_config()
-        has_nv = bool(cfg.get("nvidia_api_key"))
-        has_gem = bool(cfg.get("gemini_api_key"))
-        print(f"[RECOVERY] NVIDIA NIM configured: {has_nv} (Model: {cfg.get('nvidia_model', 'meta/llama-3.3-70b-instruct')})")
-        print(f"[RECOVERY] Gemini fallback configured: {has_gem}")
+        has_nemotron = bool(cfg.get("nvidia_api_key"))
+        print(f"[RECOVERY] Nemotron (NVIDIA NIM) configured: {has_nemotron} (Model: {cfg.get('nvidia_model', 'z-ai/glm-5.3-flash')})")
+        print(f"[RECOVERY] Gemini fallback for self-healing: DISABLED (by design)")
+        print(f"[RECOVERY] Max Nemotron retries: {MAX_NEMOTRON_RETRIES}")
+        print(f"[RECOVERY] Retry backoff: {NEMOTRON_RETRY_BACKOFF}s (exponential)")
     elif len(sys.argv) > 2 and sys.argv[1] == "--recover":
         log_file = sys.argv[2]
         result = recover_from_crash(log_file)

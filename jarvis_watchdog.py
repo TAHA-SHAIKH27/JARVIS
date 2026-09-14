@@ -4,8 +4,9 @@ jarvis_watchdog.py — Standalone Process Supervisor & Crash Recovery Daemon for
 STANDALONE ARCHITECTURE:
 - Runs as an independent supervisor process wrapping main.py.
 - Zero dependency on FastAPI/Uvicorn — pure standard library.
-- Monitors backend health via process status and HTTP polling on /api/status.
-- On crash: captures stderr/traceback -> invokes recovery_engine.py -> restarts JARVIS.
+- Monitors backend health via process status AND HTTP polling on /api/status.
+- On crash OR unhealthy HTTP state: captures stderr/traceback -> invokes recovery_engine.py -> restarts JARVIS.
+- Prevents infinite restart loops with MAX_CRASH_RECOVERIES limit.
 """
 
 import os
@@ -25,6 +26,10 @@ CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog_c
 MAX_CRASH_RECOVERIES = 3
 HEALTH_CHECK_INTERVAL = 4  # seconds
 HEALTH_CHECK_URL = "http://localhost:8000/api/status"
+# Number of consecutive HTTP health check failures before triggering recovery
+MAX_CONSECUTIVE_HEALTH_FAILURES = 3
+# Grace period after start before health checks count (seconds)
+HEALTH_CHECK_GRACE_PERIOD = 10
 
 
 def log(msg: str):
@@ -44,6 +49,8 @@ class JarvisSupervisor:
         self.process = None
         self.recovery_count = 0
         self.running = True
+        self.consecutive_health_failures = 0
+        self.process_start_time = 0
 
     def start_jarvis(self) -> subprocess.Popen:
         """Launch main.py as a subprocess."""
@@ -61,6 +68,8 @@ class JarvisSupervisor:
             env=env
         )
         log(f"J.A.R.V.I.S. PID: {self.process.pid}")
+        self.process_start_time = time.time()
+        self.consecutive_health_failures = 0
         return self.process
 
     def check_health(self) -> bool:
@@ -69,7 +78,14 @@ class JarvisSupervisor:
             req = urllib.request.Request(HEALTH_CHECK_URL, method="GET")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
-        except Exception:
+        except urllib.error.HTTPError as e:
+            log(f"Health check HTTP error: {e.code}")
+            return False
+        except urllib.error.URLError as e:
+            log(f"Health check URL error: {e.reason}")
+            return False
+        except Exception as e:
+            log(f"Health check unexpected error: {e}")
             return False
 
     def capture_crash_output(self) -> str:
@@ -113,6 +129,43 @@ class JarvisSupervisor:
             log(f"Recovery was unable to safely repair the issue. Error: {result.get('message')}")
             return False
 
+    def handle_unhealthy_backend(self) -> bool:
+        """Handle unhealthy HTTP backend state by terminating process and invoking recovery."""
+        self.recovery_count += 1
+        log(f"UNHEALTHY BACKEND DETECTED! (Incident #{self.recovery_count})")
+        
+        # Terminate the unhealthy process
+        if self.process and self.process.poll() is None:
+            log("Terminating unhealthy backend process...")
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+        
+        # Capture whatever output we can
+        crash_output = self.capture_crash_output()
+        # Write a specific marker for unhealthy state
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n\n=== UNHEALTHY BACKEND DETECTED ===\nConsecutive health check failures: {self.consecutive_health_failures}\n")
+
+        if self.recovery_count > MAX_CRASH_RECOVERIES:
+            log(f"Max recovery limit ({MAX_CRASH_RECOVERIES}) reached. Halting auto-recovery to prevent infinite loops.")
+            log("Please review watchdog_crash.log and fix errors manually.")
+            return False
+
+        log("Invoking Independent Recovery Engine for unhealthy backend...")
+        result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3)
+        log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
+
+        if result.get("status") == "success":
+            log("Recovery succeeded! Restarting J.A.R.V.I.S. backend in 2 seconds...")
+            time.sleep(2)
+            return True
+        else:
+            log(f"Recovery was unable to safely repair the issue. Error: {result.get('message')}")
+            return False
+
     def run(self, test_mode: bool = False):
         """Main supervision loop."""
         log("==================================================")
@@ -144,9 +197,27 @@ class JarvisSupervisor:
 
                 # Check HTTP health
                 is_healthy = self.check_health()
+                elapsed_since_start = time.time() - self.process_start_time
+                
                 if not is_healthy:
-                    # Could still be starting up, give it a moment
-                    pass
+                    self.consecutive_health_failures += 1
+                    log(f"Health check FAILED (consecutive: {self.consecutive_health_failures}/{MAX_CONSECUTIVE_HEALTH_FAILURES})")
+                    
+                    # Only trigger recovery after grace period and consecutive failures
+                    if elapsed_since_start > HEALTH_CHECK_GRACE_PERIOD and self.consecutive_health_failures >= MAX_CONSECUTIVE_HEALTH_FAILURES:
+                        log(f"BACKEND UNHEALTHY: {self.consecutive_health_failures} consecutive health check failures after grace period.")
+                        log("Triggering recovery engine for unhealthy backend state...")
+                        should_restart = self.handle_unhealthy_backend()
+                        if should_restart:
+                            break  # Break inner loop to restart
+                        else:
+                            log("Watchdog standing down due to unrecoverable unhealthy state.")
+                            return
+                else:
+                    # Health check passed - reset counter
+                    if self.consecutive_health_failures > 0:
+                        log(f"Health check RECOVERED (was {self.consecutive_health_failures} consecutive failures)")
+                    self.consecutive_health_failures = 0
 
                 time.sleep(HEALTH_CHECK_INTERVAL)
 

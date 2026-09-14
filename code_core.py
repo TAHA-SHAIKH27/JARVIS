@@ -1,12 +1,18 @@
 """
 code_core.py — Autonomous Code Intelligence & Developer Engine for J.A.R.V.I.S.
-================================================================================
+==============================================================================
 Capabilities:
 - Self-Code Audit (Read-only inspection, zero mutations by default).
-- Minimal Unified Diff Generation via NVIDIA NIM.
+- Minimal Unified Diff Generation via Nemotron (NVIDIA NIM).
 - Safe Patching with Timestamped Backups & Automatic Rollback.
 - Uploaded Code File Inspection, Error-Fixing, and Download Generation.
 - Multi-layer validation (py_compile, AST parse, Vite build check, /api/status).
+
+ARCHITECTURE NOTE:
+- Nemotron (NVIDIA NIM) is the dedicated engine for code analysis/fixing.
+- NO GEMINI FALLBACK for code fixing operations.
+- If Nemotron unavailable, operations return clear error requiring Nemotron config.
+- Gemini remains the engine for NORMAL JARVIS conversation/tasks.
 """
 
 import os
@@ -56,16 +62,64 @@ def is_protected(filepath: str) -> bool:
     return False
 
 
-def call_nvidia_nim(prompt: str, system_prompt: str = "", model: str = None) -> str:
-    """Call NVIDIA NIM API with streaming/OpenAI-compatible protocol."""
+# Nemotron (NVIDIA NIM) configuration for code intelligence (can be overridden by config.json)
+MAX_NEMOTRON_RETRIES = 3
+NEMOTRON_RETRY_BACKOFF = 5  # seconds
+
+
+def _get_codecore_retry_config() -> tuple[int, int]:
+    """Load retry config from config.json with defaults."""
+    config = load_config()
+    max_retries = config.get("nemotron_max_retries", MAX_NEMOTRON_RETRIES)
+    backoff = config.get("nemotron_retry_backoff_seconds", NEMOTRON_RETRY_BACKOFF)
+    try:
+        max_retries = int(max_retries)
+        backoff = int(backoff)
+    except (ValueError, TypeError):
+        max_retries = MAX_NEMOTRON_RETRIES
+        backoff = NEMOTRON_RETRY_BACKOFF
+    return max_retries, backoff
+
+
+def log_codecore_event(event_type: str, message: str, details: dict = None):
+    """Structured logging for code core events."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = {
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "message": message,
+        "details": details or {}
+    }
+    log_line = f"[{timestamp}] [CODE_CORE:{event_type}] {message}"
+    print(log_line, file=sys.stderr)
+    
+    try:
+        log_path = os.path.join(WORKSPACE_ROOT, "code_core.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception:
+        pass
+
+
+def call_nemotron(prompt: str, system_prompt: str = "", model: str = None) -> str:
+    """Call Nemotron (via NVIDIA NIM API) for code intelligence tasks.
+    
+    This is the DEDICATED code analysis/fixing engine. NO GEMINI FALLBACK.
+    On failure: retry with backoff, log failure, raise clear error.
+    """
     config = load_config()
     api_key = config.get("nvidia_api_key", "").strip() or os.environ.get("NVIDIA_API_KEY", "").strip()
-    
     if not api_key:
-        # Fallback to Gemini if no NVIDIA key
-        return call_gemini_fallback(prompt, system_prompt)
+        error_msg = "Nemotron (NVIDIA NIM) API key not configured in config.json. Code intelligence operations require Nemotron."
+        log_codecore_event("NEMOTRON_CONFIG_ERROR", error_msg)
+        raise RuntimeError(error_msg)
 
-    model_name = model or config.get("nvidia_model", "meta/llama-3.3-70b-instruct")
+    raw_model = model or config.get("nvidia_model", "")
+    if not raw_model or raw_model in ["meta/llama-3.3-70b-instruct", "qwen/qwen2.5-coder-32b-instruct", "deepseek-ai/deepseek-r1"]:
+        model_name = "z-ai/glm-5.3-flash"
+    else:
+        model_name = raw_model
+
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -82,49 +136,44 @@ def call_nvidia_nim(prompt: str, system_prompt: str = "", model: str = None) -> 
         "messages": messages,
         "temperature": 0.1,
         "top_p": 0.7,
-        "max_tokens": 8192
+        "max_tokens": 4096
     }
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            resp_body = resp.read().decode("utf-8")
-            res_json = json.loads(resp_body)
-            return res_json["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[CODE_CORE] NVIDIA NIM error: {e}, falling back to Gemini...", file=sys.stderr)
-        return call_gemini_fallback(prompt, system_prompt)
+    # Load retry config from config.json
+    max_retries, backoff = _get_codecore_retry_config()
 
-
-def call_gemini_fallback(prompt: str, system_prompt: str = "") -> str:
-    """Fallback LLM caller using Gemini API."""
-    config = load_config()
-    api_key = config.get("gemini_api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("No NVIDIA or Gemini API key configured in config.json")
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    headers = {"Content-Type": "application/json"}
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            log_codecore_event("NEMOTRON_REQUEST", f"Attempt {attempt}/{max_retries}", {"model": model_name})
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                resp_body = resp.read().decode("utf-8")
+                res_json = json.loads(resp_body)
+                choices = res_json.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
+                    if content:
+                        log_codecore_event("NEMOTRON_SUCCESS", f"Nemotron responded successfully on attempt {attempt}")
+                        return content
+                raise RuntimeError("Empty response from Nemotron")
+        except Exception as e:
+            last_error = e
+            log_codecore_event("NEMOTRON_ERROR", f"Attempt {attempt} failed: {str(e)}", {"attempt": attempt, "max_retries": max_retries})
+            if attempt < max_retries:
+                time.sleep(backoff * attempt)
+                continue
     
-    combined = (f"System: {system_prompt}\n\n" if system_prompt else "") + prompt
-    payload = {
-        "contents": [{"parts": [{"text": combined}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    error_msg = f"Nemotron failed after {max_retries} attempts. Last error: {last_error}"
+    log_codecore_event("NEMOTRON_EXHAUSTED", error_msg, {"max_retries": max_retries, "last_error": str(last_error)})
+    raise RuntimeError(error_msg)
 
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        resp_body = resp.read().decode("utf-8")
-        res_json = json.loads(resp_body)
-        candidates = res_json.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-    return ""
+
+# REMOVED: call_gemini_fallback() - Code intelligence must use Nemotron only.
+# Gemini is for NORMAL JARVIS OPERATIONS (conversation, planning, etc.) ONLY.
 
 
 def create_backup(filepath: str, tag: str = "codecore") -> str:
@@ -304,7 +353,7 @@ def preview_file_fix(filepath: str, issue_description: str = "") -> dict:
         f"Output the complete fixed code inside ```...```."
     )
 
-    llm_response = call_nvidia_nim(prompt, system_prompt)
+    llm_response = call_nemotron(prompt, system_prompt)
     proposed_content = extract_code_block(llm_response)
 
     if not proposed_content or len(proposed_content) < 10:
@@ -398,7 +447,7 @@ def apply_file_fix(filepath: str, proposed_content: str, max_retries: int = 3) -
             f"Please fix the validation error and provide the complete corrected code inside ```...```."
         )
         try:
-            resp = call_nvidia_nim(prompt, "You are a code validation repair engine. Output only corrected code.")
+            resp = call_nemotron(prompt, "You are a code validation repair engine. Output only corrected code.")
             retry_code = extract_code_block(resp)
             if retry_code:
                 with open(full_path, "w", encoding="utf-8") as f:
@@ -453,7 +502,7 @@ def process_uploaded_code_file(filename: str, file_content: str, user_instructio
         f"Please provide your concise bulleted summary of fixes, followed by the complete corrected code inside a single ```...``` block."
     )
 
-    llm_response = call_nvidia_nim(prompt, system_prompt)
+    llm_response = call_nemotron(prompt, system_prompt)
     fixed_code = extract_code_block(llm_response)
 
     if not fixed_code:

@@ -170,7 +170,7 @@ class ConfigModel(BaseModel):
     gemini_project_id: Optional[str] = ""
     groq_api_key: str = ""
     nvidia_api_key: Optional[str] = ""
-    nvidia_model: Optional[str] = "meta/llama-3.3-70b-instruct"
+    nvidia_model: Optional[str] = "z-ai/glm-5.3-flash"
 
 # ── Code Core request models ────────────────────────────────────────────────
 class CodePreviewFixRequest(BaseModel):
@@ -225,7 +225,7 @@ def post_config(req: ConfigModel):
         "gemini_project_id": req.gemini_project_id or "",
         "groq_api_key": req.groq_api_key or "",
         "nvidia_api_key": req.nvidia_api_key or "",
-        "nvidia_model": req.nvidia_model or "meta/llama-3.3-70b-instruct"
+        "nvidia_model": req.nvidia_model or "z-ai/glm-5.3-flash"
     })
     return {"status": "success", "message": "Configuration saved."}
 
