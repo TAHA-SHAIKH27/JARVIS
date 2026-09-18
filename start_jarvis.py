@@ -30,14 +30,10 @@ def check_env():
 
 
 def run_backend():
-    """Run FastAPI backend with uvicorn (no --reload to avoid whisper.cpp file-watch overhead)."""
+    """Run FastAPI backend under Guardian Watchdog supervisor with auto-healing."""
     os.chdir(BACKEND_DIR)
-    cmd = [
-        VENV_PYTHON, "-m", "uvicorn", "main:app",
-        "--host", "127.0.0.1", "--port", "8000",
-        "--workers", "1", "--log-level", "warning",
-    ]
-    print(f"[Start] Starting backend: {' '.join(cmd)}")
+    cmd = [VENV_PYTHON, "jarvis_watchdog.py"]
+    print(f"[Start] Starting backend under Guardian Watchdog: {' '.join(cmd)}")
     return subprocess.Popen(cmd, env=os.environ.copy())
 
 

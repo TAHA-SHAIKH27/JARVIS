@@ -85,6 +85,30 @@ class Browser:
 
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
+    async def _ensure_page(self) -> Page:
+        """Ensure active and non-closed Playwright Page instance, recreating if needed."""
+        try:
+            if not self.playwright or not self.context:
+                await self.start()
+            elif self.page is None or self.page.is_closed():
+                if self.context.pages:
+                    for p in reversed(self.context.pages):
+                        if not p.is_closed():
+                            self.page = p
+                            break
+                    else:
+                        self.page = await self.context.new_page()
+                else:
+                    self.page = await self.context.new_page()
+        except Exception:
+            try:
+                await self.stop()
+            except Exception:
+                pass
+            await self.start()
+
+        return self.page
+
     async def stop(self):
         """Clean up browser resources."""
         if self.page:
@@ -427,6 +451,7 @@ class Browser:
         Strategy 4: JavaScript evaluation to collect all anchor hrefs
         """
         try:
+            await self._ensure_page()
             encoded = urllib.parse.quote_plus(query.strip())
             await self.page.goto(
                 f"{base_url}{encoded}",
@@ -725,7 +750,8 @@ class Browser:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def open(self, url: str = "about:blank", new_tab: bool = False) -> Dict[str, Any]:
-        """Open a URL in the browser."""
+        """Open a URL in the browser with automatic page recovery."""
+        await self._ensure_page()
         try:
             if new_tab and self.context:
                 self.page = await self.context.new_page()
@@ -733,7 +759,17 @@ class Browser:
             title = await self.page.title()
             return {"status": "success", "message": f"Opened {url}", "url": url, "title": title}
         except Exception as e:
-            return {"status": "error", "message": f"Failed to open {url}: {str(e)}"}
+            err_msg = str(e)
+            if "closed" in err_msg.lower() or "crash" in err_msg.lower() or "target" in err_msg.lower():
+                # Recreate page and retry once
+                try:
+                    await self._ensure_page()
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    title = await self.page.title()
+                    return {"status": "success", "message": f"Opened {url} (recovered)", "url": url, "title": title}
+                except Exception as retry_e:
+                    return {"status": "error", "message": f"Failed to open {url}: {str(retry_e)}"}
+            return {"status": "error", "message": f"Failed to open {url}: {err_msg}"}
 
     async def go_to(self, url: str) -> Dict[str, Any]:
         """Navigate to a URL."""
@@ -741,6 +777,7 @@ class Browser:
 
     async def get_page_title(self) -> Dict[str, Any]:
         """Get the current page title."""
+        await self._ensure_page()
         try:
             title = await self.page.title()
             url = self.page.url
@@ -1092,6 +1129,61 @@ class Browser:
             return {"status": "success", "message": f"Screenshot saved: {path}", "path": path}
         except Exception as e:
             return {"status": "error", "message": f"Failed to screenshot: {str(e)}"}
+
+    async def search_images(self, query: str, limit: int = 8) -> List[str]:
+        """Search Bing Images for a query and return candidate direct image URLs.
+
+        Uses a temporary page in the same context so the current research page
+        is never disturbed. Returns [] on any failure (never raises)."""
+        if not self.context:
+            return []
+        page = None
+        try:
+            page = await self.context.new_page()
+            await page.goto(
+                "https://www.bing.com/images/search?q=" + urllib.parse.quote(query),
+                timeout=25000,
+                wait_until="domcontentloaded"
+            )
+            await page.wait_for_timeout(2500)
+            candidates = await page.evaluate("""() => {
+                const out = [];
+                for (const m of document.querySelectorAll('a.iusc')) {
+                    const attr = m.getAttribute('m');
+                    if (!attr) continue;
+                    try {
+                        const obj = JSON.parse(attr.replace(/&quot;/g, '"'));
+                        if (obj && obj.murl) out.push(obj.murl);
+                    } catch(e) {}
+                }
+                if (out.length === 0) {
+                    for (const img of document.querySelectorAll('img.mimg')) {
+                        const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+                        if (src) out.push(src);
+                    }
+                }
+                return out;
+            }""")
+            results = []
+            for u in candidates or []:
+                if not u or not isinstance(u, str):
+                    continue
+                u = u.strip()
+                if u.startswith("data:") or u.startswith("blob:"):
+                    continue
+                if len(u) > 500:
+                    continue
+                if u not in results:
+                    results.append(u)
+            return results[:limit]
+        except Exception:
+            return []
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     async def wait(self, selector: str = None, timeout: int = 5000) -> Dict[str, Any]:
         """Wait for an element or timeout."""

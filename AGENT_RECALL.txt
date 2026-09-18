@@ -1,0 +1,153 @@
+========================================================================
+J.A.R.V.I.S. AGENT RECALL — what has been done
+========================================================================
+Purpose: memory document for future agent sessions. Read first before
+touching Code Core, Nemotron, PowerBI-like word/pptx generation, OCR,
+or research-based document generation.
+
+------------------------------------------------------------------------
+1. CURRENT SESSION — CODE CORE LARGE-FILE SCAN FIX (latest work)
+------------------------------------------------------------------------
+REPORTED BUG (from user): In Code Core, small files scan/fix fine, but
+bigger files (>50,000 chars) never finish - "it tries 3-4 attempts then
+nothing happens".
+
+DIAGNOSIS (measured, live):
+- Code Core UI = src/CodeCorePage.jsx. "SELF-AUDIT CODEBASE" calls
+  POST /api/code/audit -> code_core.audit_codebase() (LOCAL static scan,
+  works for any size - only checks 7 root .py + 5 src .jsx files).
+- The Nemotron path (preview-fix per issue, or upload "ANALYZE & FIX"):
+  - preview_file_fix() routes files > LARGE_FILE_SINGLE_SHOT_LIMIT
+    (50000 chars) to _repair_large_file_segments().
+  - Each segment prompt was 40,000 chars (~12-15K tokens).
+- NVIDIA NIM free-tier latency measured on 2026-09-14:
+    z-ai/glm-5.3-flash              trivial prompt  ~12-19s (stream OK)
+    deepseek-ai/deepseek-v4-flash-0731  trivial prompt  ~100.6s (queued)
+    deepseek-ai/deepseek-coder-6.7b-instruct  -> HTTP 404 (not servable)
+- 40K-char segment prompts effectively NEVER return on this NIM tier:
+  glm-5.3 also streamed nothing for >11 minutes on an agent.py segment.
+  Old deepseek config produced gateway 504 / "Empty response" after the
+  same size idle (log history in code_core.log).
+- config.json: nvidia_api_key set, nemotron_max_retries=5,
+  nemotron_request_timeout_seconds=390, deadline = timeout*2 (780s).
+
+FIX APPLIED:
+1. config.json            -> "nvidia_model": "z-ai/glm-5.3-flash"
+   (was deepseek-ai/deepseek-v4-flash-0731). Verified live: call_nemotron
+   returned "OK123" in 17.3s streaming. GLM is also the model code already
+   falls back to for llama/qwen/deepseek-r1 identities.
+2. code_core.py           -> LARGE_FILE_SEGMENT_TARGET 40000 -> 12000
+   (LARGE_FILE_SEGMENT_MIN 12000 -> 6000 for coherence; it is unused in
+   _split_large_file_segments). Rationale: only SMALL prompts answer fast
+   on free tier; segment repair must keep every prompt small.
+   Verified segmentation: main.py -> 5 segs (max 11,992 ch),
+   agent.py -> 7 segs (max 11,999 ch); reassembly == original for both.
+
+NOT YET VERIFIED (be honest): a FULL end-to-end large-file scan
+(preview_file_fix on main.py / agent.py) was attempted twice but NEVER
+completed - first run killed by tool timeout at 700s (40K segments,
+old size), second run manually aborted by the user at ~60-90s with the
+new 12K segments. Do NOT claim big-file scanning works until an
+end-to-end preview_file_fix('main.py'|'agent.py') returns a success
+status. Next session: run it with patched timeout (300s) + retries(2,12)
+and confirm; note code_core.log NEMOTRON_SUCCESS per segment.
+
+------------------------------------------------------------------------
+2. PRIOR SESSION — RESEARCH→ANALYSIS→GENERATE INTELLIGENCE UPGRADES
+------------------------------------------------------------------------
+Requirements framing: EXTRACTION != ANALYSIS; SCRAPING != RESEARCH.
+Word/PPT must be built from ANALYZED info. PPT images online-first,
+HF generation only as fallback, never random. CAPTCHA: stop + inform +
+resume (already existed - observer.verify_browser_page ->
+human_required pause, core.py human_intervention_required, resume).
+Honest verification: never claim FIXED without a real test.
+
+Applied (verified unless noted):
+- backend/tools/vision.py      : added text_from_image_sync + shared
+  _ocr_sync (async text_from_image delegates). Model fallback chain
+  gemini-2.5-flash -> 2.0-flash -> 1.5-flash. Also FIXED latent bug:
+  json / urllib.request were never imported at module top (original
+  method would crash). Verified live: OCR returned real text from a
+  matplotlib-rendered image via document_intel.extract_text.
+- document_intel.py            : .png/.jpg/.jpeg uploads now accepted
+  (SUPPORTED_EXTENSIONS extended); scanned/image-only PDFs fall back to
+  Gemini OCR (result prefixed "[OCR of scanned PDF]"/"[OCR of image]").
+- backend/agent/research_synthesizer.py: added synthesize_presentation
+  (LLM JSON: 7-12 slides, concise <=8-word bullets, chart only for real
+  numeric comparison, image_subject on max 2 slides) + rule-based
+  fallback _rule_based_presentation_synthesis.
+- backend/tools/browser.py     : added search_images() (Bing Images on a
+  TEMP page so the research page is undisturbed; returns image URLs;
+  never raises). NOT runtime-verified (needs visible Chrome session).
+- backend/agent/executor.py    : _create_pptx rewritten to synthesize
+  deck from research state (dedupe -> analyze_source per source ->
+  compare_sources -> synthesize_presentation); helpers _prepare_slides,
+  _synthesize_deck, _acquire_slide_images (image_url -> search_images ->
+  HF generation fallback; only for slides that ask for an image),
+  _download_image_url (requests; webp -> PNG via Pillow), _load_hf_key.
+  Verified: slides synthesis (1 resilient slide layout, 6 slides with
+  image_subject on cover) + real PNG download + HF generation fallback.
+- backend/tools/office.py      : _build_pptx_slide places image_path in
+  the right slot; priority table > chart > image (overlap guards).
+  Verified pptx smoke (image + chart + table slides, 72KB file).
+- backend/agent/planner.py     : create_pptx template now emphasizes
+  concise analysis-based bullets + optional image_subject/image_url.
+- Frontend untouched last phase; npm run build passes.
+
+------------------------------------------------------------------------
+3. PRIOR PHASE (before the above) — WORD/PPT + FILES GALLERY (VERIFIED)
+------------------------------------------------------------------------
+- backend/tools/charts.py      : chart renderer (bar/pie/line/area) via
+  matplotlib, graph file + legend (84KB PNG). Verified image embedding.
+- backend/tools/office.py      : create_docx upgrades - chart embedding,
+  markdown tables, styled/shaded header rows, striped rows. create_pptx
+  slide chart/table support. PptRGBColor import localized inside
+  _build_pptx_slide.
+- system_ops.py                : create_word_document parses headings,
+  bullets, markdown tables, [CHART:type] blocks; archive_document_artifact
+  converts title to filename, save+copy; document saved under
+  work_files/documents -> visible in FILES gallery.
+- backend/agent/executor.py    : create_pptx dispatch; _create_docx
+  archives artifact too.
+- main.py                      : gallery document extensions + MIME types
+  for /api/files/serve (docx/pptx registry image MIME now covered);
+  /api/document/extract + /api/document/stream (existing).
+- src/GalleryPage.jsx + src/index.css: document cards in FILES gallery.
+- All verified: py_compile, import main, vite build, docx with
+  table+chart smoke, pptx smoke, /api/gallery JSON.
+
+Phase 3 earlier: startup self-audit + Nemotron fast-fail/504 hardening
+(deadline = timeout*2, non-retryable 4xx/5xx break immediately,
+429 retry) - already in place and working.
+
+------------------------------------------------------------------------
+4. ENVIRONMENT / FACTS TO REMEMBER
+------------------------------------------------------------------------
+- Root: C:\Users\taha\OneDrive\Desktop\J.A.R.V.I.S. (Claude)  (OneDrive)
+- Never commit changes. Leave pre-existing uncommitted changes alone:
+  recovery_engine.py edits, RECALL.txt deletion, code_core.py layered
+  edits (recovery layering). Do NOT touch Android/ADB/scrcpy/phone
+  mirroring/phone UI/phone gallery, watchdog/self-healing.
+- Engineering rules: smallest targeted changes; no rewrites/duplication;
+  classify findings (CRITICAL BUG / FUNCTIONAL BUG / LOGIC BUG /
+  PERFORMANCE ISSUE / OPTIONAL / STYLE); state "implemented but not
+  runtime-verified" when anything was not actually tested.
+- NVIDIA NIM (code_core.py): key nvidia_api_key; endpoint
+  https://integrate.api.nvidia.com/v1/chat/completions ; stream=True;
+  max output tokens 16384 in config; catalog check endpoint
+  GET https://integrate.api.nvidia.com/v1/models (81 models listed).
+  REMEMBER: only z-ai/glm-5.3-flash is reliable/fast on this tier.
+- Gemini OCR/vision: backend/tools/vision.py uses load_config() ->
+  gemini_api_key (API-key path only, not OAuth). Uses inline_data
+  (image/png, image/jpeg, application/pdf).
+- HF image gen: agent.generate_image_huggingface(prompt, hf_key,
+  save_name) -> dict(status, filename) under work_files/images; key read
+  from config.json "huggingface_api_key".
+- Office.create_pptx slide keys: title, bullets, table, chart,
+  image_path, notes. create_pptx default save: work_files/documents.
+- Data streams: python backend on 127.0.0.1:8000; vite dev on :5173.
+- Workflow ordering for a work session: inspect -> classify -> read the
+  relevant function/file -> smallest edit -> py_compile -> import main ->
+  npm run build (only if frontend touched) -> live smoke test -> update
+  this recall file.
+========================================================================

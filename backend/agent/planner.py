@@ -45,7 +45,8 @@ AVAILABLE ACTION TYPES AND THEIR PARAMETERS:
 {"type": "create_folder_verified", "path": "C:/Users/username/Desktop/FOLDER_NAME", "description": "Create folder on Desktop", "expected_outcome": "Folder exists at the specified path", "required_context_keys": []}
 {"type": "write_file_verified",    "path": "C:/full/path/file.txt", "content": "text", "description": "Create file", "expected_outcome": "File exists with the correct content", "required_context_keys": []}
 {"type": "verify_file",           "path": "C:/full/path/file.txt", "description": "Verify file/folder exists", "expected_outcome": "File presence is confirmed", "required_context_keys": []}
-{"type": "create_docx",           "path": "C:/full/path/doc.docx", "title": "Title", "content": "body text with sources", "headings": ["Heading 1", "Heading 2"], "description": "Create Word document", "expected_outcome": "Word document is created", "required_context_keys": []}
+{"type": "create_docx",           "path": "C:/full/path/doc.docx", "title": "Title", "content": "body text with sources, markdown tables (| a | b |) and optional [CHART:bar] Title / label: value blocks are supported", "headings": ["Heading 1", "Heading 2"], "description": "Create Word document", "expected_outcome": "Word document is created", "required_context_keys": []}
+{"type": "create_pptx",           "path": "C:/full/path/deck.pptx", "title": "Deck Title", "slides": [{"title": "Slide 1 Title", "bullets": ["Point one", "Point two"], "table": [["Header", "Value"], ["A", "1"]], "chart": {"type": "bar", "title": "Chart", "labels": ["Jan", "Feb"], "values": [30, 60]}, "image_subject": "topic-specific visual subject (only where a picture genuinely supports the slide, max 2 slides)", "image_url": "https://.../relevant.jpg", "notes": "Speaker notes"}], "description": "Create PowerPoint presentation. Bullets must be concise (max 8 words each) - slides are never dumps of scraped webpage text. When the task involves research, JARVIS builds the deck from the analyzed findings automatically.", "expected_outcome": "PowerPoint presentation is created", "required_context_keys": []}
 
 // Browser (uses visible Playwright Chromium, headless=False)
 // browser_search automatically extracts and stores results in state.search_results
@@ -126,37 +127,83 @@ Output:
 }"""
 
 
-def _load_config_gemini_api_key() -> str:
-    """Load Gemini API key from config.json or environment."""
+def _load_all_llm_configs() -> dict:
+    """Load all API keys and model configurations from config.json and environment."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(base_dir, "config.json"),
         os.path.join(base_dir, "..", "config.json"),
         os.path.join(base_dir, "..", "..", "config.json"),
+        os.path.join(base_dir, "..", "..", "..", "config.json"),
         os.path.join(os.getcwd(), "config.json")
     ]
+    cfg = {}
     for cfg_path in candidates:
         resolved = os.path.abspath(cfg_path)
         if os.path.isfile(resolved):
             try:
                 with open(resolved, "r", encoding="utf-8") as f:
-                    key = json.load(f).get("gemini_api_key", "")
-                    if key:
-                        return key
+                    cfg = json.load(f)
+                    if cfg:
+                        break
             except Exception:
                 pass
-    return os.environ.get("GEMINI_API_KEY", "")
+
+    return {
+        "gemini_api_key": cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", ""),
+        "nvidia_api_key": cfg.get("nvidia_api_key") or os.environ.get("NVIDIA_API_KEY", ""),
+        "nvidia_model": cfg.get("nvidia_model") or "meta/llama-3.3-70b-instruct",
+        "groq_api_key": cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY", ""),
+        "openai_api_key": cfg.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", ""),
+    }
+
+
+def _load_config_gemini_api_key() -> str:
+    """Load Gemini API key from config.json or environment."""
+    return _load_all_llm_configs().get("gemini_api_key", "")
+
+
+def _clean_json_response(text: str) -> Optional[Any]:
+    """Strip markdown formatting and parse JSON."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    # If wrapped in extra text, try finding JSON bracket array or object
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    arr_match = re.search(r"\[\s*\{.*\}\s*\]", cleaned, re.DOTALL)
+    if arr_match:
+        try:
+            return json.loads(arr_match.group(0))
+        except Exception:
+            pass
+
+    obj_match = re.search(r"\{\s*\".*\"\s*:.*\}", cleaned, re.DOTALL)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(0))
+        except Exception:
+            pass
+
+    return None
 
 
 def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Optional[List[Dict[str, Any]]]:
-    """Call the Gemini API to get a structured action plan."""
+    """Call LLM (Gemini, NVIDIA NIM, Groq, or OpenAI) to get a structured action plan."""
     import urllib.request
     import urllib.error
     import google_oauth
 
+    configs = _load_all_llm_configs()
     if not api_key:
-        api_key = _load_config_gemini_api_key()
+        api_key = configs.get("gemini_api_key", "")
 
+    # 1. Try Gemini API / Google OAuth
     use_oauth = google_oauth.is_authenticated()
     access_token = ""
     if use_oauth:
@@ -164,65 +211,107 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
         if not access_token:
             use_oauth = False
 
-    if not use_oauth and not api_key:
-        return None
+    if use_oauth or (api_key and not api_key.startswith("AQ.")):
+        models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        base_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
 
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    base_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
-
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": f"Task: {task}"}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 4096,
+        payload = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": f"Task: {task}"}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 4096,
+            }
         }
-    }
 
-    headers = {"Content-Type": "application/json"}
-    if use_oauth:
-        headers["Authorization"] = f"Bearer {access_token}"
+        headers = {"Content-Type": "application/json"}
+        if use_oauth:
+            headers["Authorization"] = f"Bearer {access_token}"
 
-    for model in models:
-        try:
-            url = base_url.replace("__MODEL__", model)
-            if not use_oauth:
-                url += f"?key={api_key}"
+        for model in models:
+            try:
+                url = base_url.replace("__MODEL__", model)
+                if not use_oauth:
+                    url += f"?key={api_key}"
 
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
-            text = (
-                data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-            )
-            if not text:
+                text = (
+                    data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                )
+                parsed = _clean_json_response(text)
+                if isinstance(parsed, list):
+                    return parsed
+                elif isinstance(parsed, dict) and "plan" in parsed:
+                    return parsed["plan"]
+            except Exception:
                 continue
 
-            # Strip markdown fences if any
-            text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-            text = re.sub(r"\s*```$", "", text.strip())
+    # 2. Try NVIDIA NIM / Groq / OpenAI compatible endpoints if available
+    nv_key = configs.get("nvidia_api_key") or configs.get("groq_api_key")
+    if nv_key:
+        endpoints = []
+        if nv_key.startswith("nvapi-") or "nvidia" in configs.get("nvidia_model", ""):
+            endpoints.append({
+                "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+                "key": nv_key,
+                "model": configs.get("nvidia_model") or "meta/llama-3.3-70b-instruct"
+            })
+        if configs.get("groq_api_key") and configs.get("groq_api_key").startswith("gsk_"):
+            endpoints.append({
+                "url": "https://api.groq.com/openai/v1/chat/completions",
+                "key": configs.get("groq_api_key"),
+                "model": "llama-3.3-70b-versatile"
+            })
 
-            actions = json.loads(text)
-            if isinstance(actions, list):
-                return actions
+        for ep in endpoints:
+            try:
+                payload = {
+                    "model": ep["model"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Task: {task}"}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 4096
+                }
+                headers = {
+                    "Authorization": f"Bearer {ep['key']}",
+                    "Content-Type": "application/json"
+                }
+                req = urllib.request.Request(
+                    ep["url"],
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
-        except (urllib.error.HTTPError, json.JSONDecodeError, Exception):
-            continue
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                parsed = _clean_json_response(content)
+                if isinstance(parsed, list):
+                    return parsed
+                elif isinstance(parsed, dict) and "plan" in parsed:
+                    return parsed["plan"]
+            except Exception:
+                continue
 
     return None
 
 
 def _resolve_desktop_path(path: str) -> str:
     """Replace placeholder desktop path with the actual one."""
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    from system_ops import get_desktop_path
+    desktop = get_desktop_path()
     path = path.replace("C:/Users/user/Desktop", desktop)
     path = path.replace("C:\\Users\\user\\Desktop", desktop)
     # Handle any generic user placeholder
@@ -230,11 +319,153 @@ def _resolve_desktop_path(path: str) -> str:
     return path
 
 
+def _extract_research_parameters(task: str) -> Dict[str, Any]:
+    """
+    Intelligently extract the research topic, target artifact format,
+    number of websites/sources (M), exact slide/section count (N),
+    and specific target domain from natural language user tasks.
+
+    STRICT DISAMBIGUATION:
+      N = slide / section / page count  -> matched ONLY against slide/section/page keywords
+      M = source / website count        -> matched ONLY against website/source/article keywords
+      They are parsed INDEPENDENTLY so they can NEVER be mixed up.
+    """
+    task_clean = task.strip()
+    task_lower = task_clean.lower()
+
+    word_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+    # ── M: Source / Website Count (ONLY website/source/article keywords) ──────
+    num_sources = 3
+    src_num_match = re.search(r"\b(\d+)\s+(?:websites?|sources?|sites?|links?|articles?)\b", task_lower)
+    src_word_match = re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:websites?|sources?|sites?|links?|articles?)\b", task_lower)
+    if src_num_match:
+        num_sources = max(1, min(8, int(src_num_match.group(1))))
+    elif src_word_match:
+        num_sources = max(1, min(8, word_map.get(src_word_match.group(1), 3)))
+
+    # 2. Output format
+    has_pres_kw = bool(re.search(r"\b(powerpoint|pptx|presentation|slide\s*deck|slides|ppt)\b", task_lower))
+    has_doc_kw = bool(re.search(r"\b(word|docx|document|doc|report)\b", task_lower))
+
+    # 3. Topic extraction
+    topic = ""
+
+    # Pattern 1: Explicit topic/subject markers: "topic [is/of/on/:/about] <topic>"
+    m = re.search(r"\b(?:topic|subject)(?:\s+(?:is|of|on|about)|:)?\s+([a-zA-Z0-9_\s\-\'\"]+?)(?:\s+(?:gather|collect|extract|find|from|and|with|into|using|on\s+desktop|save|\d+\s+web|\d+\s+source)|$)", task_lower)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate) >= 3:
+            topic = candidate
+
+    # Pattern 2: "on [the] <topic>" / "about [the] <topic>"
+    if not topic:
+        m = re.search(r"\b(?:about|on|regarding|concerning)\s+(?:the\s+)?([a-zA-Z0-9_\s\-\'\"]+?)(?:\s+(?:gather|collect|extract|find|from|and|with|into|using|in\s+\d+|save|\d+\s+web|\d+\s+source)|$)", task_lower)
+        if m:
+            candidate = m.group(1).strip()
+            if len(candidate) >= 3:
+                topic = candidate
+
+    # Pattern 3: "create/make/generate a [ppt/doc] on/about/for <topic>"
+    if not topic:
+        m = re.search(r"\b(?:create|make|generate|build|prepare)\s+(?:a\s+)?(?:ppt|pptx|presentation|slides?|word\s+doc(?:ument)?|docx|document|report|file)\s+(?:on|about|for|of)?\s*(?!(?:from|on|at|to|for|of|and|with)\b)\s*([a-zA-Z][a-zA-Z0-9_\s\-\'\"]*?)(?:\s+(?:gather|collect|extract|and|with|using|\d+\s+web|\d+\s+source)|$)", task_lower)
+        if m:
+            candidate = m.group(1).strip()
+            if len(candidate) >= 3:
+                topic = candidate
+
+    # Pattern 4: "research/search/gather info on/about <topic>"
+    if not topic:
+        m = re.search(r"\b(?:research|search(?:\s+for)?|gather\s+info(?:\s+on|\s+about)?|find\s+info(?:\s+on|\s+about)?|look\s+up)\s+(?:about|on|for)?\s*(?!(?:from|on|at|to|for|of|and|with)\b)\s*([a-zA-Z][a-zA-Z0-9_\s\-\'\"]*?)(?:\s+(?:and|into|to\s+create|make|with|\d+\s+web|\d+\s+source)|$)", task_lower)
+        if m:
+            candidate = m.group(1).strip()
+            if len(candidate) >= 3:
+                topic = candidate
+
+    # Fallback to whole task if still empty
+    if not topic:
+        topic = task_clean
+
+    # Clean noise prefixes & suffixes from the extracted topic
+    noise_prefixes = [
+        r"^(?:the\s+)?(?:topic|subject)(?:\s+(?:is|of|on|about)|:)?\s*",
+        r"^(?:about|on|for|of|regarding|concerning|the|some|details\s+about|info\s+on)\s+",
+        r"^(?:create|make|generate|build|write|prepare)\s+(?:a\s+)?(?:ppt|pptx|presentation|slides?|word\s+doc(?:ument)?|docx|document|report|file)\s+(?:on|about|for|of)?\s*",
+        r"^(?:research|search(?:\s+for)?|gather\s+info(?:\s+on|\s+about)?|find\s+info(?:\s+on|\s+about)?|look\s+up)\s+",
+    ]
+    for np in noise_prefixes:
+        topic = re.sub(np, "", topic, flags=re.I).strip()
+
+    noise_suffixes = [
+        r"\s+(?:gather|collect|extract|find)\s+info(?:rmation)?.*$",
+        r"\s+(?:from|using|with|via|across)\s+\d+.*$",
+        r"\s+(?:from|using|with|via|across)\s+(?:multiple|several|various|different|one|two|three|four|five|six|seven|eight|nine|ten)\s+.*$",
+        r"\s+(?:from|using|with|via|across)\s+(?:websites?|sources?|pages?|sites?|articles?|links?).*$",
+        r"\s+(?:and\s+)?(?:make|create|generate|save|build|write|prepare)\s+(?:a\s+)?(?:ppt|pptx|presentation|slides?|word\s+doc(?:ument)?|docx|document|report|file).*$",
+        r"\s+into\s+(?:a\s+)?(?:ppt|pptx|presentation|slides?|word\s+doc(?:ument)?|docx|document|report|file).*$",
+        r"\s+(?:on|to)\s+desktop.*$",
+        r"\b\d+\s+(?:websites?|sources?|pages?|sites?)\b.*$",
+        r"\s+(?:from|using|with|via|in|on|at|by|for|about|of)$",
+    ]
+    for ns in noise_suffixes:
+        topic = re.sub(ns, "", topic, flags=re.I).strip()
+
+    topic = re.sub(r"\s+(?:from|using|with|via|in|on|at|by|for|about|of)$", "", topic, flags=re.I).strip()
+    topic = topic.strip(" \t\n\r\"'.,;:?!-_")
+
+    # Guard against empty/trivial topics like single verbs or prepositions
+    invalid_topics = {"create", "make", "generate", "build", "ppt", "pptx", "presentation",
+                      "document", "word", "report", "file", "search", "research", "from",
+                      "on", "about", "for", "the", "a", "an", "of", "and", "to", "in", "with"}
+    if not topic or len(topic) < 3 or topic.lower() in invalid_topics:
+        topic = "Research Topic"
+
+    # ── N: Slide / Section / Page Count (ONLY slide/section/page keywords) ────
+    target_slides = None
+    slide_num_match = re.search(r"\b(\d+)\s*(?:slides?|sections?|pages?)\b", task_lower)
+    slide_word_match = re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:slides?|sections?|pages?)\b", task_lower)
+    if slide_num_match:
+        target_slides = max(1, min(20, int(slide_num_match.group(1))))
+    elif slide_word_match:
+        target_slides = max(1, min(20, word_map.get(slide_word_match.group(1), 8)))
+
+    # ── Target Domain: specific website restriction ───────────────────────────
+    target_domain = None
+    url_domain_match = re.search(r"(?:from|on|using|via)\s+(?:https?://)?([a-zA-Z0-9\-]+(?:\.[a-zA-Z]{2,})+)", task_lower)
+    if url_domain_match:
+        target_domain = url_domain_match.group(1).strip()
+    else:
+        known_sites = {
+            "wikipedia": "wikipedia.org", "wiki": "wikipedia.org",
+            "nasa": "nasa.gov", "bbc": "bbc.com", "cnn": "cnn.com",
+            "britannica": "britannica.com", "imdb": "imdb.com",
+            "youtube": "youtube.com", "github": "github.com",
+            "stackoverflow": "stackoverflow.com", "nytimes": "nytimes.com",
+            "reuters": "reuters.com", "nationalgeographic": "nationalgeographic.com",
+            "nature": "nature.com", "sciencedirect": "sciencedirect.com",
+        }
+        for kw, domain in known_sites.items():
+            if re.search(rf"\b{re.escape(kw)}\b", task_lower):
+                target_domain = domain
+                break
+
+    return {
+        "topic": topic,
+        "num_sources": num_sources,        # M: website/source count (strictly separate)
+        "target_slides": target_slides,    # N: slide/section count  (strictly separate)
+        "target_domain": target_domain,    # specific website restriction (if any)
+        "is_presentation": has_pres_kw and not has_doc_kw,
+        "is_document": has_doc_kw or not has_pres_kw,
+    }
+
+
 def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
-    """Simple rule-based fallback when no API key is available."""
+    """Deterministic, robust fallback plan generator."""
     task_lower = task.lower().strip()
     actions = []
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    from system_ops import get_desktop_path
+    desktop = get_desktop_path()
 
     # An explicit URL is an instruction to navigate, never a search query.
     url_match = re.search(r"https?://[^\s\]\[\),]+", task, re.I)
@@ -246,8 +477,6 @@ def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
         actions = [
             {"type": "browser_navigate", "url": url, "description": f"Open {url}"},
         ]
-        # Follow a named site section when it maps to a stable, accessible link.
-        # The click itself is observed and verified by the browser layer.
         if "download" in question.lower():
             actions.append({
                 "type": "browser_click", "selector": "a:has-text('Downloads')",
@@ -278,46 +507,56 @@ def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
                 {"type": "speak", "text": f"Clicked {target}, sir.", "description": "Done"},
             ]
 
-    # 1. Research + Word Document / Docx / File creation
+    # 1. Research + Word Document / Docx / PowerPoint creation
     elif not actions:
-        has_research_kw = any(k in task_lower for k in ["research", "search", "extract", "gather", "find", "collect", "browse", "website", "websites"])
+        has_research_kw = any(k in task_lower for k in ["research", "search", "extract", "gather", "find", "collect", "browse", "website", "websites", "topic", "information"])
         has_doc_kw = any(k in task_lower for k in ["word", "docx", "document", "doc", "file", "report"])
+        has_pres_kw = any(k in task_lower for k in ["powerpoint", "pptx", "presentation", "slide deck", "slides", "ppt"])
 
-        if has_research_kw and has_doc_kw:
-            # Extract topic
-            topic = task
-            for pattern in [
-                r"(?:open\s+(?:chrome|browser|google)(?:\s+and)?\s+)?(?:research|extract|gather|find|search|collect|look\s+up)\s+(?:info(?:rmation)?\s+)?(?:about|on|for|fr|from)?\s*(.+?)\s+(?:and\s+(?:make|create|save|generate)|into|to|make|create|save|generate)",
-                r"(?:research|search|extract|find)\s+(?:about|on|for|fr|from)?\s*(.+?)\s+(?:from|into|and|\s+create|\s+make)",
-            ]:
-                m = re.search(pattern, task_lower)
-                if m:
-                    topic = m.group(1).strip()
-                    break
-
-            # Clean topic noise
-            topic = re.sub(r"^(?:for|fr|about|on|the|info\s+on|details\s+about|some)\s+", "", topic, flags=re.I).strip()
-            topic = re.sub(r"\b(3|three|multiple|several|\d+)\s+(websites?|sources?|pages?|sites?)\b", "", topic, flags=re.I)
-            topic = re.sub(r"\b(make|create|write|save|generate|into|a|in|the)\s+(word|docx|document|doc|file|report)\b.*$", "", topic, flags=re.I).strip()
-            topic = re.sub(r"^(?:for|fr|about|on|the)\s+", "", topic, flags=re.I).strip()
-            if not topic or len(topic) < 3:
-                topic = "Science Day" if "science" in task_lower else "Research Topic"
-
+        if (has_research_kw and (has_doc_kw or has_pres_kw)) or has_doc_kw or has_pres_kw:
+            params = _extract_research_parameters(task)
+            topic = params["topic"]
+            num_sources = params["num_sources"]          # M: source count
+            target_slides = params["target_slides"]      # N: slide/section count
+            target_domain = params["target_domain"]      # specific website if mentioned
             safe_topic = re.sub(r'[^\w\-_]', '_', topic)
-            docx_path = os.path.join(desktop, f"{safe_topic}_report.docx")
 
-            actions = [
-                {"type": "browser_search", "query": topic, "description": f"Search web for {topic}"},
-                {"type": "browser_navigate", "source_index": 0, "description": "Visit source 1"},
-                {"type": "browser_extract", "description": "Extract content from source 1"},
-                {"type": "browser_navigate", "source_index": 1, "description": "Visit source 2"},
-                {"type": "browser_extract", "description": "Extract content from source 2"},
-                {"type": "browser_navigate", "source_index": 2, "description": "Visit source 3"},
-                {"type": "browser_extract", "description": "Extract content from source 3"},
-                {"type": "create_docx", "path": docx_path, "title": f"Research Report: {topic.title()}", "content": "", "headings": ["Executive Summary", "Introduction & Background", "Key Findings & Thematic Analysis", "Detailed Source Insights", "Cross-Source Comparative Analysis", "Conclusion & Implications", "References & Verified Sources"], "description": f"Generate Word Document: {safe_topic}_report.docx"},
-                {"type": "verify_file", "path": docx_path, "description": "Verify Word document created"},
-                {"type": "speak", "text": f"Research on '{topic}' complete, sir. Word document saved to Desktop.", "description": "Done"}
-            ]
+            # Build search query — if user wants a specific domain, restrict to it
+            search_query = f"site:{target_domain} {topic}" if target_domain else topic
+
+            # Build EXACTLY M source navigation + extraction steps
+            browser_steps = [{"type": "browser_search", "query": search_query, "description": f"Search web for {topic}"}]
+            for i in range(num_sources):
+                nav_desc = f"Visit source {i + 1}" + (f" on {target_domain}" if target_domain else "")
+                browser_steps.append({"type": "browser_navigate", "source_index": i, "description": nav_desc})
+                browser_steps.append({"type": "browser_extract", "description": f"Extract content from source {i + 1}"})
+
+            if params["is_presentation"]:
+                deck_path = os.path.join(desktop, f"{safe_topic}_presentation.pptx")
+                slide_note = f" ({target_slides} slides)" if target_slides else ""
+                actions = browser_steps + [
+                    {"type": "create_pptx", "path": deck_path, "title": f"Presentation: {topic.title()}",
+                     "target_slides": target_slides, "target_domain": target_domain,
+                     "description": f"Generate PowerPoint{slide_note}: {safe_topic}_presentation.pptx",
+                     "slides": [{"title": topic.title(), "bullets": ["Research findings synthesized automatically from extracted sources."]}],
+                     "notes": "Generated by J.A.R.V.I.S. Agentic System"},
+                    {"type": "verify_file", "path": deck_path, "description": "Verify presentation created"},
+                    {"type": "speak", "text": f"Research on '{topic}' complete across {num_sources} sources, sir. Presentation saved to Desktop.", "description": "Done"}
+                ]
+            else:
+                docx_path = os.path.join(desktop, f"{safe_topic}_report.docx")
+                section_note = f" ({target_slides} sections)" if target_slides else ""
+                actions = browser_steps + [
+                    {"type": "create_docx", "path": docx_path, "title": f"Research Report: {topic.title()}",
+                     "target_sections": target_slides, "target_domain": target_domain,
+                     "content": "",
+                     "headings": ["Executive Summary", "Introduction & Background", "Key Findings & Thematic Analysis",
+                                  "Detailed Source Insights", "Cross-Source Comparative Analysis",
+                                  "Conclusion & Implications", "References & Verified Sources"],
+                     "description": f"Generate Word Document{section_note}: {safe_topic}_report.docx"},
+                    {"type": "verify_file", "path": docx_path, "description": "Verify Word document created"},
+                    {"type": "speak", "text": f"Research on '{topic}' complete across {num_sources} sources, sir. Word document saved to Desktop.", "description": "Done"}
+                ]
         else:
             actions = _rule_based_non_research(task, task_lower, desktop)
 
@@ -427,6 +666,9 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
             for j in range(i):
                 if specs[j].type == "browser_extract":
                     depends_on.append(j)
+        elif atype == "create_pptx":
+            consumes = ["extracted_sources"]
+            produces = ["created_presentation_path"]
         elif atype == "calculator_compute":
             produces = ["collected_numbers"]
         elif atype == "open_app_wait":
@@ -498,7 +740,7 @@ def _infer_task_type(task: str, goal_analysis: Dict[str, Any]) -> TaskType:
     except ValueError:
         # Fallback inference
         task_lower = task.lower()
-        if "research" in task_lower and ("word" in task_lower or "docx" in task_lower or "document" in task_lower):
+        if "research" in task_lower and (("word" in task_lower or "docx" in task_lower or "document" in task_lower or "report" in task_lower) or ("powerpoint" in task_lower or "pptx" in task_lower or "presentation" in task_lower or "ppt" in task_lower or "slides" in task_lower)):
             return TaskType.RESEARCH_DOCUMENT
         elif "research" in task_lower or "search" in task_lower:
             return TaskType.RESEARCH
@@ -535,7 +777,7 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
     for i, action in enumerate(plan.actions):
         # Check consumes
         for key in action.consumes:
-            if key not in produced_keys and key not in ("search_results", "current_page_url", "current_page_title", "extracted_sources", "collected_numbers", "active_app", "active_window", "created_document_path", "ui_elements", "ui_target"):
+            if key not in produced_keys and key not in ("search_results", "current_page_url", "current_page_title", "extracted_sources", "collected_numbers", "active_app", "active_window", "created_document_path", "created_presentation_path", "ui_elements", "ui_target"):
                 # Check if any dependency produces it
                 found = False
                 for dep_idx in action.depends_on:
@@ -563,6 +805,7 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
         "write_file_verified": ["path", "content"],
         "verify_file": ["path"],
         "create_docx": ["path", "title"],
+        "create_pptx": ["path", "title", "slides"],
         "browser_search": ["query"],
         "browser_navigate": [],  # url or source_index
         "browser_extract": [],
@@ -634,35 +877,33 @@ class Planner:
                     {"step": "type_text", "depends_on": ["open_notepad"]}
                 ]
             }
-        elif ("research" in task_lower or "search" in task_lower) and ("word" in task_lower or "docx" in task_lower or "document" in task_lower):
-            topic = task
-            for pattern in [
-                r"research\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-                r"search\s+for\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-                r"find\s+(.+?)\s+(?:and\s+create|from\s+multiple|from\s+websites?|into\s+word|\s+create)",
-            ]:
-                m = re.search(pattern, task_lower)
-                if m:
-                    topic = m.group(1).strip()
-                    break
+        elif ("research" in task_lower or "search" in task_lower or "gather" in task_lower or "find" in task_lower or "topic" in task_lower or "website" in task_lower or "websites" in task_lower) and (("word" in task_lower or "docx" in task_lower or "document" in task_lower or "report" in task_lower) or ("powerpoint" in task_lower or "pptx" in task_lower or "presentation" in task_lower or "ppt" in task_lower or "slides" in task_lower)):
+            params = _extract_research_parameters(task)
+            topic = params["topic"]
+            num_sources = params["num_sources"]
+            is_pres = params["is_presentation"]
+
+            deps = [{"step": "search", "depends_on": []}]
+            extract_steps = []
+            for i in range(num_sources):
+                v_step = f"visit_source_{i + 1}"
+                e_step = f"extract_source_{i + 1}"
+                deps.append({"step": v_step, "depends_on": ["search"]})
+                deps.append({"step": e_step, "depends_on": [v_step]})
+                extract_steps.append(e_step)
+
+            artifact_name = f"PowerPoint presentation (.pptx)" if is_pres else f"Word document (.docx)"
+            deps.append({"step": "create_presentation" if is_pres else "create_document", "depends_on": extract_steps})
+
             return {
-                "primary_goal": f"Create a Word document containing researched information about {topic}",
-                "information": [f"topic: {topic}"],
-                "intermediate_operations": ["search", "visit_sources", "extract_content", "create_document"],
-                "final_deliverables": ["Word document (.docx) on Desktop with research findings"],
+                "primary_goal": f"Create a {artifact_name} containing researched information about {topic} gathered from {num_sources} sources",
+                "information": [f"topic: {topic}", f"sources_count: {num_sources}"],
+                "intermediate_operations": ["search", "visit_sources", "extract_content", "generate_output"],
+                "final_deliverables": [f"{artifact_name} on Desktop with research findings on '{topic}'"],
                 "tool_instructions": [],
                 "task_type": "research_document",
-                "constraints": {"min_sources": 3, "output_format": "docx", "output_location": "Desktop"},
-                "dependencies": [
-                    {"step": "search", "depends_on": []},
-                    {"step": "visit_source_1", "depends_on": ["search"]},
-                    {"step": "extract_source_1", "depends_on": ["visit_source_1"]},
-                    {"step": "visit_source_2", "depends_on": ["search"]},
-                    {"step": "extract_source_2", "depends_on": ["visit_source_2"]},
-                    {"step": "visit_source_3", "depends_on": ["search"]},
-                    {"step": "extract_source_3", "depends_on": ["visit_source_3"]},
-                    {"step": "create_document", "depends_on": ["extract_source_1", "extract_source_2", "extract_source_3"]}
-                ]
+                "constraints": {"min_sources": num_sources, "output_format": "pptx" if is_pres else "docx", "output_location": "Desktop"},
+                "dependencies": deps
             }
         elif "calculator" in task_lower or "calc" in task_lower:
             return {
@@ -730,10 +971,38 @@ class Planner:
         api_key = _load_config_gemini_api_key()
         
         # Step 2: Generate plan using LLM
+        # Extract research parameters FIRST to anchor the LLM on the correct
+        # topic, source count (M) and slide count (N) — preventing any confusion.
+        research_params = _extract_research_parameters(task)
+        topic = research_params["topic"]
+        num_sources = research_params["num_sources"]      # M
+        target_slides = research_params["target_slides"]  # N
+        target_domain = research_params["target_domain"]
+        is_presentation = research_params["is_presentation"]
+
+        # Store in state so executor can read them without re-parsing
+        state.task_metadata = getattr(state, "task_metadata", {})
+        state.task_metadata["target_slides"] = target_slides
+        state.task_metadata["num_sources"] = num_sources
+        state.task_metadata["target_domain"] = target_domain
+        state.task_metadata["topic"] = topic
+
+        # Enrich the task prompt so the LLM cannot confuse action verbs with the query.
+        enriched_task = task
+        if topic and topic != "Research Topic":
+            enriched_task = f"Topic: {topic}. {task}"
+            enriched_task += f" Gather info from EXACTLY {num_sources} websites (M={num_sources})."
+            if target_slides:
+                enriched_task += f" Generate EXACTLY {target_slides} slides/sections (N={target_slides})."
+            if target_domain:
+                enriched_task += f" Use ONLY sources from {target_domain}."
+            if is_presentation:
+                enriched_task += " Output format: PowerPoint presentation."
+
         # URL-directed tasks need exact navigation semantics.  Prefer the
         # deterministic URL plan over an LLM paraphrasing the URL into a search.
         explicit_url_task = bool(re.search(r"https?://[^\s\]\[\),]+", task, re.I))
-        actions = None if explicit_url_task else _call_gemini_for_plan(task, api_key, PLANNER_SYSTEM_PROMPT)
+        actions = None if explicit_url_task else _call_gemini_for_plan(enriched_task, api_key, PLANNER_SYSTEM_PROMPT)
         if actions:
             # Resolve any placeholder desktop paths
             for action in actions:
@@ -833,8 +1102,15 @@ Adjust the plan to:
 """
         
         api_key = _load_config_gemini_api_key()
-        
-        actions = _call_gemini_for_plan(task, api_key, replan_prompt)
+
+        # Enrich task with extracted topic for replanning too
+        replan_research_params = _extract_research_parameters(task)
+        replan_topic = replan_research_params["topic"]
+        replan_task = task
+        if replan_topic and replan_topic != "Research Topic":
+            replan_task = f"Topic: {replan_topic}. {task}"
+
+        actions = _call_gemini_for_plan(replan_task, api_key, replan_prompt)
         if not actions:
             actions = _rule_based_plan(task)
         

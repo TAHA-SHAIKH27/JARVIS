@@ -20,19 +20,89 @@ OFFLINE_RESPONSES = {
     "goodbye": "Goodbye, sir. Standing by on low power mode."
 }
 
-# ===== CONVERSATION HISTORY (in-memory, per-session) =====
-# Stores the last N conversation messages to give Gemini context (5 turns = 10 messages)
+# ===== CONVERSATION HISTORY (session, persisted to disk) =====
+# Stores the last N conversation messages to give Gemini context (5 turns = 10 messages).
+# Persisted to backend/data/session_memory.json so chat/command/vision/document context
+# survives backend restarts, and restored on startup. Agent-mode conversations are
+# tracked separately via phase1_runtime.ConversationContext.
 MAX_HISTORY = 10
 conversation_history = []  # list of {"role": "user"|"assistant", "text": str}
+
+
+def _session_history_path() -> str:
+    data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "backend", "data"))
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "session_memory.json")
+
+
+def _load_session_history() -> list:
+    """Restore the last session's conversation history from disk (best-effort)."""
+    try:
+        with open(_session_history_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            valid = [e for e in data if isinstance(e, dict) and e.get("role") in ("user", "assistant")]
+            return valid[-MAX_HISTORY:]
+    except (OSError, ValueError, TypeError):
+        pass
+    return []
+
+
+def _save_session_history() -> None:
+    """Persist the current session conversation history atomically."""
+    tmp = None
+    try:
+        path = _session_history_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(conversation_history, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            last_exc = None
+            for _ in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    time.sleep(0.15)
+            else:
+                if last_exc is not None:
+                    raise last_exc
+    except (OSError, ValueError, TypeError):
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
+conversation_history = _load_session_history()
 
 
 def add_to_history(role: str, text: str):
     """Add a message to conversation history, keeping it bounded to last 5 queries (10 messages)."""
     global conversation_history
     conversation_history.append({"role": role, "text": text})
-    # Trim to last MAX_HISTORY entries
     if len(conversation_history) > MAX_HISTORY:
         conversation_history = conversation_history[-MAX_HISTORY:]
+    _save_session_history()
+
+
+def clear_history():
+    """Clear the in-memory session history and remove its persisted file."""
+    global conversation_history
+    conversation_history = []
+    try:
+        os.remove(_session_history_path())
+    except OSError:
+        pass
 
 
 def get_history_text() -> str:
@@ -487,8 +557,10 @@ def generate_image_huggingface(prompt: str, hf_api_key: str, save_name: str = ""
     elif not save_name.endswith(('.png', '.jpg', '.jpeg')):
         save_name += ".png"
 
-    # Save to work_files/images directory (WORK_DIR is one level above the project root)
-    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
+    # Save to the in-project work_files/images so the FILES/GALLERY view shows it
+    # and it persists across restarts. (Must NOT be ../work_files — that lands a
+    # level ABOVE the project on the Desktop and the gallery can never find it.)
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
     img_dir = os.path.join(work_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
 
@@ -626,6 +698,8 @@ def _call_gemini_with_fallback(base_url_template: str, headers_template: dict, p
                 continue
             # Any other error (400, 401, 403, etc.) is a hard stop
             raise
+    if last_error is None:
+        raise RuntimeError("No available Gemini models to try (exhausted model list).")
     raise last_error
 
 
@@ -738,7 +812,11 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "read_file", "filename": "hello.txt"},
       {"type": "delete_file", "filename": "hello.txt"},
       {"type": "create_folder", "folder_name": "folder name relative to workspace or specifying 'on Desktop'"},
-      {"type": "create_word_doc", "filename": "report.docx", "content": "detailed document content text"},
+      // Word documents look human-made: use # headings, - bullets, markdown tables (| Name | Value |),
+      // and chart blocks; each chart marker embeds a real pie/bar/histogram/line chart image:
+      //   [CHART:bar] Quarterly Sales
+      //   Jan: 42, Feb: 55, Mar: 39
+      {"type": "create_word_doc", "filename": "report.docx", "content": "# Quarterly Sales Report\n\n## Revenue\n| Month | Revenue |\n|---|---|\n| Jan | 12000 |\n| Feb | 14500 |\n\n[CHART:bar] Quarterly Sales\nJan: 42, Feb: 55, Mar: 39"},
 
       // --- Intelligence & Info ---
       {"type": "weather", "city": "London"},
@@ -1070,7 +1148,7 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
         else:
             msg = "I encountered a network issue communicating with my neural processors, sir."
         add_to_history("assistant", msg)
-        yield {"type": "speak", "text": msg}
+        yield msg
 
 
 def extract_first_json_action(buffer: str):
@@ -1299,11 +1377,18 @@ def stream_image_analysis(image_base64: str, mime_type: str, prompt: str, api_ke
             yield msg
             return
 
+    history_text = get_history_text()
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(question, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
     payload = {
         "contents": [{
             "parts": [
                 {"inline_data": {"mime_type": mime_type, "data": image_base64}},
-                {"text": f"{VISION_SYSTEM_INSTRUCTION}\n\nUser's question: {question}"}
+                {"text": f"{VISION_SYSTEM_INSTRUCTION}\n\nUSER PERSISTENT MEMORY:\n{memory_ctx}\n\nCONVERSATION HISTORY:\n{history_text}\n\nUser's question: {question}"}
             ]
         }],
         "generationConfig": {"temperature": 0.4}
@@ -1414,8 +1499,17 @@ def stream_document_analysis(document_text: str, filename: str, prompt: str, api
             yield msg
             return
 
+    history_text = get_history_text()
+    try:
+        from backend.agent import phase1_memory
+        memory_ctx = phase1_memory.memory_context(question, limit=8)
+    except Exception:
+        memory_ctx = "No stored memories relevant to this task."
+
     full_prompt = (
         f"{DOCUMENT_SYSTEM_INSTRUCTION}\n\n"
+        f"USER PERSISTENT MEMORY:\n{memory_ctx}\n\n"
+        f"CONVERSATION HISTORY:\n{history_text}\n\n"
         f"--- DOCUMENT: {filename} ---\n{document_text}\n--- END DOCUMENT ---\n\n"
         f"User's question: {question}"
     )

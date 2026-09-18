@@ -30,6 +30,8 @@ import GalleryPage from './GalleryPage';
 
 import CodeCorePage from './CodeCorePage';
 
+import StartupAuditBanner from './StartupAuditBanner';
+
 import { useVoice } from './hooks/useVoice';
 
 
@@ -110,7 +112,7 @@ function TimerWidget({ timerData, onCancel }) {
 
     <div className="timer-strip">
 
-      <div className="timer-icon">{done ? 'Γ£à' : 'ΓÅ▒∩╕Å'}</div>
+      <div className="timer-icon">{done ? '✓' : '⏳'}</div>
 
       <div className="timer-info">
 
@@ -130,7 +132,7 @@ function TimerWidget({ timerData, onCancel }) {
 
       </div>
 
-      <button className="timer-cancel-btn" onClick={onCancel}>Γ£ò Cancel</button>
+      <button className="timer-cancel-btn" onClick={onCancel}>✕ Cancel</button>
 
     </div>
 
@@ -821,13 +823,13 @@ export default function App() {
         setTimeout(() => setSaveNote(''), 2500)
       }
     } catch {
-      setSaveNote('Save failed ΓÇö check connection.')
+      setSaveNote('Save failed — check connection.')
     }
   }
 
   async function linkGoogle() {
     setOauthBusy(true)
-    setOauthMsg('Opening browser to sign in with GoogleΓÇª')
+    setOauthMsg('Opening browser to sign in with Google…')
     try {
       const res = await fetch('/api/oauth/login', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
@@ -900,6 +902,7 @@ export default function App() {
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      <StartupAuditBanner onOpenCode={() => setActiveView('code')} />
       {/* ── Full-page overlays (Phone / Gallery) ── */}
       {activeView === 'phone' && (
         <PhoneMirrorPage
@@ -981,17 +984,17 @@ export default function App() {
               <div className="pending-image-chip">
                 <img src={pendingImage.previewUrl} alt="preview" />
                 <span className="pending-image-name">{pendingImage.fileName}</span>
-                <button onClick={() => setPendingImage(null)}>Γ£ò</button>
+                <button onClick={() => setPendingImage(null)}>✕</button>
               </div>
             )}
             {pendingDocument && (
               <div className="pending-image-chip">
                 <FileIcon size={14} />
                 <span className="pending-image-name">{pendingDocument.fileName}</span>
-                <button onClick={() => setPendingDocument(null)}>Γ£ò</button>
+                <button onClick={() => setPendingDocument(null)}>✕</button>
               </div>
             )}
-            {extracting && <div className="listening-hint">Extracting documentΓÇª</div>}
+            {extracting && <div className="listening-hint">Extracting document…</div>}
 
             {/* Clarification prompt panel */}
             {clarificationPending && (
@@ -1055,7 +1058,14 @@ export default function App() {
 
           {/* File Bay */}
           <div className="panel hud-panel-files">
-            <p className="panel-label"><span>File Bay</span><span>{files.length} items</span></p>
+            <p className="panel-label" onClick={() => setActiveView('files')} style={{ cursor: 'pointer' }} title="Click to open full Files & Gallery Album">
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Folder size={12} style={{ color: 'var(--cyan)' }} /> File Bay &amp; Album
+              </span>
+              <span className="clickable-tag" style={{ background: 'rgba(0,242,254,0.15)', padding: '2px 8px', borderRadius: 4, color: 'var(--cyan)', fontSize: 10 }}>
+                OPEN ALBUM ↗
+              </span>
+            </p>
             <div className="file-bay">
               {files.length === 0 && <div className="empty-state">Workspace is empty, sir.</div>}
               {files.map(f => (
@@ -1144,7 +1154,7 @@ export default function App() {
               <div className="oauth-row">
                 <div className="oauth-status">
                   <span className={`oauth-dot ${googleLinked === null ? 'checking' : googleLinked ? 'linked' : ''}`} />
-                  {googleLinked === null ? 'CheckingΓÇª' : googleLinked ? 'Google account linked' : 'Not linked'}
+                  {googleLinked === null ? 'Checking…' : googleLinked ? 'Google account linked' : 'Not linked'}
                 </div>
                 {googleLinked
                   ? <button className="btn-secondary" onClick={unlinkGoogle} disabled={oauthBusy}>Unlink</button>
@@ -1161,7 +1171,7 @@ export default function App() {
                 type="password"
                 value={geminiKey}
                 onChange={e => setGeminiKey(e.target.value)}
-                placeholder="AIzaΓÇª"
+                placeholder="AIza…"
               />
             </div>
             <div className="field">
@@ -1178,7 +1188,7 @@ export default function App() {
                 type="password"
                 value={hfKey}
                 onChange={e => setHfKey(e.target.value)}
-                placeholder="hf_ΓÇª"
+                placeholder="hf_…"
               />
             </div>
             <div className="field">

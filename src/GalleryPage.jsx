@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   ArrowLeft, Images, Trash2, X, ChevronLeft, ChevronRight,
-  Monitor, Smartphone, Sparkles, FolderOpen, RefreshCw, ZoomIn
+  Monitor, Smartphone, Sparkles, FolderOpen, RefreshCw, ZoomIn,
+  FileText, Download
 } from 'lucide-react'
 
 function formatBytes(n) {
@@ -25,6 +26,7 @@ const CATEGORIES = [
   { key: 'pc_screenshot', label: 'PC SHOTS', icon: Monitor },
   { key: 'phone', label: 'PHONE', icon: Smartphone },
   { key: 'generated', label: 'AI GEN', icon: Sparkles },
+  { key: 'document', label: 'DOCS', icon: FileText },
   { key: 'other', label: 'OTHER', icon: FolderOpen },
 ]
 
@@ -50,21 +52,24 @@ export default function GalleryPage({ setActiveView }) {
 
   useEffect(() => { fetchGallery() }, [fetchGallery])
 
+  const filtered = activeCategory === 'all'
+    ? images
+    : images.filter(img => img.category === activeCategory)
+
+  // Lightbox only applies to image files (documents have no preview)
+  const visibleImages = filtered.filter(img => img.kind !== 'document')
+
   // Close lightbox on Escape, arrow-key navigation
   useEffect(() => {
     if (lightboxIdx === null) return
     function onKey(e) {
       if (e.key === 'Escape') setLightboxIdx(null)
-      if (e.key === 'ArrowRight') setLightboxIdx(i => Math.min(i + 1, filtered.length - 1))
+      if (e.key === 'ArrowRight') setLightboxIdx(i => Math.min(i + 1, visibleImages.length - 1))
       if (e.key === 'ArrowLeft') setLightboxIdx(i => Math.max(i - 1, 0))
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [lightboxIdx])  // eslint-disable-line react-hooks/exhaustive-deps
-
-  const filtered = activeCategory === 'all'
-    ? images
-    : images.filter(img => img.category === activeCategory)
+  }, [lightboxIdx, visibleImages.length])
 
   async function handleDelete(img) {
     if (deleteConfirm !== img.path) {
@@ -86,7 +91,7 @@ export default function GalleryPage({ setActiveView }) {
     finally { setDeleting(null) }
   }
 
-  const currentLightboxImg = lightboxIdx !== null ? filtered[lightboxIdx] : null
+  const currentLightboxImg = lightboxIdx !== null ? visibleImages[lightboxIdx] : null
 
   const catCounts = {}
   for (const img of images) {
@@ -150,24 +155,61 @@ export default function GalleryPage({ setActiveView }) {
                 <Images size={52} style={{ color: 'var(--cyan)', opacity: .25 }} />
               </div>
               <p className="gallery-empty-title">No files here yet</p>
-              <p className="gallery-empty-sub">
-                {activeCategory === 'all'
-                  ? 'Take a screenshot, mirror your phone, or generate an image to see it here.'
-                  : `No ${CATEGORIES.find(c => c.key === activeCategory)?.label?.toLowerCase()} files yet.`}
-              </p>
+<p className="gallery-empty-sub">
+                  {activeCategory === 'all'
+                    ? 'Take a screenshot, mirror your phone, generate an image, or create a document/PPT to see it here.'
+                    : `No ${CATEGORIES.find(c => c.key === activeCategory)?.label?.toLowerCase()} files yet.`}
+                </p>
             </div>
           )}
 
           {!loading && filtered.length > 0 && (
             <div className="gallery-grid">
               {filtered.map((img, idx) => (
-                <div className="gallery-card" key={img.path}>
+                img.kind === 'document' ? (
+                  <div className="gallery-card gallery-doc-card" key={img.path}>
+                    <a
+                      className="gallery-doc-thumb"
+                      href={`/api/files/serve?path=${encodeURIComponent(img.path)}`}
+                      download={img.filename}
+                      title="Download"
+                    >
+                      <div className="gallery-doc-icon">
+                        <FileText size={26} />
+                        <span className="gallery-doc-ext">{img.ext?.toUpperCase()}</span>
+                      </div>
+                      <div className="gallery-thumb-overlay">
+                        <Download size={22} style={{ color: 'var(--cyan)' }} />
+                      </div>
+                    </a>
+                    <div className="gallery-card-meta">
+                      <span className="gallery-card-name" title={img.filename}>{img.filename}</span>
+                      <div className="gallery-card-row2">
+                        <span className="gallery-cat-tag cat-document">DOC</span>
+                        <span className="gallery-card-size">{formatBytes(img.size)}</span>
+                        <button
+                          className={`gallery-delete-btn ${deleteConfirm === img.path ? 'confirm' : ''}`}
+                          onClick={() => handleDelete(img)}
+                          disabled={deleting === img.path}
+                          aria-label={`Delete ${img.filename}`}
+                        >
+                          {deleting === img.path
+                            ? '…'
+                            : deleteConfirm === img.path
+                              ? '✓ Confirm'
+                              : <Trash2 size={12} />}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="gallery-card" key={img.path}>
                   <div
                     className="gallery-thumb-wrap"
-                    onClick={() => setLightboxIdx(idx)}
+                    onClick={() => setLightboxIdx(visibleImages.indexOf(img))}
                     role="button"
                     tabIndex={0}
-                    onKeyDown={e => e.key === 'Enter' && setLightboxIdx(idx)}
+                    onKeyDown={e => e.key === 'Enter' && setLightboxIdx(visibleImages.indexOf(img))}
                   >
                     <img
                       className="gallery-thumb"
@@ -204,6 +246,7 @@ export default function GalleryPage({ setActiveView }) {
                     </div>
                   </div>
                 </div>
+                )
               ))}
             </div>
           )}
@@ -223,7 +266,7 @@ export default function GalleryPage({ setActiveView }) {
                 <ChevronLeft size={22} />
               </button>
             )}
-            {lightboxIdx < filtered.length - 1 && (
+            {lightboxIdx < visibleImages.length - 1 && (
               <button className="lightbox-arrow right" onClick={() => setLightboxIdx(i => i + 1)}>
                 <ChevronRight size={22} />
               </button>
@@ -248,7 +291,7 @@ export default function GalleryPage({ setActiveView }) {
                 <span style={{ opacity: .5 }}>·</span>
                 <span>{formatDate(currentLightboxImg.mtime)}</span>
                 <span style={{ opacity: .5 }}>·</span>
-                <span>{lightboxIdx + 1} / {filtered.length}</span>
+                <span>{lightboxIdx + 1} / {visibleImages.length}</span>
               </div>
               <button
                 className={`gallery-delete-btn ${deleteConfirm === currentLightboxImg.path ? 'confirm' : ''}`}

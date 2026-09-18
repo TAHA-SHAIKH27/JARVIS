@@ -106,6 +106,13 @@
 .cat-phone{background:rgba(67,217,255,.08);color:var(--cyan);border:1px solid rgba(67,217,255,.18)}
 .cat-generated{background:rgba(255,180,92,.08);color:var(--amber);border:1px solid rgba(255,180,92,.2)}
 .cat-other{background:rgba(140,167,184,.06);color:var(--text-faint);border:1px solid rgba(140,167,184,.12)}
+.cat-document{background:rgba(149,128,255,.08);color:#957a8c;border:1px solid rgba(149,128,255,.2);color:var(--purple,#b08cf5)}
+
+/* Document cards (FILES & GALLERY shows docs + PPTs too) */
+.gallery-doc-thumb{position:relative;aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,rgba(24,20,46,.9),rgba(10,12,20,.85));cursor:pointer;text-decoration:none;overflow:hidden}
+.gallery-doc-icon{display:flex;flex-direction:column;align-items:center;gap:4px;color:var(--purple,#b08cf5)}
+.gallery-doc-ext{font:9px var(--font-mono);letter-spacing:.12em;color:var(--text-dim)}
+.gallery-doc-card:hover .gallery-thumb-overlay{opacity:1}
 .gallery-card-size{font:9px var(--font-mono);color:var(--text-faint);margin-left:auto}
 
 /* Delete button */
@@ -133,4 +140,33 @@
 .lightbox-footer{display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid rgba(67,217,255,.1);flex-shrink:0}
 .lightbox-filename{font:12px var(--font-mono);color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .lightbox-meta{display:flex;gap:8px;align-items:center;font:10px var(--font-mono);color:var(--text-faint);white-space:nowrap;flex-shrink:0}
+
+/* ── Startup Code Check Banner ── */
+.startup-banner{margin:10px 12px 0;padding:12px 14px;border:1px solid rgba(255,196,87,.35);background:rgba(30,22,8,.72);color:var(--text);font:11px var(--font-mono);display:flex;flex-direction:column;gap:8px;border-radius:4px;animation:fp-in .25s ease both;box-shadow:0 0 24px rgba(255,196,87,.08)}
+.startup-banner.is-fixing{border-color:rgba(67,217,255,.4);background:rgba(6,18,26,.8);color:var(--cyan);align-items:center;flex-direction:row}
+.startup-banner.is-done{border-color:rgba(80,230,160,.4);background:rgba(8,24,16,.78)}
+.startup-banner.is-error{border-color:var(--red);background:rgba(34,8,12,.8);box-shadow:0 0 24px rgba(255,98,117,.1)}
+.banner-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.banner-head strong{font:12px var(--font-display);letter-spacing:.1em;color:var(--yellow,#ffc457)}
+.banner-summary{color:var(--text-dim);font-size:10px}
+.banner-msg{color:var(--text-faint);font-size:10px;margin-top:4px}
+.banner-issues{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto}
+.banner-issue{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:5px 8px;background:rgba(0,0,0,.25);border-left:2px solid rgba(255,196,87,.5)}
+.banner-issue.is-more{color:var(--text-faint);border-left-color:transparent}
+.banner-issue .sev{font:9px var(--font-mono);letter-spacing:.06em;padding:1px 6px;border-radius:2px;flex-shrink:0;background:rgba(255,196,87,.15);color:#ffc457;border:1px solid rgba(255,196,87,.3)}
+.banner-issue .sev.critical_syntax_error,.banner-issue .sev.compilation_error{background:rgba(255,98,117,.15);color:#ff6275;border-color:rgba(255,98,117,.35)}
+.banner-issue .banner-file{color:var(--cyan);font:11px var(--font-mono)}
+.banner-issue .banner-lines{color:var(--text-dim);font:10px var(--font-mono);white-space:nowrap}
+.banner-issue .banner-msg{color:var(--text-dim);font:10px var(--font-mono)}
+.banner-downloads{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
+.banner-downloads-label{font:10px var(--font-mono);color:var(--text-dim)}
+.banner-download{font:10px var(--font-mono);color:#7ce8a0;border:1px solid rgba(124,232,160,.4);padding:3px 8px;border-radius:2px;text-decoration:none;transition:.18s}
+.banner-download:hover{background:rgba(124,232,160,.12)}
+.banner-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
+.banner-btn{background:transparent;border:1px solid rgba(67,217,255,.35);color:var(--cyan);font:10px var(--font-mono);letter-spacing:.06em;padding:5px 12px;border-radius:2px;cursor:pointer;transition:.18s}
+.banner-btn:hover{background:rgba(67,217,255,.12)}
+.banner-btn.is-primary{border-color:rgba(255,196,87,.5);color:#ffc457;background:rgba(255,196,87,.1)}
+.banner-btn.is-primary:hover{background:rgba(255,196,87,.18)}
+.banner-spinner{width:12px;height:12px;border:2px solid rgba(67,217,255,.25);border-top-color:var(--cyan);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
 

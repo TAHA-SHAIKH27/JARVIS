@@ -13,6 +13,9 @@ import numpy as np
 import wave
 import io
 import uuid
+import threading
+import time
+import sys
 
 # Import local helper modules
 from system_ops import (
@@ -52,8 +55,6 @@ import google_oauth
 import phone_control
 import whatsapp_ops
 import code_core
-import json
-import asyncio
 
 from backend.agent.core import AgentCore
 from backend.agent.state import TaskState
@@ -96,6 +97,54 @@ def _start_ws_scrcpy():
         print("[ws-scrcpy] Started on port 8080")
     except Exception as e:
         print(f"[ws-scrcpy] Failed to start: {e}")
+
+
+# ── Startup Code Audit (automatic, read-only) ────────────────────────────────────
+# After boot, a background worker performs a zero-mutation source scan (AST +
+# py_compile - no Nemotron) and publishes the report so the UI can notify the
+# user about problem files (with line ranges) and ask whether to apply fixes.
+
+_STARTUP_AUDIT_LOCK = threading.Lock()
+_startup_audit_report = None
+_STARTUP_AUDIT_WAIT_SECONDS = 15
+
+
+def _audit_report_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend", "data", "last_audit.json")
+
+
+def _run_startup_audit_worker():
+    """Wait for the frontend to attach, then run a read-only audit and persist it."""
+    global _startup_audit_report
+    time.sleep(_STARTUP_AUDIT_WAIT_SECONDS)
+    with _STARTUP_AUDIT_LOCK:
+        try:
+            report = code_core.audit_codebase()
+            _startup_audit_report = report
+            try:
+                os.makedirs(os.path.dirname(_audit_report_path()), exist_ok=True)
+                with open(_audit_report_path(), "w", encoding="utf-8") as f:
+                    json.dump(report, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+            print(
+                f"[startup-audit] Codebase scan finished: health {report['health_score']}%, "
+                f"{report['total_files_checked']} files checked, {report['issues_count']} issue(s) "
+                f"reported to the UI.",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[startup-audit] Startup scan failed: {e}", file=sys.stderr)
+
+
+@app.on_event("startup")
+def _start_startup_code_audit():
+    """Launch the automatic read-only source audit shortly after boot."""
+    try:
+        threading.Thread(target=_run_startup_audit_worker, daemon=True).start()
+        print("[startup-audit] Startup code check armed - running in background.", file=sys.stderr)
+    except Exception as e:
+        print(f"[startup-audit] Could not start audit thread: {e}", file=sys.stderr)
 
 # Configuration persistence
 CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json"))
@@ -219,7 +268,9 @@ def get_config():
 
 @app.post("/api/config")
 def post_config(req: ConfigModel):
-    save_config({
+    # Merge into existing config so Nemotron tuning keys survive this write
+    cfg = load_config()
+    cfg.update({
         "gemini_api_key": req.gemini_api_key,
         "huggingface_api_key": req.huggingface_api_key,
         "gemini_project_id": req.gemini_project_id or "",
@@ -227,6 +278,7 @@ def post_config(req: ConfigModel):
         "nvidia_api_key": req.nvidia_api_key or "",
         "nvidia_model": req.nvidia_model or "z-ai/glm-5.3-flash"
     })
+    save_config(cfg)
     return {"status": "success", "message": "Configuration saved."}
 
 
@@ -236,9 +288,49 @@ def post_config(req: ConfigModel):
 def code_audit():
     return code_core.audit_codebase()
 
+@app.get("/api/code/audit/latest")
+def code_audit_latest():
+    """Return the most recent startup self-audit report (read-only, no mutations).
+
+    If the background startup worker hasn't published yet, run a fresh audit
+    synchronously so early frontend polls always get a complete report.
+    """
+    global _startup_audit_report
+    if _startup_audit_report is None:
+        with _STARTUP_AUDIT_LOCK:
+            if _startup_audit_report is None:
+                try:
+                    _startup_audit_report = code_core.audit_codebase()
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Audit failed: {e}")
+    return _startup_audit_report
+
+class CodeAuditFixRequest(BaseModel):
+    issues: Optional[List[dict]] = None
+
+@app.post("/api/code/audit/fix")
+def code_audit_fix(req: CodeAuditFixRequest = None):
+    """Apply fixes for the startup audit report issues (per-file, with backups,
+    validation and auto-rollback). Returns per-file results including download
+    URLs for each corrected file."""
+    global _startup_audit_report
+    if req and req.issues is not None:
+        report = {"issues": req.issues}
+    elif _startup_audit_report is not None:
+        report = _startup_audit_report
+    else:
+        try:
+            report = code_core.audit_codebase()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Audit failed: {e}")
+    return code_core.apply_reported_fixes(report)
+
 @app.post("/api/code/preview-fix")
 def code_preview_fix(req: CodePreviewFixRequest):
-    return code_core.preview_file_fix(req.file, req.issue)
+    try:
+        return code_core.preview_file_fix(req.file, req.issue)
+    except code_core.NemotronUnavailableError as e:
+        return {"status": "error", "error_type": "nemotron_unavailable", "file": req.file, "message": str(e)}
 
 @app.post("/api/code/apply-fix")
 def code_apply_fix(req: CodeApplyFixRequest):
@@ -293,16 +385,15 @@ class VoiceCommandRequest(BaseModel):
 
 
 @app.post("/api/voice/command")
-def voice_command(req: VoiceCommandRequest):
+async def voice_command(req: VoiceCommandRequest):
     """Endpoint for the native voice service to send recognized commands."""
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="Empty prompt")
     
     # Reuse the existing command processing logic
     # Create a mock CommandRequest and process it
-    from agent import conversation_history
     command_req = CommandRequest(prompt=req.prompt.strip(), apiKey=None)
-    return process_command(command_req)
+    return await process_command(command_req)
 
 
 
@@ -405,7 +496,7 @@ def remove_file(filename: str):
 # Serve generated images from work_files
 @app.get("/api/images/{filename}")
 def serve_image(filename: str):
-    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
+    work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
     img_path = os.path.join(work_dir, "images", filename)
     if not os.path.exists(img_path):
         raise HTTPException(status_code=404, detail="Image not found")
@@ -667,7 +758,7 @@ async def process_command(req: CommandRequest):
     prompt_lower = req.prompt.lower().strip()
     if prompt_lower in ["clear chat", "reset history", "forget everything", "clear memory", "reset"]:
         import agent
-        agent.conversation_history.clear()
+        agent.clear_history()
         try:
             from backend.agent import phase1_memory, phase1_runtime
             if prompt_lower in ["clear memory", "forget everything", "reset"]:
@@ -716,13 +807,19 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"JARVIS: {speak_text}")
 
         elif act_type == "shutdown":
-            delay = int(action.get("delay_seconds", 0))
+            try:
+                delay = int(action.get("delay_seconds", 0))
+            except (TypeError, ValueError):
+                delay = 0
             res = shutdown_pc(delay)
             execution_logs.append(f"ACTION: Shutdown initiated")
             execution_logs.append(f"RESULT: {res['message']}")
 
         elif act_type == "restart":
-            delay = int(action.get("delay_seconds", 0))
+            try:
+                delay = int(action.get("delay_seconds", 0))
+            except (TypeError, ValueError):
+                delay = 0
             res = restart_pc(delay)
             execution_logs.append(f"ACTION: Restart initiated")
             execution_logs.append(f"RESULT: {res['message']}")
@@ -792,7 +889,10 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"RESULT: {res['message']}")
 
         elif act_type == "set_timer":
-            seconds = int(action.get("seconds", 60))
+            try:
+                seconds = int(action.get("seconds", 60))
+            except (TypeError, ValueError):
+                seconds = 60
             label = action.get("label", "Timer")
             execution_logs.append(f"ACTION: Setting timer for {seconds} seconds")
             # Timer is purely frontend-driven; we pass the data back
@@ -955,7 +1055,12 @@ async def process_command(req: CommandRequest):
 
         elif act_type == "clear_history":
             import agent
-            agent.conversation_history.clear()
+            agent.clear_history()
+            try:
+                from backend.agent import phase1_runtime
+                phase1_runtime.runtime.conversation.clear()
+            except Exception:
+                pass
             execution_logs.append("ACTION: Cleared conversation history")
 
         # --- Phone Control (ADB / scrcpy) -------------------------------
@@ -1090,15 +1195,31 @@ async def process_command(req: CommandRequest):
             if target in ["all", "errors", "issues"]:
                 audit_res = code_core.audit_codebase()
                 fixed_count = 0
+                failed_count = 0
                 for issue in audit_res.get("issues", []):
                     fpath = issue["file"]
-                    preview = code_core.preview_file_fix(fpath, issue.get("message", ""))
+                    try:
+                        preview = code_core.preview_file_fix(fpath, issue.get("message", ""))
+                    except code_core.NemotronUnavailableError as e:
+                        failed_count += 1
+                        execution_logs.append(f"RESULT: {fpath} skipped - Nemotron unavailable: {e}")
+                        continue
                     if preview.get("status") == "success":
-                        app_res = code_core.apply_file_fix(fpath, preview["proposed_content"])
+                        try:
+                            app_res = code_core.apply_file_fix(fpath, preview["proposed_content"])
+                        except code_core.NemotronUnavailableError as e:
+                            failed_count += 1
+                            execution_logs.append(f"RESULT: {fpath} skipped - Nemotron unavailable during repair: {e}")
+                            continue
                         if app_res.get("status") == "success":
                             fixed_count += 1
                             execution_logs.append(f"RESULT: Repaired {fpath} with validation verified.")
-                speak_text = f"Self-repair complete, sir. Successfully fixed and validated {fixed_count} files with automatic rollback safety enabled."
+                        else:
+                            failed_count += 1
+                    else:
+                        failed_count += 1
+                tail = f" {failed_count} could not be auto-fixed." if failed_count else ""
+                speak_text = f"Self-repair complete, sir. Successfully fixed and validated {fixed_count} files with automatic rollback safety enabled.{tail}"
             else:
                 preview = code_core.preview_file_fix(target, action.get("issue", ""))
                 if preview.get("status") == "success":
@@ -1156,11 +1277,13 @@ async def process_command(req: CommandRequest):
 # ── Gallery endpoints ─────────────────────────────────────────────────────────
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_DOC_EXTS = {".docx", ".pptx", ".ppt", ".xlsx", ".xls", ".pdf", ".csv", ".txt", ".md", ".html", ".htm", ".rtf"}
 
 @app.get("/api/gallery")
 def get_gallery():
-    """Recursively scan work_files for images, returning metadata for each file.
-    Categorises files into: pc_screenshot, phone, generated, other."""
+    """Recursively scan work_files for images and documents, returning metadata
+    for each file. Categorises into: pc_screenshot, phone, generated, document,
+    other. Documents (docx/pptx/pdf/...) persist across restarts and always show."""
     work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
     if not os.path.exists(work_dir):
         return {"images": []}
@@ -1171,7 +1294,9 @@ def get_gallery():
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fname in sorted(files):
             ext = os.path.splitext(fname)[1].lower()
-            if ext not in _IMAGE_EXTS:
+            is_image = ext in _IMAGE_EXTS
+            is_doc = ext in _DOC_EXTS
+            if not is_image and not is_doc:
                 continue
             full_path = os.path.join(root, fname)
             rel = os.path.relpath(full_path, work_dir).replace("\\", "/")
@@ -1186,11 +1311,14 @@ def get_gallery():
 
             # Categorise based on folder / filename prefix
             rel_lower = rel.lower()
-            if rel_lower.startswith("phone/") or fname.startswith("phone_"):
+            kind = "image" if is_image else "document"
+            if not is_image:
+                category = "document"
+            elif rel_lower.startswith("phone/") or fname.startswith("phone_"):
                 category = "phone"
             elif rel_lower.startswith("images/") or fname.startswith("gen_") or fname.startswith("image_"):
                 category = "generated"
-            elif fname.startswith("screenshot_") or fname.startswith("screen_"):
+            elif rel_lower.startswith("screenshots/") or fname.startswith("screenshot_") or fname.startswith("screen_"):
                 category = "pc_screenshot"
             else:
                 category = "other"
@@ -1201,6 +1329,8 @@ def get_gallery():
                 "size": size,
                 "mtime": mtime,
                 "category": category,
+                "kind": kind,
+                "ext": ext.lstrip("."),
             })
 
     # Newest first
@@ -1210,7 +1340,7 @@ def get_gallery():
 
 @app.get("/api/files/serve")
 def serve_work_file(path: str):
-    """Serve an image from work_files by its relative path (safe — refuses path traversal)."""
+    """Serve a file from work_files by its relative path (safe — refuses path traversal)."""
     work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
     full_path = os.path.abspath(os.path.join(work_dir, path))
     # Guard against path traversal
@@ -1219,8 +1349,23 @@ def serve_work_file(path: str):
     if not os.path.isfile(full_path):
         raise HTTPException(status_code=404, detail="File not found.")
     ext = os.path.splitext(full_path)[1].lower()
-    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+    mime_map = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".pdf": "application/pdf",
+        ".csv": "text/csv",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".rtf": "application/rtf",
+    }
     media_type = mime_map.get(ext, "application/octet-stream")
     return FileResponse(full_path, media_type=media_type)
 
@@ -1361,3 +1506,8 @@ async def agent_resume(req: dict):
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)

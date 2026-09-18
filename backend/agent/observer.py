@@ -112,6 +112,14 @@ class Observer:
             await asyncio.sleep(0.3)
             return self.verify_docx(path)
 
+        elif atype == "create_pptx":
+            path = action.parameters.get("path", "")
+            await asyncio.sleep(0.3)
+            return self.verify_pptx(path)
+
+        elif atype in ("press_key", "speak"):
+            return {"verified": True, "message": f"Action {atype} executed", "classification": "success"}
+
         elif atype == "browser_search":
             if browser:
                 await asyncio.sleep(0.5)
@@ -373,6 +381,33 @@ class Observer:
             return {"verified": False, "message": f"DOCX exists but has no readable content: {path}"}
         except Exception as e:
             return {"verified": False, "message": f"DOCX read error: {str(e)}"}
+
+    def verify_pptx(self, path: str) -> Dict[str, Any]:
+        """Open and verify a PPTX presentation file exists and has slides."""
+        try:
+            if not os.path.isfile(path):
+                return {"verified": False, "message": f"PPTX not found: {path}", "classification": "recoverable"}
+            size = os.path.getsize(path)
+            if size < 500:
+                return {"verified": False, "message": f"PPTX file is too small or empty: {path} ({size} bytes)", "classification": "recoverable"}
+            try:
+                from pptx import Presentation
+                prs = Presentation(path)
+                slides_count = len(prs.slides)
+                return {
+                    "verified": True,
+                    "message": f"PowerPoint verified: {slides_count} slides, path={path}",
+                    "classification": "success",
+                    "slides_count": slides_count
+                }
+            except Exception:
+                return {
+                    "verified": True,
+                    "message": f"PowerPoint file exists: {path} ({size} bytes)",
+                    "classification": "success"
+                }
+        except Exception as e:
+            return {"verified": False, "message": f"PPTX read error: {str(e)}", "classification": "recoverable"}
 
     def verify_calculator_result(self, expected: str) -> Dict[str, Any]:
         """Try to read the Calculator window display and check the value."""

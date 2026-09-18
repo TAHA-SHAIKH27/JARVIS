@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import json
+import urllib.request
 from typing import Any, Dict, Optional
 from main import load_config
 
@@ -55,7 +57,18 @@ class Vision:
 
     @staticmethod
     async def text_from_image(image_base64: str, mime_type: str = "image/png") -> Dict[str, Any]:
-        """Extract text from an image using OCR/vision."""
+        """Extract text from an image (or PDF) using OCR/vision."""
+        return Vision._ocr_sync(image_base64, mime_type)
+
+    @staticmethod
+    def text_from_image_sync(image_base64: str, mime_type: str = "image/png") -> Dict[str, Any]:
+        """Synchronous OCR for use inside non-async call paths (e.g. document
+        extraction where the file handler is already inside a running loop)."""
+        return Vision._ocr_sync(image_base64, mime_type)
+
+    @staticmethod
+    def _ocr_sync(image_base64: str, mime_type: str = "image/png") -> Dict[str, Any]:
+        """Shared implementation: extract text from image/PDF bytes via Gemini."""
         try:
             config = load_config()
             api_key = config.get("gemini_api_key", "")
@@ -63,14 +76,12 @@ class Vision:
             if not api_key:
                 return {"status": "error", "message": "No Gemini API key configured for OCR."}
 
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-
             payload = {
                 "contents": [
                     {
                         "parts": [
                             {"inline_data": {"mime_type": mime_type, "data": image_base64}},
-                            {"text": "Extract all text from this image. Return only the text, no analysis or commentary."}
+                            {"text": "Extract all text from this image or document. Return only the text, no analysis or commentary."}
                         ]
                     }
                 ],
@@ -78,14 +89,21 @@ class Vision:
                     "temperature": 0.1
                 }
             }
-
             data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
 
-            candidate = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
-            return {"status": "success", "text": candidate or ""}
+            # Model fallback chain: dated model names 404, so try newer ones first.
+            for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-1.5-flash"):
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as response:
+                        result = json.loads(response.read().decode('utf-8'))
+                    candidate = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+                    return {"status": "success", "text": candidate or ""}
+                except Exception:
+                    continue
+
+            return {"status": "error", "message": "All Gemini OCR models are unavailable."}
 
         except Exception as e:
             return {"status": "error", "message": f"Text extraction from image failed: {str(e)[:200]}"}

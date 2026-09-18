@@ -1,11 +1,26 @@
 import asyncio
+import io
 import os
 import re
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from system_ops import WORK_DIR
+from backend.tools.charts import render_chart
+
+
+def _shade_cell(cell, fill_hex: str):
+    """Fill a table cell with a background colour for a human-made look."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex)
+    tc_pr.append(shd)
 
 
 class Office:
@@ -18,15 +33,20 @@ class Office:
         headings: List[str] = None,
         lists: List[str] = None,
         tables: List[List] = None,
+        charts: List[Dict] = None,
         save_path: str = "",
         structured_report: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Create a beautifully formatted Microsoft Word .docx file."""
+        """Create a beautifully formatted Microsoft Word .docx file.
+
+        `charts` is an optional list of chart specs ({type: pie|bar|histogram|
+        line, title, labels, values|data, bins, width, height}) - each one is
+        rendered and embedded as a real image so reports look human-made."""
         try:
             # Determine save path
             if not save_path:
                 filename = f"{title.replace(' ', '_')}_{os.path.basename(os.getcwd())}.docx"
-                save_path = os.path.join(WORK_DIR, filename)
+                save_path = os.path.join(WORK_DIR, "documents", filename)
             elif not save_path.endswith('.docx'):
                 save_path = save_path + '.docx'
 
@@ -78,19 +98,63 @@ class Office:
                 if tables:
                     for table_data in tables:
                         if isinstance(table_data, list) and table_data:
-                            rows = len(table_data)
-                            cols = max(len(row) for row in table_data) if table_data else 0
-                            table = doc.add_table(rows=rows, cols=cols)
-                            table.style = 'Table Grid'
-                            for i, row_data in enumerate(table_data):
-                                for j, cell_text in enumerate(row_data):
-                                    if j < cols:
-                                        table.rows[i].cells[j].text = str(cell_text)
+                            Office._add_styled_table(doc, table_data)
+
+            # ── Embedded charts (rendered to real images) ─────────────────────
+            for chart_spec in charts or []:
+                if not isinstance(chart_spec, dict):
+                    continue
+                try:
+                    png, cw, ch = render_chart(chart_spec)
+                    cap_title = str(chart_spec.get("title", "") or "").strip()
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = p.add_run()
+                    run.add_picture(io.BytesIO(png), width=Inches(min(float(cw), 6.2)))
+                    if cap_title:
+                        cap = doc.add_paragraph()
+                        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        cap_run = cap.add_run(cap_title)
+                        cap_run.italic = True
+                        cap_run.font.size = Pt(9)
+                        cap_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+                except Exception as chart_err:
+                    # Never let one render failure kill the whole document
+                    print(f"[office] Chart embed skipped ({chart_err})")
 
             doc.save(save_path)
             return {"status": "success", "message": f"Word document created: {save_path}", "path": save_path}
         except Exception as e:
             return {"status": "error", "message": f"Failed to create Word document: {str(e)}"}
+
+    @staticmethod
+    def _add_styled_table(doc: Document, table_data: List[List]):
+        """Add a polished, readable table with a bold shaded header row."""
+        if not table_data or not isinstance(table_data, list):
+            return
+        rows = len(table_data)
+        cols = max(len(row) for row in table_data) if table_data else 0
+        if cols == 0:
+            return
+        table = doc.add_table(rows=rows, cols=cols)
+        table.style = 'Table Grid'
+        for i, row_data in enumerate(table_data):
+            for j in range(cols):
+                cell = table.rows[i].cells[j]
+                txt = str(row_data[j]) if j < len(row_data) else ""
+                cell.text = ""
+                para = cell.paragraphs[0]
+                run = para.add_run(txt)
+                if i == 0:
+                    run.bold = True
+                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                    _shade_cell(cell, "2E86AB")
+        # Give alternating rows a light shade so it reads like a real report
+        for i in range(1, rows):
+            if i % 2 == 0:
+                for j in range(cols):
+                    _shade_cell(table.rows[i].cells[j], "EAF3F8")
+        doc.add_paragraph()
 
     @staticmethod
     def _build_from_structured_report(doc: Document, report: Dict[str, Any], default_title: str):
@@ -191,13 +255,40 @@ class Office:
 
     @staticmethod
     def _build_from_markdown(doc: Document, markdown_text: str, default_title: str):
-        """Parse structured markdown text and convert into styled Word document elements."""
+        """Parse structured markdown text (incl. tables) into styled Word elements."""
         lines = markdown_text.splitlines()
         has_title = False
+        i = 0
 
-        for line in lines:
-            line_str = line.strip()
+        def _is_table_row(line: str) -> bool:
+            return bool(line.strip().startswith("|")) and line.count("|") >= 2
+
+        while i < len(lines):
+            line_str = lines[i].strip()
             if not line_str:
+                i += 1
+                continue
+
+            # ── Markdown table block ──────────────────────────────────────
+            if _is_table_row(line_str):
+                block = []
+                while i < len(lines) and _is_table_row(lines[i].strip()) and "```" not in lines[i]:
+                    block.append(lines[i].strip())
+                    i += 1
+                if block:
+                    rows = []
+                    for row_line in block:
+                        cells = [c.strip() for c in row_line.strip().strip("|").split("|")]
+                        # skip the |---| :---| separator row
+                        if all(re.match(r"^:?-+:?$", c or "-") for c in cells):
+                            continue
+                        rows.append(cells)
+                    if rows:
+                        if len(rows) == 1:
+                            # single-row table: treat as a normal inline table
+                            Office._add_styled_table(doc, rows)
+                        else:
+                            Office._add_styled_table(doc, rows)
                 continue
 
             # Heading 1 (# Heading)
@@ -224,6 +315,7 @@ class Office:
             else:
                 p = doc.add_paragraph()
                 Office._add_formatted_runs(p, line_str)
+            i += 1
 
     @staticmethod
     def _add_formatted_runs(paragraph, text: str):
@@ -293,3 +385,229 @@ class Office:
             }
         except Exception as e:
             return {"status": "error", "message": f"Failed to verify document: {str(e)}", "verified": False}
+
+    @staticmethod
+    async def create_pptx(
+        title: str = "Presentation",
+        slides: List[Dict] = None,
+        save_path: str = ""
+    ) -> Dict[str, Any]:
+        """Create a modern executive PowerPoint presentation with python-pptx.
+
+        Each slide dict supports:
+          - title:    slide title text
+          - bullets:  list of bullet text lines
+          - table:    list-of-lists table data
+          - chart:    chart spec ({type, title, labels, values, bins})
+          - notes:    speaker notes for the slide
+          - image_path: path to relevant slide image
+        """
+        try:
+            from pptx import Presentation
+            from pptx.util import Inches, Pt
+            from pptx.dml.color import RGBColor as PptRGBColor
+            from pptx.enum.text import PP_ALIGN
+            from pptx.enum.shapes import MSO_SHAPE
+
+            if not save_path:
+                safe = re.sub(r'[^\w\- ]', '_', title)
+                save_path = os.path.join(WORK_DIR, "documents", f"{safe.replace(' ', '_')}.pptx")
+            if not save_path.endswith('.pptx'):
+                save_path = save_path + '.pptx'
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+            prs = Presentation()
+            prs.slide_width = Inches(13.333)
+            prs.slide_height = Inches(7.5)
+
+            # ── Executive Cover Slide ─────────────────────────────────────────
+            cover_layout = prs.slide_layouts[6]  # Blank layout for custom styling
+            cover = prs.slides.add_slide(cover_layout)
+
+            # Dark Background Header Banner
+            bg_shape = cover.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(7.5))
+            bg_shape.fill.solid()
+            bg_shape.fill.fore_color.rgb = PptRGBColor(0x0F, 0x17, 0x2A)  # Slate 900
+            bg_shape.line.fill.background()
+
+            # Cyan Left Accent Stripe
+            accent_stripe = cover.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.8), Inches(1.5), Inches(0.15), Inches(4.5))
+            accent_stripe.fill.solid()
+            accent_stripe.fill.fore_color.rgb = PptRGBColor(0x02, 0x84, 0xC7)  # Sky 600
+            accent_stripe.line.fill.background()
+
+            # Main Title & Subtitle Box
+            title_box = cover.shapes.add_textbox(Inches(1.2), Inches(1.8), Inches(11.0), Inches(3.8))
+            tf = title_box.text_frame
+            tf.word_wrap = True
+
+            p1 = tf.paragraphs[0]
+            clean_title = re.sub(r'^(?:Presentation:?\s*|Deck:?\s*)', '', str(title), flags=re.I).strip()
+            p1.text = clean_title.title() or "Executive Presentation"
+            p1.font.size = Pt(38)
+            p1.font.bold = True
+            p1.font.color.rgb = PptRGBColor(0xFF, 0xFF, 0xFF)
+            p1.space_after = Pt(14)
+
+            p2 = tf.add_paragraph()
+            p2.text = "RESEARCH SYNTHESIS & STRATEGIC INSIGHTS"
+            p2.font.size = Pt(14)
+            p2.font.bold = True
+            p2.font.color.rgb = PptRGBColor(0x38, 0xBD, 0xF8)  # Cyan 400
+            p2.space_after = Pt(28)
+
+            p3 = tf.add_paragraph()
+            p3.text = f"Prepared by J.A.R.V.I.S. Agentic Intelligence System  ·  {datetime.now().strftime('%B %Y')}"
+            p3.font.size = Pt(12)
+            p3.font.color.rgb = PptRGBColor(0x94, 0xA3, 0xB8)  # Slate 400
+
+            # ── Content Slides ────────────────────────────────────────────────
+            for idx, slide_data in enumerate(slides or [], 1):
+                Office._build_pptx_slide(prs, slide_data, idx, len(slides or []))
+
+            prs.save(save_path)
+            return {"status": "success", "message": f"Presentation created: {save_path}", "path": save_path}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to create PowerPoint: {str(e)}"}
+
+    @staticmethod
+    def _build_pptx_slide(prs, slide_data: Dict, slide_num: int = 1, total_slides: int = 1):
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor as PptRGBColor
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN
+
+        title_text = str(slide_data.get("title", "") or "").strip()
+        bullets = slide_data.get("bullets") or []
+        table_data = slide_data.get("table")
+        chart_spec = slide_data.get("chart")
+        image_path = slide_data.get("image_path")
+        notes = slide_data.get("notes")
+
+        # Blank layout for total control over aesthetics
+        layout = prs.slide_layouts[6]
+        slide = prs.slides.add_slide(layout)
+
+        # Top Header Accent Bar
+        top_bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(1.1))
+        top_bar.fill.solid()
+        top_bar.fill.fore_color.rgb = PptRGBColor(0x0F, 0x17, 0x2A)  # Slate 900
+        top_bar.line.fill.background()
+
+        # Cyan Accent Stripe beneath top bar
+        accent_line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(1.1), Inches(13.333), Inches(0.06))
+        accent_line.fill.solid()
+        accent_line.fill.fore_color.rgb = PptRGBColor(0x02, 0x84, 0xC7)  # Sky 600
+        accent_line.line.fill.background()
+
+        # Slide Title in Header
+        if title_text:
+            tbox = slide.shapes.add_textbox(Inches(0.6), Inches(0.18), Inches(10.5), Inches(0.8))
+            ttf = tbox.text_frame
+            ttf.word_wrap = True
+            tp = ttf.paragraphs[0]
+            tp.text = title_text.title()
+            tp.font.size = Pt(22)
+            tp.font.bold = True
+            tp.font.color.rgb = PptRGBColor(0xFF, 0xFF, 0xFF)
+
+        # Slide Counter Badge in Top Right Header
+        counter_box = slide.shapes.add_textbox(Inches(11.2), Inches(0.25), Inches(1.5), Inches(0.6))
+        ctf = counter_box.text_frame
+        cp = ctf.paragraphs[0]
+        cp.alignment = PP_ALIGN.RIGHT
+        cp.text = f"{slide_num} / {total_slides}"
+        cp.font.size = Pt(12)
+        cp.font.bold = True
+        cp.font.color.rgb = PptRGBColor(0x38, 0xBD, 0xF8)
+
+        if image_path and not os.path.isfile(str(image_path)):
+            image_path = None
+        has_right = bool(chart_spec or image_path or (table_data and isinstance(table_data, list)))
+        left_w = Inches(6.0) if has_right else Inches(12.1)
+
+        # ── Left Side: Formatted Content / Bullet Points ─────────────────────
+        if bullets:
+            box = slide.shapes.add_textbox(Inches(0.6), Inches(1.35), left_w, Inches(5.6))
+            tf = box.text_frame
+            tf.word_wrap = True
+            
+            for idx, b in enumerate(bullets):
+                p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
+                p.space_after = Pt(10)
+                p.space_before = Pt(4)
+                
+                b_text = str(b).strip()
+                # Parse bold prefix if present (e.g. "**Header:** text" or "Header: text")
+                colon_match = re.match(r'^(?:\*\*)?([A-Za-z0-9\s\-_]+?)(?:\*\*)?:\s*(.*)$', b_text)
+                if colon_match:
+                    prefix_str = colon_match.group(1).strip() + ": "
+                    body_str = colon_match.group(2).strip()
+
+                    r1 = p.add_run()
+                    r1.text = "• " + prefix_str
+                    r1.font.bold = True
+                    r1.font.size = Pt(15)
+                    r1.font.color.rgb = PptRGBColor(0x02, 0x84, 0xC7)  # Sky 600
+
+                    r2 = p.add_run()
+                    r2.text = body_str
+                    r2.font.size = Pt(14)
+                    r2.font.color.rgb = PptRGBColor(0x33, 0x41, 0x55)  # Slate 700
+                else:
+                    r = p.add_run()
+                    r.text = "• " + b_text
+                    r.font.size = Pt(14)
+                    r.font.color.rgb = PptRGBColor(0x33, 0x41, 0x55)
+
+        # ── Right Side: Table ─────────────────────────────────────────────────
+        if table_data and isinstance(table_data, list) and table_data:
+            n_rows = len(table_data)
+            n_cols = max(len(r) for r in table_data)
+            tx = Inches(6.9) if bullets else Inches(0.6)
+            tbl_w = Inches(5.8) if bullets else Inches(12.1)
+            gfx = slide.shapes.add_table(n_rows, n_cols, tx, Inches(1.5), tbl_w, Inches(0.45 * n_rows + 0.3))
+            tbl = gfx.table
+            for i, row in enumerate(table_data):
+                for j in range(n_cols):
+                    cell = tbl.cell(i, j)
+                    cell.text = str(row[j]) if j < len(row) else ""
+                    if i == 0:
+                        cell.fill.solid()
+                        cell.fill.fore_color.rgb = PptRGBColor(0x0F, 0x17, 0x2A)
+                        for para in cell.text_frame.paragraphs:
+                            for run in para.runs:
+                                run.font.bold = True
+                                run.font.size = Pt(13)
+                                run.font.color.rgb = PptRGBColor(0xFF, 0xFF, 0xFF)
+                    else:
+                        cell.fill.solid()
+                        bg_c = PptRGBColor(0xF8, 0xFA, 0xFC) if i % 2 == 1 else PptRGBColor(0xFF, 0xFF, 0xFF)
+                        cell.fill.fore_color.rgb = bg_c
+                        for para in cell.text_frame.paragraphs:
+                            for run in para.runs:
+                                run.font.size = Pt(12)
+                                run.font.color.rgb = PptRGBColor(0x33, 0x41, 0x55)
+
+        # ── Right Side: Chart ─────────────────────────────────────────────────
+        if chart_spec and isinstance(chart_spec, dict):
+            from backend.tools.charts import render_chart
+            try:
+                png, cw, chh = render_chart(chart_spec)
+                w = min(float(cw), 5.8)
+                slide.shapes.add_picture(io.BytesIO(png), Inches(6.8), Inches(1.5), width=Inches(w))
+            except Exception as ce:
+                print(f"[office] PPT chart embed skipped ({ce})")
+
+        # ── Right Side: Relevant Image ───────────────────────────────────────
+        elif image_path and not (table_data and isinstance(table_data, list) and table_data):
+            try:
+                slide.shapes.add_picture(str(image_path), Inches(6.8), Inches(1.4), width=Inches(5.8))
+            except Exception as ie:
+                print(f"[office] PPT image embed skipped ({ie})")
+
+        if notes:
+            try:
+                slide.notes_slide.notes_text_frame.text = str(notes)
+            except Exception:
+                pass

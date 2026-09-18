@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -14,6 +15,7 @@ _LOCK = threading.RLock()
 _PLANNER_BRIDGE_INSTALLED = False
 _COMMAND_BRIDGE_STARTED = False
 _COMMAND_BRIDGE_INSTALLED = False
+_CONVERSATION_MIGRATED = False
 
 
 def _data_dir() -> str:
@@ -22,16 +24,35 @@ def _data_dir() -> str:
     return path
 
 
+def _migrate_legacy_conversation() -> None:
+    """One-time migration of data from the legacy conversation_context.json file.
+
+    Older builds read+wrote to different files (legacy read, new write), which
+    silently orphaned legacy data on the first write. Merge legacy turns into
+    the current file exactly once so no conversation is lost.
+    """
+    global _CONVERSATION_MIGRATED
+    if _CONVERSATION_MIGRATED:
+        return
+    _CONVERSATION_MIGRATED = True
+    try:
+        new_path = os.path.join(_data_dir(), "current_session_memory.json")
+        legacy = os.path.join(_data_dir(), "conversation_context.json")
+        if not os.path.exists(legacy) or os.path.exists(new_path):
+            return
+        value = _read_json(legacy, [])
+        if isinstance(value, list) and value:
+            _write_json(new_path, value)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def _conversation_path() -> str:
-    path = os.path.join(_data_dir(), "current_session_memory.json")
-    legacy = os.path.join(_data_dir(), "conversation_context.json")
-    if not os.path.exists(path) and os.path.exists(legacy):
-        return legacy
-    return path
+    return os.path.join(_data_dir(), "current_session_memory.json")
 
 
 def _conversation_save_path() -> str:
-    return os.path.join(_data_dir(), "current_session_memory.json")
+    return _conversation_path()
 
 
 def _reminder_path() -> str:
@@ -50,7 +71,30 @@ def _write_json(path: str, value: Any) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # Transient locks (OneDrive sync, AV scans, concurrent processes) can
+        # briefly block the atomic replace on Windows — retry with backoff.
+        last_exc = None
+        for _ in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.15)
+        else:
+            if last_exc is not None:
+                raise last_exc
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def utc_now() -> str:
@@ -155,6 +199,7 @@ class ConversationContext:
 
     def _load(self) -> List[Dict[str, Any]]:
         with _LOCK:
+            _migrate_legacy_conversation()
             value = _read_json(_conversation_path(), [])
             return value if isinstance(value, list) else []
 
@@ -293,6 +338,10 @@ class Phase1Runtime:
 
 runtime = Phase1Runtime()
 
+# One-time migration from the legacy conversation_context.json must happen at
+# import time, before any caller can create/clear the new file first.
+_migrate_legacy_conversation()
+
 
 def install_planner_context_bridge() -> None:
     global _PLANNER_BRIDGE_INSTALLED
@@ -355,6 +404,11 @@ async def _memory_route_app(scope, receive, send, original_app):
         if reset in {"clear memory", "forget everything", "reset"}:
             phase1_memory.clear()
         runtime.conversation.clear()
+        try:
+            import agent
+            agent.clear_history()
+        except Exception:
+            pass
         response = {"speak": "Memory banks cleared, sir. Starting fresh.", "logs": ["ACTION: Cleared conversation history"], "file_data": None, "refresh_files": False, "image_data": None, "phase1_reset": True}
         from starlette.responses import JSONResponse
         await JSONResponse(response)(scope, receive, send)

@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import webbrowser
 import psutil
@@ -8,7 +9,7 @@ import tempfile
 from datetime import datetime
 
 # Root folder for Jarvis's work files
-WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "work_files"))
+WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files"))
 if not os.path.exists(WORK_DIR):
     os.makedirs(WORK_DIR)
 
@@ -253,12 +254,155 @@ def create_folder(folder_name: str) -> dict:
     except Exception as e:
         return {"status": "error", "message": f"Failed to create folder: {str(e)}"}
 
-def create_word_document(filename: str, content: str) -> dict:
-    """Create a Microsoft Word .docx file relative to workspace, or on desktop if specified."""
+
+# ── Document helpers (human-like Word documents) ─────────────────────────────
+
+_CHART_MARKER_RE = None  # built lazily to avoid import churn
+
+
+def _number_token(value):
+    """Coerce a token like '42', '1,200', '12%' to float or None."""
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_document_blocks(content: str):
+    """Extract [CHART:type] Title / label: value, ... blocks from document text.
+
+    Markers are removed from the returned text; each chart becomes a spec dict
+    ready for the chart renderer. Example:
+
+        [CHART:bar] Quarterly Sales
+        Jan: 42, Feb: 55, Mar: 39
+
+        [CHART:histogram] Age Spread
+        5 8 9 12 7 11 9
+
+    Returns (cleaned_text, chart_specs).
+    """
+    global _CHART_MARKER_RE
+    if _CHART_MARKER_RE is None:
+        import re as _re
+        _CHART_MARKER_RE = _re.compile(r"^\[CHART:(\w+)\]\s*(.*)$")
+
+    lines = content.split("\n")
+    out = []
+    specs = []
+    i = 0
+    while i < len(lines):
+        m = _CHART_MARKER_RE.match(lines[i].strip())
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+
+        ctype = m.group(1).lower()
+        title = m.group(2).strip()
+        labels = []
+        values = []
+        raw_nums = []
+        i += 1
+        while i < len(lines):
+            dl = lines[i].strip()
+            if not dl or _CHART_MARKER_RE.match(dl) or dl.startswith("#"):
+                break
+            if ":" in dl:
+                for pair in dl.split(","):
+                    if ":" in pair:
+                        lab, val = pair.split(":", 1)
+                        num = _number_token(val)
+                        if num is not None:
+                            labels.append(str(lab).strip())
+                            values.append(num)
+            else:
+                for tok in dl.split():
+                    num = _number_token(tok)
+                    if num is not None:
+                        raw_nums.append(num)
+            i += 1
+
+        spec = {"type": ctype if ctype in ("pie", "bar", "histogram", "line") else "bar", "title": title}
+        if ctype == "histogram" and raw_nums:
+            spec["data"] = raw_nums
+        elif labels:
+            spec["labels"] = labels
+            spec["values"] = values
+        elif values:
+            spec["values"] = values
+        else:
+            spec["values"] = [0]
+        specs.append(spec)
+    return "\n".join(out), specs
+
+
+def _docx_add_table(doc, rows):
+    """Add one markdown table (rows = list of '|a|b|' strings) to a docx."""
+    from docx.shared import Pt, RGBColor
+    table_data = []
+    for line in rows:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        # skip the |---| :---:| separator row
+        if all(re.match(r"^:?-+:?$", c or "-") for c in cells):
+            continue
+        table_data.append(cells)
+    if not table_data:
+        return
+    cols = max(len(r) for r in table_data)
+    table = doc.add_table(rows=len(table_data), cols=cols)
+    table.style = 'Table Grid'
+    for r_i, row in enumerate(table_data):
+        for c_i in range(cols):
+            cell = table.rows[r_i].cells[c_i]
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(str(row[c_i]) if c_i < len(row) else "")
+            if r_i == 0:
+                run.bold = True
+                run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+
+def _render_chart_bytes(spec):
+    """Render a chart spec to (png_bytes_io, width_in, height_in) via backend.tools.charts."""
+    from backend.tools.charts import render_chart
+    import io as _io
+    png, w, h = render_chart(spec)
+    return _io.BytesIO(png), w, h
+
+
+def archive_document_artifact(path: str) -> str:
+    """Copy a created document/PPT into the in-project work_files/documents so the
+    FILES/GALLERY view always shows it (persists across restarts).
+
+    Returns the archive path, or the original path if already inside work_files.
+    """
+    try:
+        import shutil
+        doc_dir = os.path.join(WORK_DIR, "documents")
+        os.makedirs(doc_dir, exist_ok=True)
+        norm_work = os.path.abspath(WORK_DIR)
+        if os.path.dirname(os.path.abspath(path)).lower().startswith(norm_work.lower()):
+            return path
+        dest = os.path.join(doc_dir, os.path.basename(path))
+        if os.path.abspath(path).lower() != os.path.abspath(dest).lower():
+            shutil.copy2(path, dest)
+        return dest
+    except Exception:
+        return path
+
+
+def create_word_document(filename: str, content: str, charts: list = None) -> dict:
+    """Create a Microsoft Word .docx file relative to workspace, or on desktop if specified.
+
+    Content supports light markdown so documents look human-made:
+      # / ## / ### headings, - bullets, |a|b| markdown tables, and
+      [CHART:pie|bar|histogram|line] Title / label: value, ... blocks
+      which are rendered and embedded as real chart images.
+    """
     import re
     if not filename.endswith('.docx'):
         filename += '.docx'
-        
+
     # Check if desktop requested
     filename_lower = filename.lower()
     if "desktop" in filename_lower:
@@ -268,23 +412,92 @@ def create_word_document(filename: str, content: str) -> dict:
     else:
         filename = os.path.basename(filename)
         path = os.path.join(WORK_DIR, filename)
-        
+
+    clean_content, embedded_charts = _parse_document_blocks(content)
+    all_charts = list(charts or []) + embedded_charts
+
     try:
         import docx
+        from docx.shared import Inches, Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
         doc = docx.Document()
-        for paragraph in content.split('\n'):
-            if paragraph.strip():
-                doc.add_paragraph(paragraph)
+
+        # Title (styled from the filename) — reads like a real document
+        title_text = os.path.splitext(os.path.basename(path))[0].replace("_", " ").replace("-", " ").strip()
+        title_p = doc.add_heading(title_text.title() if title_text else "Document", level=0)
+        title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        clean_lines = clean_content.split('\n')
+        i = 0
+        while i < len(clean_lines):
+            raw_line = clean_lines[i]
+            line = raw_line.strip()
+            if not line:
+                i += 1
+                continue
+            # Markdown table block (consecutive | a | b | rows)
+            if line.startswith('|') and line.count('|') >= 2:
+                block = []
+                while i < len(clean_lines):
+                    tl = clean_lines[i].strip()
+                    if tl.startswith('|') and tl.count('|') >= 2:
+                        block.append(tl)
+                    else:
+                        break
+                    i += 1
+                _docx_add_table(doc, block)
+                continue
+            # Markdown headings
+            if line.startswith('### '):
+                doc.add_heading(line[4:].strip().title(), level=2)
+            elif line.startswith('## '):
+                doc.add_heading(line[3:].strip().title(), level=1)
+            elif line.startswith('# '):
+                doc.add_heading(line[2:].strip().title(), level=1)
+            # Bullets
+            elif line.startswith(("- ", "* ", "• ")):
+                doc.add_paragraph(line[2:].strip(), style='List Bullet')
+            # ALL-CAPS short line behaves like a section header
+            elif line.isupper() and len(line) < 60:
+                doc.add_heading(line.title(), level=1)
+            else:
+                doc.add_paragraph(line)
+            i += 1
+
+        # Embedded charts
+        for cspec in all_charts:
+            try:
+                png, cw, chh = _render_chart_bytes(cspec)
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = p.add_run()
+                run.add_picture(png, width=Inches(min(cw, 6.0)))
+                cap = doc.add_paragraph()
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap_run = cap.add_run(cspec.get("title", ""))
+                cap_run.italic = True
+                cap_run.font.size = Pt(9)
+                cap_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+            except Exception as chart_err:
+                print(f"[system_ops] Chart embedding skipped: {chart_err}")
+
         doc.save(path)
-        return {"status": "success", "message": f"Word document created successfully: {os.path.basename(path)}", "path": path}
+        archive_path = archive_document_artifact(path)
+        result = {"status": "success", "message": f"Word document created successfully: {os.path.basename(path)}", "path": path}
+        if archive_path and archive_path != path:
+            result["archive_path"] = archive_path
+        return result
     except Exception as e:
         print(f"python-docx error: {str(e)}, using plain text fallback")
         try:
-            # Create a simple .docx or .doc file with text format (or a simple text file)
-            # MS Word can open a plain text file if named .doc / .txt
             with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return {"status": "success", "message": f"Created document (plain text fallback): {os.path.basename(path)}", "path": path}
+                f.write(clean_content)
+            result = {"status": "success", "message": f"Created document (plain text fallback): {os.path.basename(path)}", "path": path}
+            archive_path = archive_document_artifact(path)
+            if archive_path and archive_path != path:
+                result["archive_path"] = archive_path
+            return result
         except Exception as e2:
             return {"status": "error", "message": f"Failed to create document: {str(e2)}"}
 
@@ -848,3 +1061,30 @@ def press_key(key: str, modifiers: list = None) -> dict:
             return {"status": "success", "message": f"Pressed key {key}"}
     except Exception as e:
         return {"status": "error", "message": f"Failed to press key {key}: {str(e)}"}
+
+def archive_document_artifact(file_path: str) -> str:
+    """Copy a generated file (DOCX, PPTX, PDF, images, etc.) into work_files/documents
+    (or work_files subfolders) so it appears persistently in the JARVIS files & album gallery."""
+    try:
+        if not file_path or not os.path.isfile(file_path):
+            return ""
+        norm_file = os.path.abspath(file_path)
+        norm_work = os.path.abspath(WORK_DIR)
+
+        # If already inside WORK_DIR, no need to copy
+        if norm_file.startswith(norm_work):
+            return norm_file
+
+        ext = os.path.splitext(norm_file)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+            target_dir = os.path.join(WORK_DIR, "images")
+        else:
+            target_dir = os.path.join(WORK_DIR, "documents")
+
+        os.makedirs(target_dir, exist_ok=True)
+        dest_path = os.path.join(target_dir, os.path.basename(norm_file))
+        shutil.copy2(norm_file, dest_path)
+        return dest_path
+    except Exception as e:
+        print(f"[archive_document_artifact] Error archiving {file_path}: {e}")
+        return ""

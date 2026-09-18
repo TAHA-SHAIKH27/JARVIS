@@ -7,17 +7,22 @@ stream_document_analysis()). Supports PDF, PPTX, DOCX, TXT, and MD.
 """
 
 import os
+import base64
 
 # Keep well under Gemini's context window while avoiding pathologically
 # large payloads from someone uploading a 2000-page PDF.
 MAX_CHARS = 400_000
 MAX_PDF_PAGES = 200
 
-SUPPORTED_EXTENSIONS = (".txt", ".md", ".csv", ".log", ".pdf", ".pptx", ".docx")
+SUPPORTED_EXTENSIONS = (".txt", ".md", ".csv", ".log", ".pdf", ".pptx", ".docx", ".png", ".jpg", ".jpeg")
 
 
 def extract_text(filepath: str, filename: str) -> dict:
     """Extract plain text from a document file on disk.
+
+    Supports text-based formats natively and uses the existing Gemini OCR
+    capability (backend.tools.vision) for scanned/image-only PDFs and image
+    uploads so clients get useful content instead of a 'no readable text' dead end.
 
     Returns {"status": "success", "text": str, "char_count": int, "truncated": bool}
     or {"status": "error", "message": str}.
@@ -29,14 +34,24 @@ def extract_text(filepath: str, filename: str) -> dict:
             text = _extract_txt(filepath)
         elif ext == ".pdf":
             text = _extract_pdf(filepath)
+            if not (text or "").strip():
+                # Scanned / image-only PDF — render via Gemini vision (OCR)
+                text = _ocr_file(filepath, "application/pdf")
+                if text:
+                    text = f"[OCR of scanned PDF]\n{text}"
         elif ext == ".pptx":
             text = _extract_pptx(filepath)
         elif ext == ".docx":
             text = _extract_docx(filepath)
+        elif ext in (".png", ".jpg", ".jpeg"):
+            ext_to_mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+            text = _ocr_file(filepath, ext_to_mime.get(ext, "image/png"))
+            if text:
+                text = f"[OCR of image]\n{text}"
         else:
             return {
                 "status": "error",
-                "message": f"Unsupported file type '{ext or 'unknown'}', sir. I can read PDF, DOCX, PPTX, TXT, and MD files."
+                "message": f"Unsupported file type '{ext or 'unknown'}', sir. I can read PDF, DOCX, PPTX, TXT, MD, and image files."
             }
     except Exception as e:
         return {"status": "error", "message": f"Failed to read {filename}, sir: {str(e)}"}
@@ -54,6 +69,22 @@ def extract_text(filepath: str, filename: str) -> dict:
         truncated = True
 
     return {"status": "success", "text": text, "char_count": len(text), "truncated": truncated}
+
+
+def _ocr_file(filepath: str, mime_type: str) -> str:
+    """OCR an image/PDF file with the existing Gemini vision integration."""
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read()
+        if not raw:
+            return ""
+        from backend.tools.vision import Vision
+        result = Vision.text_from_image_sync(base64.b64encode(raw).decode("utf-8"), mime_type)
+        if result.get("status") == "success":
+            return (result.get("text") or "").strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _extract_txt(filepath: str) -> str:

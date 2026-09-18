@@ -18,6 +18,7 @@ import urllib.request
 import urllib.error
 import subprocess
 import py_compile
+import tempfile
 from datetime import datetime
 
 # Protected files blacklist — recovery engine will NEVER modify these
@@ -30,6 +31,10 @@ BACKUP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".backup"
 # Self-healing configuration (can be overridden by config.json)
 MAX_NEMOTRON_RETRIES = 3
 NEMOTRON_RETRY_BACKOFF = 5  # seconds
+# Nemotron NIM streams full-file rewrites slowly (~9 tok/s). 60-90s timeouts are too
+# short for real self-healing patches; default 240s, configurable via config.json.
+NEMOTRON_REQUEST_TIMEOUT = 240  # seconds per request
+NEMOTRON_MAX_OUTPUT_TOKENS = 16384  # output budget per request (gateway-safe ceiling)
 NEED_HUMAN_NOTIFICATION = True
 
 
@@ -45,6 +50,28 @@ def _get_retry_config() -> tuple[int, int]:
         max_retries = MAX_NEMOTRON_RETRIES
         backoff = NEMOTRON_RETRY_BACKOFF
     return max_retries, backoff
+
+
+def _get_nemotron_timeout() -> int:
+    """Load per-request timeout from config.json, clamped to a sane range."""
+    config = load_config()
+    timeout = config.get("nemotron_request_timeout_seconds", NEMOTRON_REQUEST_TIMEOUT)
+    try:
+        timeout = int(timeout)
+    except (ValueError, TypeError):
+        timeout = NEMOTRON_REQUEST_TIMEOUT
+    return max(30, min(timeout, 600))
+
+
+def _get_nemotron_output_tokens() -> int:
+    """Load max output tokens from config.json, clamped to the gateway-safe range."""
+    config = load_config()
+    tokens = config.get("nemotron_max_output_tokens", NEMOTRON_MAX_OUTPUT_TOKENS)
+    try:
+        tokens = int(tokens)
+    except (ValueError, TypeError):
+        tokens = NEMOTRON_MAX_OUTPUT_TOKENS
+    return max(2048, min(tokens, 32768))
 
 
 def load_config() -> dict:
@@ -101,6 +128,7 @@ def call_nemotron(prompt: str, system_prompt: str = "", model: str = None) -> st
 
     # Load retry config from config.json
     max_retries, backoff = _get_retry_config()
+    timeout = _get_nemotron_timeout()
 
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {
@@ -118,8 +146,14 @@ def call_nemotron(prompt: str, system_prompt: str = "", model: str = None) -> st
         "messages": messages,
         "temperature": 0.1,
         "top_p": 0.7,
-        "max_tokens": 4096
+        "max_tokens": _get_nemotron_output_tokens(),
+        "stream": True
     }
+    if model_name.startswith("deepseek-ai/"):
+        # DeepSeek V-family models spend the output budget on reasoning_content by
+        # default, which truncates whole-file rewrites and causes long timeouts.
+        # Disable reasoning so the full budget is used for the actual code answer.
+        payload["reasoning_effort"] = "none"
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -127,17 +161,31 @@ def call_nemotron(prompt: str, system_prompt: str = "", model: str = None) -> st
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            log_recovery_event("NEMOTRON_REQUEST", f"Attempt {attempt}/{max_retries}", {"model": model_name})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                resp_body = resp.read().decode("utf-8")
-                res_json = json.loads(resp_body)
-                choices = res_json.get("choices", [])
-                if choices:
-                    msg = choices[0].get("message", {})
-                    content = msg.get("content") or msg.get("reasoning_content") or ""
-                    if content:
-                        log_recovery_event("NEMOTRON_SUCCESS", f"Nemotron responded successfully on attempt {attempt}")
-                        return content
+            log_recovery_event("NEMOTRON_REQUEST", f"Attempt {attempt}/{max_retries}", {"model": model_name, "timeout_seconds": timeout})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content_parts = []
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_line = line[len("data:"):].strip()
+                    if data_line == "[DONE]":
+                        break
+                    try:
+                        evt = json.loads(data_line)
+                    except Exception:
+                        continue
+                    choices = evt.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0] or {}).get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                content = "".join(content_parts)
+                if content:
+                    log_recovery_event("NEMOTRON_SUCCESS", f"Nemotron responded successfully on attempt {attempt}")
+                    return content
                 raise RuntimeError("Empty response from Nemotron")
         except Exception as e:
             last_error = e
@@ -231,6 +279,7 @@ def parse_traceback(traceback_text: str) -> dict:
     target_file = None
     target_line = None
     error_msg = ""
+    workspace_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Search for File "...", line N
     for line in reversed(lines):
@@ -238,7 +287,8 @@ def parse_traceback(traceback_text: str) -> dict:
             error_msg = line.strip()
         match = re.search(r'File "([^"]+)", line (\d+)', line)
         if match:
-            f_path = match.group(1)
+            raw_path = match.group(1)
+            f_path = raw_path if os.path.isabs(raw_path) else os.path.join(workspace_dir, raw_path)
             # Only consider files in workspace
             if os.path.exists(f_path) and not is_protected(f_path):
                 target_file = f_path
@@ -255,19 +305,103 @@ def parse_traceback(traceback_text: str) -> dict:
 def validate_python_file(filepath: str) -> tuple[bool, str]:
     """Validate python file syntax using py_compile."""
     try:
-        py_compile.compile(filepath, doraise=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfile = os.path.join(tmpdir, os.path.basename(filepath) + ".pyc")
+            py_compile.compile(filepath, cfile=cfile, doraise=True)
         return True, "Syntax valid"
     except py_compile.PyCompileError as e:
         return False, str(e)
+    except Exception as e:
+        return False, f"Validation blocked: {e}"
 
 
 def extract_code_from_llm_response(response: str) -> str:
     """Extract code cleanly from markdown code blocks or raw response."""
-    # Look for ```python ... ``` or ``` ... ```
     match = re.search(r"```(?:python)?\s*([\s\S]*?)\s*```", response)
     if match:
         return match.group(1)
     return response.strip()
+
+
+def _extract_syntax_error_line(filepath: str) -> tuple[int, str]:
+    """Check if file has syntax/compilation errors and extract the exact line number."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+        import ast
+        ast.parse(source, filename=filepath)
+    except SyntaxError as se:
+        lineno = int(se.lineno or 0)
+        return lineno, f"SyntaxError: {se.msg}"
+    except Exception as e:
+        pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfile = os.path.join(tmpdir, os.path.basename(filepath) + ".pyc")
+            py_compile.compile(filepath, cfile=cfile, doraise=True)
+        return 0, ""
+    except py_compile.PyCompileError as pe:
+        lineno = 0
+        match = re.search(r'line (\d+)', str(pe))
+        if match:
+            lineno = int(match.group(1))
+        return lineno, f"PyCompileError: {str(pe)}"
+    except Exception as e:
+        return 0, f"Validation check blocked: {e}"
+
+
+def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, traceback_text: str) -> tuple[bool, str]:
+    """Surgically repair a focused line window around target_line without rewriting the whole file."""
+    with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+        file_content = f.read()
+
+    lines = file_content.splitlines(keepends=True)
+    total_lines = len(lines)
+    if total_lines == 0:
+        return False, "File is empty"
+
+    window_radius = 25
+    start_idx = max(0, target_line - 1 - window_radius)
+    end_idx = min(total_lines, max(target_line + window_radius, start_idx + 10))
+    window_snippet = "".join(lines[start_idx:end_idx])
+
+    system_prompt = (
+        "You are an expert Python systems recovery engineer for J.A.R.V.I.S.\n"
+        "Your task: Fix the specific crash/syntax error inside the provided code snippet.\n"
+        "CRITICAL RULES:\n"
+        f"1. Output ONLY the corrected replacement code for lines {start_idx + 1} to {end_idx}.\n"
+        "2. Preserve exact variable names, function signatures, imports, and indentation.\n"
+        "3. Output ONLY the code inside a single ```python ... ``` block with zero conversational text.\n"
+        "4. Do NOT output the entire file — output ONLY the replaced snippet."
+    )
+
+    prompt = (
+        f"FILE: {os.path.basename(target_file)}\n"
+        f"ERROR LOCATION: Line {target_line}\n"
+        f"ERROR DETAILS: {error_msg}\n\n"
+        f"ORIGINAL CODE SNIPPET (Lines {start_idx + 1} to {end_idx}):\n```python\n{window_snippet}\n```\n\n"
+        f"Output the corrected snippet for lines {start_idx + 1}-{end_idx} inside ```python ... ```."
+    )
+
+    llm_response = call_nemotron(prompt, system_prompt)
+    fixed_snippet = extract_code_from_llm_response(llm_response)
+    if not fixed_snippet or len(fixed_snippet.strip()) < 5:
+        return False, "Empty snippet returned by model"
+
+    # Ensure trailing newline if needed
+    if not fixed_snippet.endswith("\n"):
+        fixed_snippet += "\n"
+
+    # Splice fixed window back into the file lines
+    new_lines = lines[:start_idx] + [fixed_snippet] + lines[end_idx:]
+    new_content = "".join(new_lines)
+
+    with open(target_file, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    is_valid, val_msg = validate_python_file(target_file)
+    return is_valid, val_msg
 
 
 def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
@@ -286,7 +420,39 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
     target_line = parsed.get("line")
     error_summary = parsed.get("error")
 
+    # If traceback didn't identify a file, check if any core file has a syntax error
     if not target_file or not os.path.exists(target_file):
+        workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        core_files = [
+            "main.py", "agent.py", "system_ops.py", "code_core.py",
+            "recovery_engine.py", "jarvis_watchdog.py", "phone_control.py"
+        ]
+        for cf in core_files:
+            cfp = os.path.join(workspace_dir, cf)
+            if os.path.exists(cfp):
+                err_line, err_msg = _extract_syntax_error_line(cfp)
+                if err_line > 0:
+                    target_file = cfp
+                    target_line = err_line
+                    error_summary = err_msg
+                    break
+
+    if not target_file or not os.path.exists(target_file):
+        # Check if this is an "unhealthy backend" situation (health check failures
+        # without a Python crash) rather than a code crash. In that case, the backend
+        # just needs restarting, not code patching.
+        crash_summary = (error_summary or "").strip()
+        is_unhealthy_backend = (
+            "UNHEALTHY BACKEND DETECTED" in crash_summary
+            or "Consecutive health check failures" in crash_summary
+        )
+        if is_unhealthy_backend:
+            return {
+                "status": "unhealthy_backend",
+                "message": f"Backend became unhealthy (health check failures) but no code crash detected. Backend needs restart, not code patching.",
+                "file": None,
+                "traceback": traceback_text[:1000]
+            }
         return {
             "status": "error",
             "message": f"Could not identify a mutable workspace file from traceback: {error_summary}",
@@ -311,6 +477,67 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
     with open(target_file, "r", encoding="utf-8", errors="replace") as f:
         original_content = f.read()
 
+    current_error = error_summary
+    current_line = target_line or 1
+
+    # Multi-error surgical repair loop (fixes 1-by-1 fast)
+    max_surgical_passes = 4
+    for p in range(1, max_surgical_passes + 1):
+        # Determine exact error line if not known
+        if not current_line or current_line <= 0:
+            syn_line, syn_msg = _extract_syntax_error_line(target_file)
+            if syn_line > 0:
+                current_line = syn_line
+                current_error = syn_msg
+
+        print(f"\n[RECOVERY] Surgical Repair Pass {p}/{max_surgical_passes} on {os.path.basename(target_file)} near line {current_line}...")
+        log_recovery_event("SURGICAL_REPAIR_ATTEMPT", f"Pass {p} on {os.path.basename(target_file)}: line {current_line}", {"line": current_line, "error": current_error})
+
+        try:
+            is_valid, val_msg = _repair_window_attempt(target_file, current_line, current_error, traceback_text)
+            if is_valid:
+                # Check if there's any remaining syntax error on a different line
+                next_line, next_msg = _extract_syntax_error_line(target_file)
+                if next_line == 0:
+                    log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated in pass {p}")
+                    print(f"[RECOVERY] SUCCESS: File {os.path.basename(target_file)} repaired and validated!")
+                    return {
+                        "status": "success",
+                        "file": target_file,
+                        "attempt": p,
+                        "backup": backup_path,
+                        "message": f"Successfully repaired {os.path.basename(target_file)} (surgical pass {p})."
+                    }
+                else:
+                    print(f"[RECOVERY] Pass {p} resolved line {current_line}, but found next error at line {next_line}: {next_msg}")
+                    current_line = next_line
+                    current_error = next_msg
+                    continue
+            else:
+                print(f"[RECOVERY] Surgical pass {p} validation reported: {val_msg}")
+                # Check if the validation error pinpointed a new line
+                next_line, next_msg = _extract_syntax_error_line(target_file)
+                if next_line > 0:
+                    current_line = next_line
+                    current_error = next_msg
+                else:
+                    current_error = val_msg
+        except RuntimeError as e:
+            print(f"\n[RECOVERY] Nemotron self-healing engine unavailable: {e}")
+            log_recovery_event("RECOVERY_NEMOTRON_UNAVAILABLE", str(e))
+            restore_backup(backup_path, target_file)
+            return {
+                "status": "nemotron_unavailable",
+                "file": target_file,
+                "backup": backup_path,
+                "message": f"Nemotron self-healing engine unavailable after retries. Rolled back safely."
+            }
+        except Exception as e:
+            print(f"[RECOVERY] Surgical repair exception: {e}")
+            current_error = str(e)
+
+    # Fallback to full-file repair if surgical passes failed
+    print(f"\n[RECOVERY] Surgical repair exhausted. Falling back to whole-file repair...")
     system_prompt = (
         "You are an expert Python systems recovery engineer for J.A.R.V.I.S.\n"
         "Your task: Fix the provided code file to resolve the specific crash/traceback error.\n"
@@ -321,10 +548,8 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
         "4. Ensure zero syntax errors, valid imports, and proper exception handling."
     )
 
-    current_error = error_summary
     for attempt in range(1, max_retries + 1):
-        print(f"\n[RECOVERY] Attempt {attempt}/{max_retries} — Querying Nemotron (Self-Healing Engine)...")
-
+        print(f"\n[RECOVERY] Fallback Attempt {attempt}/{max_retries} — Querying Nemotron (Full File)...")
         prompt = (
             f"FILE TO REPAIR: {target_file}\n"
             f"CRASH TRACEBACK:\n{traceback_text}\n\n"
@@ -343,53 +568,40 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
                 time.sleep(1)
                 continue
 
-            # Write fixed code
             with open(target_file, "w", encoding="utf-8") as f:
                 f.write(fixed_code)
 
-            # Validate
             is_valid, val_msg = validate_python_file(target_file)
             if is_valid:
-                log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated on attempt {attempt}")
+                log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated on fallback attempt {attempt}")
                 print(f"[RECOVERY] SUCCESS: File {os.path.basename(target_file)} repaired and validated!")
                 return {
                     "status": "success",
                     "file": target_file,
                     "attempt": attempt,
                     "backup": backup_path,
-                    "message": f"Successfully repaired {os.path.basename(target_file)} on attempt {attempt}."
+                    "message": f"Successfully repaired {os.path.basename(target_file)} on fallback attempt {attempt}."
                 }
             else:
-                print(f"[RECOVERY] Attempt {attempt} validation failed: {val_msg}")
+                print(f"[RECOVERY] Fallback attempt {attempt} validation failed: {val_msg}")
                 current_error = f"Validation py_compile error: {val_msg}"
                 time.sleep(1)
 
-        except RuntimeError as e:
-            # Nemotron exhausted retries - this is a terminal failure for self-healing
-            print(f"\n[RECOVERY] Nemotron self-healing engine unavailable: {e}")
-            log_recovery_event("RECOVERY_NEMOTRON_UNAVAILABLE", str(e))
-            restore_backup(backup_path, target_file)
-            return {
-                "status": "nemotron_unavailable",
-                "file": target_file,
-                "backup": backup_path,
-                "message": f"Nemotron self-healing engine unavailable after retries. Rolled back safely. Human intervention required."
-            }
         except Exception as e:
-            print(f"[RECOVERY] Attempt {attempt} error: {e}")
+            print(f"[RECOVERY] Fallback attempt {attempt} error: {e}")
             current_error = str(e)
             time.sleep(1)
 
     # If all attempts failed, execute automatic rollback
-    print(f"\n[RECOVERY] FAILED: All {max_retries} attempts failed. Rolling back to original state...")
-    log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All {max_retries} repair attempts failed for {os.path.basename(target_file)}")
+    print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Rolling back to original state...")
+    log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All repair attempts failed for {os.path.basename(target_file)}")
     restore_backup(backup_path, target_file)
 
     return {
         "status": "failed_rolled_back",
         "file": target_file,
         "backup": backup_path,
-        "message": f"Could not safely repair {os.path.basename(target_file)} after {max_retries} attempts. Rolled back safely."
+        "message": f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts. Rolled back safely."
     }
 
 

@@ -123,6 +123,9 @@ class Executor:
         elif atype == "create_docx":
             return await self._create_docx(params, state)
 
+        elif atype == "create_pptx":
+            return await self._create_pptx(params, state)
+
         # ── Browser ──────────────────────────────────────────────────────────
 
         elif atype == "browser_search":
@@ -298,7 +301,7 @@ class Executor:
             from datetime import datetime
             try:
                 import json as _json
-                notes_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "notes.json"))
+                notes_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "notes.json"))
                 notes = []
                 if os.path.exists(notes_path):
                     with open(notes_path) as f:
@@ -316,7 +319,7 @@ class Executor:
             from datetime import datetime
             try:
                 import json as _json
-                todos_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "todos.json"))
+                todos_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "todos.json"))
                 todos = []
                 if os.path.exists(todos_path):
                     with open(todos_path) as f:
@@ -385,7 +388,12 @@ class Executor:
 
         elif atype == "clear_history":
             import agent
-            agent.conversation_history.clear()
+            agent.clear_history()
+            try:
+                from backend.agent import phase1_runtime
+                phase1_runtime.runtime.conversation.clear()
+            except Exception:
+                pass
             return {"status": "success", "message": "Conversation history cleared"}
 
         elif atype == "generate_image":
@@ -684,7 +692,8 @@ class Executor:
         headings = action.get("headings", [])
 
         if not path:
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            from system_ops import get_desktop_path
+            desktop = get_desktop_path()
             safe_title = re.sub(r'[^\w\-_]', '_', title)
             path = os.path.join(desktop, f"{safe_title}.docx")
 
@@ -738,11 +747,16 @@ class Executor:
             state.cross_source_analysis = comparison
 
             # 4. Deep report synthesis
+            target_sections = (
+                action.get("target_sections")
+                or (getattr(state, "task_metadata", {}).get("target_slides") if getattr(state, "task_metadata", None) else None)
+            )
             structured_report = synthesizer.synthesize_research_report(
                 topic=clean_topic,
                 sources=unique_sources,
                 source_analyses=source_analyses,
-                comparison=comparison
+                comparison=comparison,
+                target_sections=target_sections
             )
             state.synthesized_report = structured_report
 
@@ -752,6 +766,8 @@ class Executor:
                     structured_report=structured_report,
                     save_path=path
                 )
+                if result.get("status") == "success":
+                    self._archive_document(path)
                 state.final_outcome_verified = True
                 state.final_outcome_data = {"path": path, "title": title, "report": structured_report}
                 return result
@@ -769,11 +785,252 @@ class Executor:
                 headings=headings if headings else ["Executive Summary", "Key Findings", "References"],
                 save_path=path
             )
+            if result.get("status") == "success":
+                self._archive_document(path)
             state.final_outcome_verified = True
             state.final_outcome_data = {"path": path, "title": title}
             return result
         except Exception as e:
             return {"status": "error", "message": f"Failed to create DOCX: {str(e)}"}
+
+    async def _create_pptx(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Create a PowerPoint presentation using python-pptx.
+
+        When research data exists in state, the deck is synthesized from the
+        analyzed research (never raw webpage text) — mirroring how _create_docx
+        works. Slides that requested a topic-relevant image get one acquired
+        online first, with Hugging Face generation used only as a fallback."""
+        path = action.get("path", "")
+        title = action.get("title", "Presentation")
+
+        if not path:
+            from system_ops import WORK_DIR
+            safe_title = re.sub(r'[^\w\-_]', '_', title)
+            doc_dir = os.path.join(WORK_DIR, "documents")
+            os.makedirs(doc_dir, exist_ok=True)
+            path = os.path.join(doc_dir, f"{safe_title}.pptx")
+
+        if not path.endswith(".pptx"):
+            path += ".pptx"
+
+        try:
+            slides = await self._prepare_slides(action, state)
+            if not isinstance(slides, list) or not slides:
+                if slides is True:
+                    return {"status": "ok", "message": "No slides requested for this task.", "path": path}
+                return {"status": "error", "message": "create_pptx requires 'slides' to be a list of slide objects."}
+
+            from backend.tools.office import Office
+            result = await Office.create_pptx(title=title, slides=slides, save_path=path)
+            if result.get("status") == "success":
+                self._archive_document(path)
+            state.final_outcome_verified = True
+            state.final_outcome_data = {"path": path, "title": title, "slide_count": len(slides)}
+            return result
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to create PowerPoint: {str(e)}"}
+
+    async def _prepare_slides(self, action: Dict, state: TaskState) -> List[Dict[str, Any]]:
+        """Decide the final slide structure: synthesized-from-analysis when research
+        data exists, otherwise the plan's slides. Then acquire images for any slide
+        that genuinely calls for one (online first, HF generation as fallback)."""
+        title = action.get("title", "Presentation")
+        slides = action.get("slides", []) or []
+        if not isinstance(slides, list):
+            slides = []
+
+        target_slides = (
+            action.get("target_slides")
+            or (getattr(state, "task_metadata", {}).get("target_slides") if getattr(state, "task_metadata", None) else None)
+            or (len(slides) if len(slides) > 1 else None)
+        )
+
+        # Research-backed tasks always synthesize the deck from analyzed content,
+        # just like the Word pipeline — planner slides built before extraction
+        # cannot reflect the actual information gathered.
+        if state.extracted_sources or state.search_results:
+            deck = self._synthesize_deck(title, state, target_slides=target_slides)
+            if deck and deck.get("slides"):
+                slides = deck["slides"]
+
+        if not slides:
+            return slides
+
+        slides = await self._acquire_slide_images(slides)
+        return slides
+
+    def _synthesize_deck(self, title: str, state: TaskState, target_slides: Optional[int] = None) -> Dict[str, Any]:
+        """Run the research analysis pipeline and produce a slide structure."""
+        try:
+            from backend.agent.research_synthesizer import ResearchSynthesizer
+            synthesizer = ResearchSynthesizer()
+
+            raw_sources = state.extracted_sources if state.extracted_sources else state.search_results
+            unique_sources = []
+            seen_urls = set()
+            for src in raw_sources or []:
+                u = (src.get("url") or "").strip().lower()
+                if u and u not in seen_urls:
+                    seen_urls.add(u)
+                    unique_sources.append(src)
+                elif not u:
+                    unique_sources.append(src)
+            if not unique_sources:
+                unique_sources = raw_sources or []
+
+            source_analyses = []
+            for src in unique_sources:
+                s_title = src.get("title") or src.get("url") or "Web Source"
+                s_url = src.get("url") or ""
+                s_content = src.get("text") or src.get("snippet") or ""
+                source_analyses.append(synthesizer.analyze_source(s_title, s_url, s_content))
+            state.source_analyses = source_analyses
+
+            clean_topic = title
+            for prefix in ["Presentation:", "Presentation -", "Research Presentation:", "Deck:"]:
+                if clean_topic.startswith(prefix):
+                    clean_topic = clean_topic[len(prefix):].strip()
+            if not clean_topic.strip():
+                clean_topic = state.task or "Research Topic"
+
+            comparison = synthesizer.compare_sources(clean_topic, source_analyses)
+            state.cross_source_analysis = comparison
+            return synthesizer.synthesize_presentation(
+                clean_topic, unique_sources, source_analyses, comparison, target_slides=target_slides
+            )
+        except Exception as e:
+            print(f"[executor] Deck synthesis skipped ({e})")
+            return {}
+
+    async def _acquire_slide_images(self, slides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """For slides that requested a topic image (image_subject/image_url), acquire
+        a relevant one: explicit URL → online image search → HF generation fallback.
+        Never generates an image merely to fill a slot — only when requested."""
+        from system_ops import WORK_DIR
+        import time as _time
+
+        img_dir = os.path.join(WORK_DIR, "images")
+        try:
+            os.makedirs(img_dir, exist_ok=True)
+        except Exception:
+            pass
+        hf_key = self._load_hf_key()
+        browser = getattr(self, "_browser", None)
+
+        updated = []
+        for i, slide in enumerate(slides or [], 1):
+            if not isinstance(slide, dict):
+                updated.append(slide)
+                continue
+            subject = slide.get("image_subject")
+            explicit_url = slide.get("image_url")
+            if not subject and not explicit_url:
+                updated.append(slide)
+                continue
+
+            img_path = ""
+
+            # 1) Direct image URL provided by the plan (most relevant, zero guessing)
+            if explicit_url:
+                img_path = await self._download_image_url(explicit_url, img_dir, f"slide{i}")
+
+            # 2) Online image search for the slide's subject (relevant by query)
+            if not img_path and browser is not None and getattr(browser, "context", None) is not None:
+                try:
+                    urls = await browser.search_images(str(subject)[:120])
+                    for candidate in urls or []:
+                        img_path = await self._download_image_url(candidate, img_dir, f"slide{i}")
+                        if img_path:
+                            break
+                except Exception:
+                    pass
+
+            # 3) HF generation — supplement only, and only when the slide asked for a picture
+            if not img_path and subject and hf_key:
+                try:
+                    from agent import generate_image_huggingface
+                    prompt = f"Editorial, documentary-style image related to: {subject}. Realistic, relevant, high quality."
+                    res = generate_image_huggingface(prompt, hf_key, f"ppt_slide{i}_{int(_time.time())}.png")
+                    if res.get("status") == "success":
+                        filename = res.get("filename", "")
+                        if filename:
+                            candidate = os.path.join(WORK_DIR, filename.replace("/", os.sep))
+                            if os.path.isfile(candidate):
+                                img_path = candidate
+                except Exception:
+                    pass
+
+            slide = dict(slide)
+            if img_path:
+                slide["image_path"] = img_path
+            updated.append(slide)
+        return updated
+
+    @staticmethod
+    async def _download_image_url(url: str, dest_dir: str, prefix: str) -> str:
+        """Download an image to dest_dir. Returns local path on success, else ''."""
+        try:
+            import requests
+            import uuid
+            resp = requests.get(url, timeout=12, stream=True,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            if resp.status_code != 200:
+                return ""
+            ctype = (resp.headers.get("Content-Type", "") or "").lower()
+            if not ctype.startswith("image/"):
+                return ""
+            data = resp.content
+            if not data or len(data) > 6 * 1024 * 1024:
+                return ""
+            ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                       "image/gif": ".gif", "image/bmp": ".bmp", "image/webp": ".webp"}
+            ext = ext_map.get(ctype, ".jpg")
+            path = os.path.join(dest_dir, f"{prefix}_{uuid.uuid4().hex[:8]}{ext}")
+            with open(path, "wb") as f:
+                f.write(data)
+            # python-pptx cannot embed webp — convert to PNG via Pillow when possible
+            if ext == ".webp":
+                from PIL import Image
+                png_path = path[:-5] + ".png"
+                Image.open(path).convert("RGB").save(png_path, "PNG")
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                path = png_path
+            return path if os.path.isfile(path) else ""
+        except Exception:
+            return ""
+
+    def _load_hf_key(self) -> str:
+        """Load the configured Hugging Face API key, or '' when unset."""
+        try:
+            import json as _json
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(base_dir, "config.json"),
+                os.path.join(base_dir, "..", "config.json"),
+                os.path.join(base_dir, "..", "..", "config.json"),
+                os.path.join(os.getcwd(), "config.json")
+            ]
+            for cfg_path in candidates:
+                if os.path.isfile(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        key = _json.load(f).get("huggingface_api_key", "")
+                    if key:
+                        return key
+        except Exception:
+            pass
+        return ""
+
+    def _archive_document(self, path: str) -> None:
+        """Ensure documents/PPTs saved outside work_files are mirrored into
+        work_files/documents so the FILES/GALLERY view shows them."""
+        try:
+            from system_ops import archive_document_artifact
+            archive_document_artifact(path)
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Browser helpers

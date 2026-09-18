@@ -437,13 +437,11 @@ class AgentCore:
                         observation = {"verified": False, "message": f"Observer error: {str(e)}"}
                     
                     verification = self.verifier.verify_action(action, result, observation)
-                    
-        
-            # Log execution step
-            self._log_execution(action_index + 1, len(actions), action, result or {}, observation or {}, verification or {})
-            
-            if verification["verified"]:
 
+                    # Log execution step
+                    self._log_execution(idx + 1, len(actions), action, result or {}, observation or {}, verification or {})
+
+                    if verification["verified"]:
                         state.completed_steps.append(idx)
                         completed_indices.add(idx)
                         state.observations.append(observation)
@@ -606,7 +604,7 @@ class AgentCore:
     def _log_execution(self, step_idx: int, total_steps: int, action: ActionSpec, result: dict, observation: dict, verification: dict):
         import datetime
         import os
-        log_dir = 'C:/Users/taha/OneDrive/Desktop/J.A.R.V.I.S. (Claude)/backend/logs'
+        log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, 'execution.log')
         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
