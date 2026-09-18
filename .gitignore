@@ -41,3 +41,8 @@ whisper.cpp/
 ws-scrcpy/
 client_secret.json
 config.json
+
+# Local JARVIS working data
+.backup/
+downloads/
+work_files/
