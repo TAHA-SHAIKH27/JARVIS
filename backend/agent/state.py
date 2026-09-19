@@ -1,6 +1,82 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
+from datetime import datetime
+
+
+@dataclass
+class ConversationContext:
+    """Conversation context - what the user is discussing."""
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    last_user_message: str = ""
+    last_agent_response: str = ""
+    topic: str = ""
+    turn_count: int = 0
+    language: str = "en"
+
+    def add_message(self, role: str, content: str):
+        self.messages.append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
+        self.turn_count += 1
+        if role == "user":
+            self.last_user_message = content
+            self.topic = self._extract_topic(content)
+        elif role == "assistant":
+            self.last_agent_response = content
+
+    def _extract_topic(self, text: str) -> str:
+        # Simple topic extraction from user message
+        words = text.lower().split()
+        # Remove common stop words
+        stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "must", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "her", "its", "our", "their", "this", "that", "these", "those", "what", "when", "where", "who", "why", "how", "please", "thank", "thanks"}
+        topic_words = [w for w in words if w not in stop_words and len(w) > 2]
+        return " ".join(topic_words[:5]) if topic_words else ""
+
+
+@dataclass
+class TaskContext:
+    """Task context - what JARVIS is currently doing."""
+    current_task: str = ""
+    interpreted_goal: str = ""
+    plan_summary: str = ""
+    current_action: str = ""
+    action_index: int = 0
+    completed_actions: List[str] = field(default_factory=list)
+    failed_actions: List[Dict[str, Any]] = field(default_factory=list)
+    progress: float = 0.0
+    status: str = "pending"  # pending, running, paused, completed, failed
+    estimated_steps_remaining: int = 0
+
+
+@dataclass
+class ComputerContext:
+    """Computer context - what is currently visible/open on the machine."""
+    active_window: Optional[str] = None
+    active_app: Optional[str] = None
+    running_apps: List[str] = field(default_factory=list)
+    open_windows: List[Dict[str, Any]] = field(default_factory=list)
+    ui_elements: List[Dict[str, Any]] = field(default_factory=list)
+    focused_element: Optional[Dict[str, Any]] = None
+    screen_resolution: Optional[tuple] = None
+    last_screenshot: Optional[str] = None
+    clipboard_content: str = ""
+    last_updated: Optional[str] = field(default_factory=lambda: datetime.now().isoformat())
+
+    def update_from_observation(self, observation: Dict[str, Any]):
+        if observation.get("active_window"):
+            self.active_window = observation["active_window"]
+        if observation.get("active_app"):
+            self.active_app = observation["active_app"]
+        if observation.get("running_apps"):
+            self.running_apps = observation["running_apps"]
+        if observation.get("elements"):
+            self.ui_elements = observation["elements"]
+        if observation.get("focused_element"):
+            self.focused_element = observation["focused_element"]
+        self.last_updated = datetime.now().isoformat()
 
 
 class BrowserPageState(Enum):
@@ -144,6 +220,11 @@ class TaskState:
     task_id: str = ""
     task_started_at: str = ""
     phase1_initialized: bool = False
+
+    # Separated contexts
+    conversation: ConversationContext = field(default_factory=ConversationContext)
+    task_context: TaskContext = field(default_factory=TaskContext)
+    computer_context: ComputerContext = field(default_factory=ComputerContext)
 
     _context: Dict[str, Any] = field(default_factory=dict)
 

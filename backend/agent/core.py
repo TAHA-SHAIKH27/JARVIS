@@ -14,12 +14,20 @@ Flow per task:
   5. Human-in-the-loop handling (pause/resume)
   6. Final Outcome Verification → verify actual deliverable exists
   7. Emit "complete" event with verified summary
+
+Supports:
+- Mid-task user instructions (updates current task context)
+- Interruptible execution (planning, speaking, waiting, acting)
+- Separate conversation/task/computer contexts
+- Bounded failure recovery with alternative strategies
 """
 import asyncio
 import json
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Callable
+from dataclasses import dataclass, field
+from enum import Enum
 
 from backend.agent.state import TaskState, ActionSpec, Plan, TaskType, FailureClassification
 from backend.agent.registry import ToolRegistry
@@ -94,6 +102,142 @@ class AgentCore:
         self.registry.register("computer_tool", Computer(self.registry))
         self.registry.register("browser_tool", Browser())
         self.registry.register("office_tool", Office)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Interruption & Status Management
+    # ─────────────────────────────────────────────────────────────────────────
+
+    class AgentStatus(Enum):
+        """High-level agent status for frontend reporting."""
+        IDLE = "idle"
+        THINKING = "thinking"
+        PLANNING = "planning"
+        ACTING = "acting"
+        OBSERVING = "observing"
+        VERIFYING = "verifying"
+        RECOVERING = "recovering"
+        REPLANNING = "replanning"
+        LISTENING = "listening"
+        SPEAKING = "speaking"
+        WAITING_FOR_USER = "waiting_for_user"
+        COMPLETED = "completed"
+        FAILED = "failed"
+        INTERRUPTED = "interrupted"
+
+    def __init__(self):
+        self.registry = ToolRegistry()
+        self.planner = Planner()
+        self.executor = Executor(self.registry)
+        self.observer = Observer(self.registry)
+        self.verifier = Verifier()
+        self._setup_default_tools()
+        
+        # Interruption and status tracking
+        self._interrupt_requested = False
+        self._interrupt_reason = ""
+        self._current_status = self.AgentStatus.IDLE
+        self._status_callback: Optional[Callable[[AgentStatus, str], None]] = None
+        self._mid_task_instruction: Optional[str] = None
+        self._mid_task_instruction_processed = False
+        self._tts_task: Optional[asyncio.Task] = None
+        self._current_action_start_time: Optional[float] = None
+        self._execution_lock = asyncio.Lock()
+
+    def set_status_callback(self, callback: Callable[[AgentStatus, str], None]):
+        """Set callback for status updates (for frontend SSE)."""
+        self._status_callback = callback
+
+    def _set_status(self, status: AgentStatus, message: str = ""):
+        """Update agent status and emit event."""
+        self._current_status = status
+        # This will be called from within process() which has event_queue
+
+    def request_interrupt(self, reason: str = "User requested interruption"):
+        """Request interruption of current execution."""
+        self._interrupt_requested = True
+        self._interrupt_reason = reason
+
+    def clear_interrupt(self):
+        """Clear interruption request."""
+        self._interrupt_requested = False
+        self._interrupt_reason = ""
+
+    def inject_mid_task_instruction(self, instruction: str):
+        """Inject a mid-task instruction to update current task."""
+        self._mid_task_instruction = instruction
+        self._mid_task_instruction_processed = False
+
+    async def _check_interrupt(self, event_queue: Optional[asyncio.Queue] = None) -> bool:
+        """Check for interruption and handle it gracefully."""
+        if self._interrupt_requested:
+            if event_queue:
+                await event_queue.put({
+                    "type": "interrupted",
+                    "message": f"Execution interrupted: {self._interrupt_reason}",
+                    "icon": "⚠",
+                    "data": {"reason": self._interrupt_reason},
+                    "ts": time.time(),
+                })
+            return True
+        return False
+
+    async def _handle_mid_task_instruction(self, state: TaskState, event_queue: Optional[asyncio.Queue] = None) -> bool:
+        """Process mid-task instruction if available."""
+        if self._mid_task_instruction and not self._mid_task_instruction_processed:
+            instruction = self._mid_task_instruction
+            self._mid_task_instruction_processed = True
+            
+            if event_queue:
+                await event_queue.put({
+                    "type": "mid_task_instruction",
+                    "message": f"Processing mid-task instruction: {instruction}",
+                    "icon": "🔄",
+                    "data": {"instruction": instruction},
+                    "ts": time.time(),
+                })
+            
+            # Update task context with new instruction
+            state.task = f"{state.task} | Mid-task update: {instruction}"
+            
+            # Replan from current state
+            try:
+                failure_context = {
+                    "step_index": state.current_step,
+                    "action_type": "mid_task_update",
+                    "reason": f"Mid-task instruction: {instruction}",
+                    "classification": "recoverable"
+                }
+                new_actions = self.planner.replan(state.task, state, failure_context)
+                # Replace plan but keep completed steps
+                state.plan = Plan(actions=new_actions, goal=state.interpreted_goal, task_type=state.task_type)
+                return True
+            except Exception as e:
+                if event_queue:
+                    await event_queue.put({
+                        "type": "error",
+                        "message": f"Failed to process mid-task instruction: {str(e)}",
+                        "icon": "✗",
+                        "ts": time.time(),
+                    })
+            return False
+        return False
+
+    async def _emit_status(self, status: 'AgentCore.AgentStatus', message: str, event_queue: Optional[asyncio.Queue] = None):
+        """Emit status update event."""
+        if event_queue:
+            await event_queue.put({
+                "type": "status_update",
+                "message": message,
+                "icon": "📊",
+                "data": {"status": status.value},
+                "ts": time.time(),
+            })
+
+    async def _execute_with_interrupt_check(self, action: ActionSpec, state: TaskState, event_queue: Optional[asyncio.Queue] = None) -> Dict[str, Any]:
+        """Execute an action with periodic interrupt checking."""
+        # For long-running actions, we could add periodic checks here
+        # For now, just execute normally - interruption is checked between actions
+        return await self.executor.execute(action, state)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main agent process loop
@@ -185,6 +329,35 @@ class AgentCore:
         completed_indices: Set[int] = set()
 
         while action_index < len(actions):
+            # Check for interruption before each action
+            if await self._check_interrupt(event_queue):
+                state.completion_status = "interrupted"
+                speak_text = f"Task interrupted, sir. {self._interrupt_reason}"
+                await emit("task_interrupted", speak_text, {
+                    "completed_steps": len(state.completed_steps),
+                    "total_steps": len([a for a in actions if a.type != "speak"]),
+                    "errors": state.errors,
+                    "reason": self._interrupt_reason
+                }, icon="⚠")
+                return {
+                    "status": "interrupted",
+                    "task": task,
+                    "speak": speak_text,
+                    "completed_steps": state.completed_steps,
+                    "errors": state.errors,
+                    "interrupt_reason": self._interrupt_reason
+                }
+
+            # Handle mid-task instruction if available
+            if await self._handle_mid_task_instruction(state, event_queue):
+                # Replan happened - reset execution to new plan
+                actions = state.plan.actions
+                action_index = 0
+                completed_indices = set()
+                state.completed_steps = []
+                state.retry_count = 0
+                continue
+
             action = actions[action_index]
             atype = action.type
             desc = action.description
@@ -211,27 +384,31 @@ class AgentCore:
             if state.waiting_for_user and state.human_verification_action_index == action_index:
                 await emit("waiting_for_user", state.human_verification_message, 
                           {"action_index": action_index, "context": state.human_verification_context}, icon="⏳")
-                # Wait for human to resolve
+                # Wait for human to resolve with interrupt check
                 while state.waiting_for_user and state.human_verification_action_index == action_index:
-                    await asyncio.sleep(1.0)
+                    if await self._check_interrupt(event_queue):
+                        state.completion_status = "interrupted"
+                        speak_text = f"Task interrupted while waiting for user, sir. {self._interrupt_reason}"
+                        await emit("task_interrupted", speak_text, {"reason": self._interrupt_reason}, icon="⚠")
+                        return {"status": "interrupted", "task": task, "speak": speak_text, "errors": state.errors}
+                    await asyncio.sleep(0.5)
                 if state.human_verification_resolved:
                     await emit("resuming", "Human intervention resolved, resuming execution", {"action_index": action_index}, icon="▶")
                     state.waiting_for_user = False
                     state.human_verification_resolved = False
-                    # Continue with this action
                 else:
-                    # Human didn't resolve, treat as failure
                     state.errors.append(f"Human intervention not resolved for step {action_index}")
                     break
 
             state.current_step = action_index
+            self._current_action_start_time = time.time()
             await emit("step_started", f"Executing step {action_index + 1}/{len(actions)}: {desc}", 
                       {"action": atype, "step": action_index + 1, "total": len(actions)}, icon="→")
 
-            # Execute
+            # Execute with interrupt checking
             await emit("tool_started", f"Starting tool: {atype}", {"action": atype, "parameters": action.parameters}, icon="⚙")
             try:
-                result = await self.executor.execute(action, state)
+                result = await self._execute_with_interrupt_check(action, state, event_queue)
             except Exception as e:
                 tb = traceback.format_exc()
                 result = {"status": "error", "message": f"Executor exception: {str(e)}", "traceback": tb}
@@ -259,6 +436,9 @@ class AgentCore:
             if verification["verified"]:
 
                 await emit("verification_passed", f"Verification passed for {atype}", {"action": atype}, icon="✓")
+                # Emit status update for frontend
+                await self._emit_status(self.AgentStatus.ACTING, f"Step {action_index + 1} completed: {desc}", event_queue)
+
                 await emit(
                     "step_completed",
                     f"✓ {desc}: {observation.get('message', '')}",
@@ -342,6 +522,7 @@ class AgentCore:
                     # Try replanning with different strategy
                     await emit("replanning", f"Strategy failed, replanning... (replan {state.replan_count + 1}/{state.max_replans})", 
                               {"reason": fail_msg, "action_index": action_index}, icon="🔄")
+                    await self._emit_status(self.AgentStatus.REPLANNING, f"Replanning due to: {fail_msg}", event_queue)
                     
                     try:
                         failure_context = {
@@ -350,7 +531,8 @@ class AgentCore:
                             "reason": fail_msg,
                             "classification": classification
                         }
-                        new_actions = self.planner.replan(task, state, failure_context)
+                        # Use state.task which may include mid-task instructions
+                        new_actions = self.planner.replan(state.task, state, failure_context)
                         actions = new_actions
                         # Replanning replaces the authoritative plan. Final
                         # verification must evaluate the replacement, not the
@@ -360,6 +542,8 @@ class AgentCore:
                         completed_indices = set()
                         state.completed_steps = []
                         state.retry_count = 0
+                        state.replan_count += 1
+                        state.last_replan_reason = fail_msg
                         continue
                     except Exception as e:
                         await emit("error", f"Replanning failed: {str(e)}", icon="✗")

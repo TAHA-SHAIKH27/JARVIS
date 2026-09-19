@@ -58,6 +58,7 @@ import code_core
 
 from backend.agent.core import AgentCore
 from backend.agent.state import TaskState
+from backend.agent.voice import get_voice_system, get_command_processor, TTSState
 
 app = FastAPI(title="J.A.R.V.I.S. Core", description="API Service for Windows OS Automation")
 
@@ -384,19 +385,61 @@ class VoiceCommandRequest(BaseModel):
     prompt: str
 
 
+class TTSRequest(BaseModel):
+    text: str
+    priority: int = 0
+    interrupt: bool = True
+
+
 @app.post("/api/voice/command")
 async def voice_command(req: VoiceCommandRequest):
     """Endpoint for the native voice service to send recognized commands."""
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="Empty prompt")
     
-    # Reuse the existing command processing logic
-    # Create a mock CommandRequest and process it
-    command_req = CommandRequest(prompt=req.prompt.strip(), apiKey=None)
-    return await process_command(command_req)
+    # Get command processor and process the voice command
+    processor = get_command_processor()
+    processor.set_agent_core(AgentCore())
+    
+    # Create a temporary task state for context checking
+    temp_state = TaskState()
+    temp_state.task = getattr(temp_state, 'task', '') or ''
+    
+    result = await processor.process_command(req.prompt.strip(), temp_state)
+    
+    if result.get("status") == "interrupted":
+        return {"status": "interrupted", "speak": "Interrupted, sir."}
+    elif result.get("status") == "mid_task_instruction":
+        return {"status": "mid_task_instruction", "speak": "Instruction noted, sir. Updating task."}
+    elif result.get("status") == "new_command":
+        # Process as new command
+        command_req = CommandRequest(prompt=req.prompt.strip(), apiKey=None)
+        return await process_command(command_req)
+    
+    return result
 
 
+@app.post("/api/voice/tts")
+async def voice_tts(req: TTSRequest):
+    """Text-to-speech endpoint with interruption support."""
+    voice = get_voice_system()
+    success = voice.speak(req.text, priority=req.priority, interrupt=req.interrupt)
+    return {"status": "success" if success else "error", "speaking": voice.is_speaking()}
 
+
+@app.post("/api/voice/tts/interrupt")
+async def voice_tts_interrupt():
+    """Interrupt current TTS playback."""
+    voice = get_voice_system()
+    interrupted = voice.interrupt()
+    return {"status": "success", "interrupted": interrupted}
+
+
+@app.get("/api/voice/tts/state")
+async def voice_tts_state():
+    """Get current TTS state."""
+    voice = get_voice_system()
+    return {"status": "success", "state": voice.get_state().value, "speaking": voice.is_speaking()}
 
 
 # ── Notes endpoints ───────────────────────────────────────────────────────

@@ -10,9 +10,21 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
 
 from backend.agent.state import TaskState, ActionSpec
 from backend.agent.registry import ToolRegistry
+from backend.tools.result_schema import (
+    create_computer_result,
+    create_browser_result,
+    create_office_result,
+    create_filesystem_result,
+    ToolResultStatus,
+    ComputerActionResult,
+    BrowserActionResult,
+    OfficeActionResult,
+    FilesystemActionResult,
+)
 
 
 class Executor:
@@ -47,6 +59,108 @@ class Executor:
         if computer is None:
             raise RuntimeError("Windows automation tool is not registered")
         return computer
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Failure Diagnosis & Recovery
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _diagnose_failure(self, action: ActionSpec, result: Dict[str, Any], state: TaskState) -> Dict[str, Any]:
+        """
+        Diagnose a failure and suggest recovery strategies.
+        Returns a dict with diagnosis info and suggested recovery actions.
+        """
+        atype = action.type
+        error_msg = result.get("message", "") if result else "No result"
+        
+        diagnosis = {
+            "action_type": atype,
+            "error_message": error_msg,
+            "recovery_strategies": [],
+            "can_retry": True,
+            "requires_alternative": False,
+            "alternative_action": None,
+        }
+        
+        if atype == "open_app_wait":
+            if "timeout" in error_msg.lower() or "not detected" in error_msg.lower():
+                diagnosis["recovery_strategies"] = [
+                    "wait_longer",
+                    "try_launch_any_app",
+                    "check_process_list",
+                    "try_alternative_executable"
+                ]
+                diagnosis["alternative_action"] = {
+                    "type": "open_app_wait",
+                    "parameters": {**action.parameters, "wait_timeout": 15}
+                }
+            elif "not found" in error_msg.lower() or "no such file" in error_msg.lower():
+                diagnosis["recovery_strategies"] = ["verify_app_name", "check_installation"]
+                diagnosis["can_retry"] = False
+        
+        elif atype in ("find_ui_element", "click_ui", "type_ui"):
+            if "not found" in error_msg.lower() or "element not found" in error_msg.lower():
+                diagnosis["recovery_strategies"] = [
+                    "re_inspect_ui",
+                    "try_coordinate_click",
+                    "wait_for_element",
+                    "try_vision_fallback"
+                ]
+                diagnosis["alternative_action"] = {
+                    "type": "inspect_ui",
+                    "parameters": {"target": action.parameters.get("window_title", "")}
+                }
+                diagnosis["requires_alternative"] = True
+        
+        elif atype == "browser_search":
+            if "captcha" in error_msg.lower() or "sorry" in error_msg.lower():
+                diagnosis["recovery_strategies"] = [
+                    "fallback_to_bing",
+                    "fallback_to_duckduckgo",
+                    "wait_for_human"
+                ]
+                diagnosis["requires_alternative"] = True
+            elif "network" in error_msg.lower() or "timeout" in error_msg.lower():
+                diagnosis["recovery_strategies"] = ["retry_with_longer_timeout", "check_connectivity"]
+        
+        elif atype == "browser_navigate":
+            if "not found" in error_msg.lower() or "404" in error_msg:
+                diagnosis["recovery_strategies"] = [
+                    "try_next_search_result",
+                    "re_search_with_modified_query"
+                ]
+                diagnosis["alternative_action"] = {
+                    "type": "browser_search",
+                    "parameters": {"query": action.parameters.get("query", "") + " alternative"}
+                }
+        
+        elif atype in ("create_docx", "create_pptx"):
+            if "permission" in error_msg.lower() or "access denied" in error_msg.lower():
+                diagnosis["recovery_strategies"] = [
+                    "try_desktop_path",
+                    "try_work_dir",
+                    "check_disk_space"
+                ]
+        
+        return diagnosis
+
+    def _apply_recovery(self, action: ActionSpec, diagnosis: Dict[str, Any], state: TaskState) -> Optional[ActionSpec]:
+        """Apply a recovery strategy and return a modified action if applicable."""
+        if not diagnosis.get("alternative_action"):
+            return None
+        
+        alt = diagnosis["alternative_action"]
+        # Create a new ActionSpec with the alternative parameters
+        from backend.agent.state import ActionSpec
+        return ActionSpec(
+            type=alt["type"],
+            description=f"Recovery: {alt['type']}",
+            parameters=alt["parameters"],
+            depends_on=action.depends_on,
+            produces=action.produces,
+            consumes=action.consumes,
+            expected_outcome=action.expected_outcome,
+            fallback="recovery_fallback",
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main dispatch

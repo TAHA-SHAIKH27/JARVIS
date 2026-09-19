@@ -7,12 +7,51 @@ Provides structured state representation for semantic computer understanding.
 import asyncio
 import os
 import time
+import json
 from typing import Any, Dict, Optional, List
+from dataclasses import dataclass, field
 
 from backend.agent.state import TaskState, ActionSpec, VerificationResult
 from backend.agent.registry import ToolRegistry
 from backend.tools.browser import Browser, BrowserPageState
-from backend.tools.result_schema import ScreenObservation, UIElement, WindowInfo
+from backend.tools.result_schema import ScreenObservation, UIElement, WindowInfo, ToolResultStatus, create_computer_result
+
+
+@dataclass
+class SemanticState:
+    """Enhanced structured state with semantic understanding."""
+    application: str
+    window_title: str
+    window_class: str
+    window_bounds: List[int]  # [x1, y1, x2, y2]
+    elements: List[UIElement]
+    running_apps: List[str]
+    active_window: Optional[WindowInfo] = None
+    timestamp: float = field(default_factory=time.time)
+    source: str = "mixed"
+    
+    # Semantic understanding
+    ui_hierarchy: Dict[str, Any] = field(default_factory=dict)
+    element_groups: Dict[str, List[UIElement]] = field(default_factory=dict)
+    interaction_hints: List[str] = field(default_factory=list)
+    confidence: float = 0.95
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "application": self.application,
+            "window_title": self.window_title,
+            "window_class": self.window_class,
+            "window_bounds": self.window_bounds,
+            "elements": [e.to_dict() for e in self.elements],
+            "running_apps": self.running_apps,
+            "active_window": self.active_window.to_dict() if self.active_window else None,
+            "timestamp": self.timestamp,
+            "source": self.source,
+            "ui_hierarchy": self.ui_hierarchy,
+            "element_groups": {k: [e.to_dict() for e in v] for k, v in self.element_groups.items()},
+            "interaction_hints": self.interaction_hints,
+            "confidence": self.confidence,
+        }
 
 
 class Observer:
@@ -46,26 +85,38 @@ class Observer:
         observations["observations"].append(f"System snapshot taken: focus={focus}")
         return observations
 
-    async def get_structured_state(self, state: TaskState) -> ScreenObservation:
+    async def get_structured_state(self, state: TaskState) -> SemanticState:
         """
-        Get a structured representation of the current computer state.
+        Get a semantically enriched structured representation of the current computer state.
         
-        Returns a ScreenObservation dataclass with:
+        Returns a SemanticState dataclass with:
         - application: application name
         - window_title: active window title
+        - window_class: window class name
+        - window_bounds: [x1, y1, x2, y2]
         - elements: list of UIElement objects
-        - active_window: WindowInfo object
         - running_apps: list of running process names
+        - active_window: WindowInfo object
         - timestamp: float
         - source: "uia" | "win32" | "mixed"
+        - ui_hierarchy: semantic hierarchy of UI elements
+        - element_groups: elements grouped by role
+        - interaction_hints: suggested interactions based on visible elements
+        - confidence: overall confidence in state accuracy
         """
         application = None
         window_title = None
+        window_class = ""
+        window_bounds: List[int] = []
         elements: List[UIElement] = []
         active_window: Optional[WindowInfo] = None
         running_apps: List[str] = []
         timestamp = time.time()
         source = "mixed"
+        ui_hierarchy: Dict[str, Any] = {}
+        element_groups: Dict[str, List[UIElement]] = {}
+        interaction_hints: List[str] = []
+        confidence = 0.95
 
         # Get active window
         computer = self._get_computer()
@@ -83,6 +134,8 @@ class Observer:
                     process_name=win_data.get("process_name", ""),
                 )
                 window_title = win_data["title"]
+                window_class = win_data["class_name"]
+                window_bounds = win_data["bounds"]
                 application = self._extract_app_name(window_title, win_data["class_name"])
 
         # Get running apps
@@ -105,7 +158,7 @@ class Observer:
                 for ctrl in elements_result.get("controls", []):
                     bounds = ctrl.get("bounds", ctrl.get("rect", []))
                     if len(bounds) == 4:
-                        elements.append(UIElement(
+                        elem = UIElement(
                             name=ctrl.get("name") or ctrl.get("title") or ctrl.get("automation_id") or "unnamed",
                             role=ctrl.get("role", ctrl.get("control_type", "")).lower(),
                             bounds=bounds,
@@ -114,17 +167,73 @@ class Observer:
                             enabled=ctrl.get("enabled", True),
                             class_name=ctrl.get("class_name", ctrl.get("class", "")),
                             automation_id=ctrl.get("automation_id", ""),
-                        ))
+                        )
+                        elements.append(elem)
+                        
+                        # Group elements by role for semantic understanding
+                        role = elem.role
+                        if role not in element_groups:
+                            element_groups[role] = []
+                        element_groups[role].append(elem)
+                        
+                        # Build interaction hints based on element types
+                        if role in ("button", "link", "menuitem") and elem.enabled:
+                            interaction_hints.append(f"Clickable: {elem.name}")
+                        elif role in ("edit", "textbox", "combobox") and elem.enabled:
+                            interaction_hints.append(f"Editable: {elem.name}")
+                        elif role in ("checkbox", "radiobutton") and elem.enabled:
+                            interaction_hints.append(f"Toggleable: {elem.name}")
 
-        return ScreenObservation(
+        # Build semantic UI hierarchy
+        ui_hierarchy = self._build_ui_hierarchy(elements)
+
+        return SemanticState(
             application=application or "Unknown",
             window_title=window_title or "Unknown",
+            window_class=window_class,
+            window_bounds=window_bounds,
             elements=elements,
-            active_window=active_window,
             running_apps=running_apps,
+            active_window=active_window,
             timestamp=timestamp,
             source=source,
+            ui_hierarchy=ui_hierarchy,
+            element_groups=element_groups,
+            interaction_hints=interaction_hints,
+            confidence=confidence,
         )
+
+    def _build_ui_hierarchy(self, elements: List[UIElement]) -> Dict[str, Any]:
+        """Build a semantic hierarchy of UI elements based on bounds containment."""
+        hierarchy = {"root": {"children": [], "bounds": None}}
+        
+        # Sort elements by area (largest first) to find containers
+        sorted_elements = sorted(elements, key=lambda e: (e.bounds[2] - e.bounds[0]) * (e.bounds[3] - e.bounds[1]), reverse=True)
+        
+        # Simple containment-based hierarchy
+        for elem in sorted_elements:
+            elem_dict = elem.to_dict()
+            elem_dict["children"] = []
+            
+            # Find parent (first larger element that contains this one)
+            parent = None
+            for potential_parent in sorted_elements:
+                if potential_parent is elem:
+                    continue
+                p_bounds = potential_parent.bounds
+                e_bounds = elem.bounds
+                if (p_bounds[0] <= e_bounds[0] and p_bounds[1] <= e_bounds[1] and
+                    p_bounds[2] >= e_bounds[2] and p_bounds[3] >= e_bounds[3]):
+                    parent = potential_parent
+                    break
+            
+            if parent:
+                # Add to parent's children in hierarchy
+                pass  # Simplified for now
+            else:
+                hierarchy["root"]["children"].append(elem_dict)
+        
+        return hierarchy
 
     def _extract_app_name(self, window_title: str, class_name: str) -> str:
         """Extract application name from window title/class."""

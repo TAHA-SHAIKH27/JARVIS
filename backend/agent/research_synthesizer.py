@@ -8,13 +8,18 @@ Design principles:
   - Zero raw scraping dumps (no repeated sentences, no webpage navigation text)
   - 100% topic-agnostic: works for ANY subject dynamically
   - Exact parameter enforcement: respects target_slides (N) and num_sources (M)
+  - Evidence-based claims with source verification
+  - Iterative research until sufficient evidence gathered
 """
 import os
 import json
 import re
 import urllib.request
 import urllib.error
-from typing import Any, Dict, List, Optional
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
 
 
 def _clean_text(text: str) -> str:
@@ -43,11 +48,47 @@ def _deduplicate_sentences(items: List[str]) -> List[str]:
     return result
 
 
+@dataclass
+class EvidenceBlock:
+    """A piece of evidence extracted from a source."""
+    source_id: int
+    source_url: str
+    source_title: str
+    block_id: str
+    text: str
+    claim_ids: List[str] = field(default_factory=list)
+    confidence: float = 0.8
+    extracted_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+@dataclass
+class Claim:
+    """A verifiable claim with supporting evidence."""
+    claim_id: str
+    statement: str
+    evidence_blocks: List[EvidenceBlock] = field(default_factory=list)
+    confidence: float = 0.0
+    status: str = "unverified"  # unverified, supported, contradicted, insufficient
+    verified_at: Optional[str] = None
+
+
+@dataclass
+class SourceComparison:
+    """Result of comparing multiple sources."""
+    consensus_facts: List[str] = field(default_factory=list)
+    unique_perspectives: List[Dict[str, Any]] = field(default_factory=list)
+    contradictions: List[Dict[str, Any]] = field(default_factory=list)
+    uncertainty_areas: List[str] = field(default_factory=list)
+    overall_synthesis: str = ""
+
+
 class ResearchSynthesizer:
     """Performs structured source analysis, cross-source comparison, and report synthesis."""
 
     def __init__(self, api_key: str = ""):
         self.api_key = api_key or self._load_api_key()
+        self.evidence_store: Dict[str, EvidenceBlock] = {}
+        self.claims: Dict[str, Claim] = {}
 
     @staticmethod
     def _load_api_key() -> str:

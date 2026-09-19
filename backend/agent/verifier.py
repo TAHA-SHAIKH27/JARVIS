@@ -9,7 +9,8 @@ Verification outcomes:
 - UNKNOWN: Cannot determine outcome (missing verifier, etc.)
 """
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
+from dataclasses import dataclass, field
 from backend.agent.state import TaskState, ActionSpec, FailureClassification
 from backend.tools.result_schema import ToolResultStatus
 
@@ -21,9 +22,82 @@ class VerificationOutcome(Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass
+class VerificationConfig:
+    """Configuration for verification confidence thresholds per action type."""
+    min_confidence_for_success: float = 0.7
+    min_confidence_for_partial: float = 0.4
+    executor_weight: float = 0.4
+    observer_weight: float = 0.6
+    # Action-type specific confidence modifiers
+    action_type_modifiers: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "open_app_wait": {"executor_weight": 0.3, "observer_weight": 0.7},
+        "type_in_app": {"executor_weight": 0.2, "observer_weight": 0.8},
+        "click_ui": {"executor_weight": 0.3, "observer_weight": 0.7},
+        "browser_search": {"executor_weight": 0.5, "observer_weight": 0.5},
+        "browser_navigate": {"executor_weight": 0.4, "observer_weight": 0.6},
+        "browser_extract": {"executor_weight": 0.3, "observer_weight": 0.7},
+        "create_docx": {"executor_weight": 0.4, "observer_weight": 0.6},
+        "create_pptx": {"executor_weight": 0.4, "observer_weight": 0.6},
+        "calculator_compute": {"executor_weight": 0.5, "observer_weight": 0.5},
+        "find_ui_element": {"executor_weight": 0.2, "observer_weight": 0.8},
+    })
+
+
 class Verifier:
-    def __init__(self):
-        pass
+    def __init__(self, config: Optional[VerificationConfig] = None):
+        self.config = config or VerificationConfig()
+
+    def _get_action_weights(self, action_type: str) -> tuple:
+        """Get executor and observer weights for an action type."""
+        modifiers = self.config.action_type_modifiers.get(action_type, {})
+        executor_w = modifiers.get("executor_weight", self.config.executor_weight)
+        observer_w = modifiers.get("observer_weight", self.config.observer_weight)
+        # Normalize
+        total = executor_w + observer_w
+        return executor_w / total, observer_w / total
+
+    def _calculate_confidence(self, exec_ok: bool, exec_message: str, 
+                             obs_verified: bool, obs_message: str,
+                             obs_confidence: float, classification: str,
+                             action_type: str) -> float:
+        """Calculate verification confidence with sophisticated scoring."""
+        executor_w, observer_w = self._get_action_weights(action_type)
+        
+        # Base confidence from executor
+        if exec_ok:
+            exec_conf = 0.8
+            # Boost for specific success indicators
+            if "success" in exec_message.lower() or "verified" in exec_message.lower():
+                exec_conf = 0.9
+            elif "completed" in exec_message.lower():
+                exec_conf = 0.85
+        else:
+            exec_conf = 0.1
+            if "timeout" in exec_message.lower():
+                exec_conf = 0.3
+        
+        # Observer confidence
+        if obs_verified:
+            obs_conf = max(obs_confidence, 0.85)
+        else:
+            obs_conf = obs_confidence * 0.5  # Penalize unverified
+            # But check for partial progress indicators
+            if obs_message and any(kw in obs_message.lower() for kw in ["found", "partial", "some", "progress", "detected"]):
+                obs_conf = max(obs_conf, 0.4)
+        
+        # Weighted combination
+        confidence = (executor_w * exec_conf) + (observer_w * obs_conf)
+        
+        # Classification-based adjustments
+        if classification == "human_required":
+            confidence = 0.0  # Cannot verify without human
+        elif classification == "fatal":
+            confidence = 0.05
+        elif classification == "retryable":
+            confidence = max(confidence, 0.3)  # Might succeed on retry
+        
+        return min(max(confidence, 0.0), 1.0)
 
     def verify_action(
         self,
@@ -56,18 +130,11 @@ class Verifier:
         classification = observation.get("classification", "recoverable")
         obs_confidence = observation.get("confidence", 0.5)
 
-        # Determine base confidence
-        base_confidence = 0.8 if exec_ok else 0.3
-        if obs_verified:
-            base_confidence = max(base_confidence, 0.9)
-        elif not exec_ok:
-            base_confidence = min(base_confidence, 0.2)
-        else:
-            # Exec OK but observer couldn't verify
-            base_confidence = 0.5
-
-        # Adjust confidence based on observation confidence
-        confidence = (base_confidence + obs_confidence) / 2
+        # Calculate confidence using sophisticated scoring
+        confidence = self._calculate_confidence(
+            exec_ok, exec_message, obs_verified, obs_message,
+            obs_confidence, classification, action.type
+        )
 
         if exec_ok and obs_verified:
             return {
@@ -93,7 +160,7 @@ class Verifier:
                     "classification": FailureClassification.RETRYABLE.value,
                     "requires_user": False,
                     "recoverable": True,
-                    "confidence": 0.2,
+                    "confidence": self._calculate_confidence(False, exec_message, False, "", 0.3, "retryable", action.type),
                 }
             return {
                 "verified": False,
@@ -104,7 +171,7 @@ class Verifier:
                 "classification": FailureClassification.RECOVERABLE.value,
                 "requires_user": False,
                 "recoverable": True,
-                "confidence": 0.1,
+                "confidence": self._calculate_confidence(False, exec_message, False, "", 0.1, "recoverable", action.type),
             }
         else:
             # Executor OK but observer did not confirm
@@ -113,6 +180,8 @@ class Verifier:
                 cls = FailureClassification(classification) if classification in [c.value for c in FailureClassification] else FailureClassification.RECOVERABLE
             except ValueError:
                 cls = FailureClassification.RECOVERABLE
+
+            calc_confidence = self._calculate_confidence(True, exec_message, False, obs_message, obs_confidence, classification, action.type)
 
             if cls == FailureClassification.HUMAN_REQUIRED:
                 return {
@@ -136,11 +205,11 @@ class Verifier:
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": True,
-                    "confidence": 0.3,
+                    "confidence": calc_confidence,
                 }
             elif cls == FailureClassification.RECOVERABLE:
                 # Check if this is a partial success (some progress made)
-                if obs_message and ("found" in obs_message.lower() or "partial" in obs_message.lower() or "some" in obs_message.lower()):
+                if obs_message and any(kw in obs_message.lower() for kw in ["found", "partial", "some", "progress", "detected", "located"]):
                     return {
                         "verified": False,
                         "outcome": VerificationOutcome.PARTIAL_SUCCESS.value,
@@ -150,7 +219,7 @@ class Verifier:
                         "classification": cls.value,
                         "requires_user": False,
                         "recoverable": True,
-                        "confidence": 0.5,
+                        "confidence": max(calc_confidence, 0.5),
                     }
                 return {
                     "verified": False,
@@ -161,7 +230,7 @@ class Verifier:
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": True,
-                    "confidence": 0.3,
+                    "confidence": calc_confidence,
                 }
             elif cls == FailureClassification.FATAL:
                 return {
@@ -173,7 +242,7 @@ class Verifier:
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": False,
-                    "confidence": 0.0,
+                    "confidence": 0.05,
                 }
             else:
                 return {
