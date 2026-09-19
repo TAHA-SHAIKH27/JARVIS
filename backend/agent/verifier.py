@@ -45,8 +45,17 @@ class VerificationConfig:
 
 
 class Verifier:
-    def __init__(self, config: Optional[VerificationConfig] = None):
+    def __init__(self, config: Optional[VerificationConfig] = None, registry=None):
         self.config = config or VerificationConfig()
+        self.registry = registry
+        self._vision_perception = None
+        self._perception_manager = None
+    
+    def _get_perception_manager(self):
+        if self._perception_manager is None:
+            from backend.agent.observer import PerceptionManager
+            self._perception_manager = PerceptionManager(self.registry)
+        return self._perception_manager
 
     def _get_action_weights(self, action_type: str) -> tuple:
         """Get executor and observer weights for an action type."""
@@ -257,7 +266,138 @@ class Verifier:
                     "confidence": 0.2,
                 }
 
-    def verify(self, state: TaskState, intended_result: Any = None) -> Dict[str, Any]:
+    async def verify_with_vision(
+        self,
+        action: ActionSpec,
+        result: Dict[str, Any],
+        observation: Dict[str, Any],
+        state: TaskState
+    ) -> Dict[str, Any]:
+        """
+        Attempt vision-based verification when UIA is inconclusive.
+        Uses the PerceptionManager to capture and analyze the screen visually.
+        """
+        # First, get the base verification result
+        base_result = self.verify_action(action, result, observation)
+        
+        # If already verified or fatal/human_required, no need for vision
+        if base_result["verified"] or base_result["classification"] in ("human_required", "fatal"):
+            return base_result
+        
+        # If UIA was recoverable or retryable but inconclusive, try vision
+        if base_result["status"] in ("recoverable", "retryable", "inconclusive"):
+            try:
+                perception_manager = self._get_perception_manager()
+                
+                # Request vision perception
+                vision_data = await self._perception_manager.vision.capture_and_analyze(state)
+                
+                # Analyze vision data for expected outcome
+                vision_verified = self._analyze_vision_for_action(action, vision_data)
+                
+                if vision_verified:
+                    # Vision confirmed success - upgrade confidence
+                    return {
+                        "verified": True,
+                        "outcome": VerificationOutcome.SUCCESS.value,
+                        "status": "success",
+                        "message": f"Vision confirmed: {action.description}",
+                        "should_retry": False,
+                        "classification": FailureClassification.COMPLETED.value,
+                        "requires_user": False,
+                        "recoverable": True,
+                        "confidence": 0.8,
+                        "evidence_source": "vision"
+                    }
+                else:
+                    # Vision also inconclusive - return original with note
+                    return {
+                        **base_result,
+                        "message": f"{obs_message} (vision also inconclusive)",
+                        "confidence": max(0.1, base_result.get("confidence", 0.2) * 0.5),
+                        "evidence_source": "uia+vision"
+                    }
+            except Exception as e:
+                # Vision failed - return original result
+                return {
+                    **base_result,
+                    "message": f"{obs_message} (vision verification failed: {str(e)})",
+                    "evidence_source": "uia"
+                }
+        
+        return base_result
+    
+    def _analyze_vision_for_action(self, action: ActionSpec, vision_data) -> bool:
+        """
+        Analyze vision data to determine if the action's expected outcome is visible.
+        Returns True if vision confirms the action succeeded.
+        """
+        if not vision_data or not vision_data.elements:
+            return False
+        
+        atype = action.type
+        params = action.parameters
+        
+        # Check for specific expected visual outcomes
+        if atype in ("click_ui", "click_element", "click_coordinates"):
+            # Look for button/button-like elements that were clicked
+            target_text = params.get("text", "").lower()
+            for elem in vision_data.elements:
+                if elem.get("type") in ("button", "text"):
+                    text = elem.get("text", "").lower()
+                    if target_text and target_text in text:
+                        return True
+                    if "clicked" in text or "pressed" in text:
+                        return True
+        
+        elif atype in ("type_in_app", "type_ui", "type_text"):
+            # Look for typed text in vision
+            target_text = params.get("text", "").lower()
+            for elem in vision_data.elements:
+                if elem.get("type") == "text":
+                    text = elem.get("text", "").lower()
+                    if target_text and target_text in text:
+                        return True
+        
+        elif atype in ("draw_shape", "draw_circle", "draw_ellipse", "fill_shape"):
+            # Look for drawn shapes on canvas
+            for elem in vision_data.elements:
+                if elem.get("type") in ("shape", "circle", "ellipse", "oval", "drawing"):
+                    return True
+                # Check for canvas-like elements with drawing
+                if "canvas" in elem.get("text", "").lower() or "drawing" in elem.get("text", "").lower():
+                    return True
+        
+        elif atype in ("fill_color", "set_color", "apply_color"):
+            # Look for color changes
+            color = params.get("color", "").lower()
+            for elem in vision_data.elements:
+                if color and color in elem.get("text", "").lower():
+                    return True
+                if "filled" in elem.get("text", "").lower() or "colored" in elem.get("text", "").lower():
+                    return True
+        
+        elif atype == "open_app_wait":
+            # Look for app window
+            app_name = params.get("app_name", "").lower()
+            window_title = params.get("window_title", "").lower()
+            for elem in vision_data.elements:
+                text = elem.get("text", "").lower()
+                if app_name and app_name in text:
+                    return True
+                if window_title and window_title in text:
+                    return True
+        
+        elif atype in ("calculator_compute",):
+            # Look for calculator result
+            expected = str(params.get("expected", ""))
+            for elem in vision_data.elements:
+                if elem.get("type") in ("text", "display", "result"):
+                    text = elem.get("text", "").replace(",", "").replace(" ", "")
+                    if expected and expected in text:
+                        return True
+        
+        return False
         """
         Overall task verification — used for final status after the loop.
         Checks state.errors and state.completed_steps.

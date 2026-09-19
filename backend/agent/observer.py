@@ -8,6 +8,7 @@ import asyncio
 import os
 import time
 import json
+import uuid
 from typing import Any, Dict, Optional, List
 from dataclasses import dataclass, field
 
@@ -99,10 +100,12 @@ class Observer:
         - active_window: WindowInfo object
         - timestamp: float
         - source: "uia" | "win32" | "mixed"
-        - ui_hierarchy: semantic hierarchy of UI elements
+        - ui_tree: full UI tree with parent/children relationships
         - element_groups: elements grouped by role
         - interaction_hints: suggested interactions based on visible elements
         - confidence: overall confidence in state accuracy
+        - window_class: window class name
+        - window_bounds: [x1, y1, x2, y2]
         """
         application = None
         window_title = None
@@ -113,7 +116,7 @@ class Observer:
         running_apps: List[str] = []
         timestamp = time.time()
         source = "mixed"
-        ui_hierarchy: Dict[str, Any] = {}
+        ui_tree: Dict[str, Any] = {}
         element_groups: Dict[str, List[UIElement]] = {}
         interaction_hints: List[str] = []
         confidence = 0.95
@@ -151,41 +154,38 @@ class Observer:
         except Exception:
             running_apps = []
 
-        # Get UI elements for active window
+        # Get UI elements for active window with enhanced metadata
         if window_title and computer:
             elements_result = await computer.inspect_controls(window_title, state=state)
             if elements_result.get("status") == "success":
-                for ctrl in elements_result.get("controls", []):
-                    bounds = ctrl.get("bounds", ctrl.get("rect", []))
-                    if len(bounds) == 4:
-                        elem = UIElement(
-                            name=ctrl.get("name") or ctrl.get("title") or ctrl.get("automation_id") or "unnamed",
-                            role=ctrl.get("role", ctrl.get("control_type", "")).lower(),
-                            bounds=bounds,
-                            confidence=ctrl.get("confidence", 0.95 if ctrl.get("enabled") else 0.5),
-                            source=ctrl.get("source", "uia"),
-                            enabled=ctrl.get("enabled", True),
-                            class_name=ctrl.get("class_name", ctrl.get("class", "")),
-                            automation_id=ctrl.get("automation_id", ""),
-                        )
-                        elements.append(elem)
-                        
-                        # Group elements by role for semantic understanding
-                        role = elem.role
-                        if role not in element_groups:
-                            element_groups[role] = []
-                        element_groups[role].append(elem)
-                        
-                        # Build interaction hints based on element types
-                        if role in ("button", "link", "menuitem") and elem.enabled:
-                            interaction_hints.append(f"Clickable: {elem.name}")
-                        elif role in ("edit", "textbox", "combobox") and elem.enabled:
-                            interaction_hints.append(f"Editable: {elem.name}")
-                        elif role in ("checkbox", "radiobutton") and elem.enabled:
-                            interaction_hints.append(f"Toggleable: {elem.name}")
+                raw_controls = elements_result.get("controls", [])
+                elements = self._process_raw_controls(raw_controls, window_title)
+                
+                # Group elements by role for semantic understanding
+                for elem in elements:
+                    role = elem.role
+                    if role not in element_groups:
+                        element_groups[role] = []
+                    element_groups[role].append(elem)
+                    
+                    # Build interaction hints based on element types
+                    if role in ("button", "link", "menuitem") and elem.enabled:
+                        interaction_hints.append(f"Clickable: {elem.name}")
+                    elif role in ("edit", "textbox", "combobox") and elem.enabled:
+                        interaction_hints.append(f"Editable: {elem.name}")
+                    elif role in ("checkbox", "radiobutton") and elem.enabled:
+                        interaction_hints.append(f"Toggleable: {elem.name}")
+                    elif role in ("menu", "menubar") and elem.enabled:
+                        interaction_hints.append(f"Menu: {elem.name}")
+                    elif role in ("tab", "tabitem") and elem.enabled:
+                        interaction_hints.append(f"Tab: {elem.name}")
+                    elif role in ("list", "listitem", "tree", "treeitem") and elem.enabled:
+                        interaction_hints.append(f"Selectable: {elem.name}")
+                    elif role in ("slider", "scrollbar") and elem.enabled:
+                        interaction_hints.append(f"Adjustable: {elem.name}")
 
-        # Build semantic UI hierarchy
-        ui_hierarchy = self._build_ui_hierarchy(elements)
+        # Build enhanced semantic UI tree with parent/children relationships
+        ui_tree = self._build_ui_tree(elements)
 
         return SemanticState(
             application=application or "Unknown",
@@ -195,16 +195,16 @@ class Observer:
             elements=elements,
             running_apps=running_apps,
             active_window=active_window,
-            timestamp=timestamp,
+            timestamp=time.time(),
             source=source,
-            ui_hierarchy=ui_hierarchy,
+            ui_tree=ui_tree,
             element_groups=element_groups,
             interaction_hints=interaction_hints,
             confidence=confidence,
         )
 
     def _build_ui_hierarchy(self, elements: List[UIElement]) -> Dict[str, Any]:
-        """Build a semantic hierarchy of UI elements based on bounds containment."""
+        """Build a semantic hierarchy of UI elements based on bounds containment (legacy method)."""
         hierarchy = {"root": {"children": [], "bounds": None}}
         
         # Sort elements by area (largest first) to find containers
@@ -235,7 +235,228 @@ class Observer:
         
         return hierarchy
 
-    def _extract_app_name(self, window_title: str, class_name: str) -> str:
+    def _build_ui_tree(self, elements: List[UIElement]) -> Dict[str, Any]:
+        """
+        Build a proper semantic UI tree with parent/children relationships.
+        Returns a tree structure with proper parent/children relationships and unique element IDs.
+        """
+        if not elements:
+            return {"root": {"element_id": "root", "children": [], "bounds": None, "name": "Desktop", "role": "desktop"}}
+        
+        # Generate unique element IDs if not present
+        for i, elem in enumerate(elements):
+            if not elem.element_id:
+                elem.element_id = f"elem_{id(elem)}_{i}"
+        
+        # Sort elements by area (largest first) to find containers
+        sorted_elements = sorted(elements, key=lambda e: (e.bounds[2] - e.bounds[0]) * (e.bounds[3] - e.bounds[1]), reverse=True)
+        
+        # Map element_id -> element for quick lookup
+        elem_map = {elem.element_id: elem for elem in elements}
+        
+        # Build containment tree
+        # Each element gets a parent_id based on bounds containment
+        for elem in elements:
+            if not elem.parent_id:
+                # Find parent (smallest container that contains this element)
+                parent = None
+                min_area = float('inf')
+                for potential_parent in elements:
+                    if potential_parent is elem:
+                        continue
+                    p_bounds = potential_parent.bounds
+                    e_bounds = elem.bounds
+                    if (p_bounds[0] <= e_bounds[0] and p_bounds[1] <= e_bounds[1] and
+                        p_bounds[2] >= e_bounds[2] and p_bounds[3] >= e_bounds[3]):
+                        area = (p_bounds[2] - p_bounds[0]) * (p_bounds[3] - p_bounds[1])
+                        if area < min_area:
+                            min_area = area
+                            parent = potential_parent
+                
+                if parent:
+                    elem.parent_id = parent.element_id
+                    parent.children_ids.append(elem.element_id)
+                else:
+                    elem.parent_id = "root"
+        
+        # Build tree structure from element relationships
+        def build_tree_node(elem_id: str) -> Dict[str, Any]:
+            elem = elem_map[elem_id]
+            node = elem.to_dict()
+            node["children"] = []
+            for child_id in elem.children_ids:
+                if child_id in elem_map:
+                    node["children"].append(build_tree_node(child_id))
+            return node
+        
+        # Build tree starting from root
+        tree = {"root": {"element_id": "root", "children": [], "bounds": None, "name": "Desktop", "role": "desktop"}}
+        for elem in elements:
+            if elem.parent_id == "root" or not elem.parent_id:
+                tree["root"]["children"].append(build_tree_node(elem.element_id))
+        
+        return tree
+
+    def _process_raw_controls(self, raw_controls: List[Dict], window_title: str) -> List[UIElement]:
+        """
+        Process raw control data from computer.inspect_controls into rich UIElement objects
+        with comprehensive metadata.
+        """
+        elements = []
+        
+        for ctrl in raw_controls:
+            bounds = ctrl.get("bounds", ctrl.get("rect", []))
+            if len(bounds) != 4:
+                continue
+            
+            # Skip zero-size or off-screen elements
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                continue
+            
+            # Extract comprehensive metadata
+            name = ctrl.get("name") or ctrl.get("title") or ctrl.get("automation_id") or "unnamed"
+            role = ctrl.get("role", ctrl.get("control_type", "")).lower()
+            class_name = ctrl.get("class_name", ctrl.get("class", ""))
+            automation_id = ctrl.get("automation_id", "")
+            framework_id = ctrl.get("framework_id", "")
+            enabled = ctrl.get("enabled", True)
+            
+            # Extract state information
+            state_parts = []
+            if not ctrl.get("visible", True):
+                state_parts.append("hidden")
+            if not enabled:
+                state_parts.append("disabled")
+            if ctrl.get("focused", False):
+                state_parts.append("focused")
+            if ctrl.get("selected", False):
+                state_parts.append("selected")
+            if ctrl.get("checked") is True:
+                state_parts.append("checked")
+            elif ctrl.get("checked") is False and "checkbox" in role:
+                state_parts.append("unchecked")
+            if ctrl.get("read_only", False):
+                state_parts.append("read_only")
+            if ctrl.get("required", False):
+                state_parts.append("required")
+            
+            state_str = ", ".join(state_parts) if state_parts else "normal"
+            
+            # Extract UIA patterns
+            uia_patterns = []
+            for pattern in ["invoke", "expand_collapse", "toggle", "scroll", "value", "range_value", 
+                           "selection", "grid", "table", "text", "window", "transform", "dock", "multiple_view"]:
+                if ctrl.get(f"has_{pattern}", False) or ctrl.get(f"supports_{pattern}", False):
+                    uia_patterns.append(pattern)
+            
+            # Determine available actions based on role and patterns
+            available_actions = []
+            if "invoke" in uia_patterns or role in ("button", "link", "menuitem", "menu"):
+                available_actions.append("click")
+            if "expand_collapse" in uia_patterns:
+                available_actions.extend(["expand", "collapse"])
+            if "toggle" in uia_patterns or role in ("checkbox", "radiobutton", "switch"):
+                available_actions.append("toggle")
+            if "value" in uia_patterns or role in ("edit", "textbox", "combobox", "text"):
+                available_actions.extend(["type", "select"])
+            if "scroll" in uia_patterns or role in ("scrollbar", "slider"):
+                available_actions.append("scroll")
+            if "selection" in uia_patterns or role in ("listitem", "treeitem", "list", "tree"):
+                available_actions.append("select")
+            if role in ("edit", "textbox", "text"):
+                available_actions.append("type")
+            if role in ("menuitem", "menu"):
+                available_actions.append("hover")
+            if "drag" in str(ctrl.get("supported_patterns", "")):
+                available_actions.append("drag")
+            
+            # Remove duplicates
+            available_actions = list(set(available_actions))
+            
+            # Extract keyboard shortcuts
+            keyboard_shortcuts = []
+            accelerator = ctrl.get("accelerator_key", "") or ctrl.get("keyboard_shortcut", "")
+            if accelerator:
+                keyboard_shortcuts.append(accelerator)
+            
+            # Extract framework info
+            framework = ctrl.get("framework", "")
+            if not framework:
+                framework_id = ctrl.get("framework_id", "").lower()
+                if "wpf" in framework_id or "presentationcore" in framework_id:
+                    framework = "WPF"
+                elif "chrome" in framework_id or "chromium" in framework_id:
+                    framework = "Chrome"
+                elif "edge" in framework_id or "msedge" in framework_id:
+                    framework = "Edge"
+                elif "firefox" in framework_id or "mozilla" in framework_id:
+                    framework = "Firefox"
+                elif "electron" in framework_id:
+                    framework = "Electron"
+                elif "java" in framework_id or "awt" in framework_id or "swing" in framework_id:
+                    framework = "Java"
+                elif "qt" in framework_id:
+                    framework = "Qt"
+                elif "win32" in framework_id or "user32" in framework_id:
+                    framework = "Win32"
+                else:
+                    framework = "Unknown"
+            
+            # Create element with all metadata
+            bounds = ctrl.get("bounds", ctrl.get("rect", []))
+            if len(bounds) != 4:
+                continue
+            
+            # Generate unique element ID
+            import uuid
+            element_id = f"elem_{uuid.uuid4().hex[:8]}"
+            
+            # Build interaction hints
+            interaction_hints = []
+            if role in ("button", "link", "menuitem") and enabled:
+                interaction_hints.append(f"Clickable: {name}")
+            elif role in ("edit", "textbox", "combobox", "text") and enabled:
+                interaction_hints.append(f"Editable: {name}")
+            elif role in ("checkbox", "radiobutton") and enabled:
+                interaction_hints.append(f"Toggleable: {name}")
+            elif role in ("menu", "menubar") and enabled:
+                interaction_hints.append(f"Menu: {name}")
+            elif role in ("tab", "tabitem") and enabled:
+                interaction_hints.append(f"Tab: {name}")
+            elif role in ("list", "listitem", "tree", "treeitem") and enabled:
+                interaction_hints.append(f"Selectable: {name}")
+            elif role in ("slider", "scrollbar") and enabled:
+                interaction_hints.append(f"Adjustable: {name}")
+            
+            # Create UIElement with all metadata
+            elem = UIElement(
+                name=name,
+                role=role,
+                bounds=bounds,
+                confidence=ctrl.get("confidence", 0.95 if enabled else 0.5),
+                source=ctrl.get("source", "uia"),
+                enabled=enabled,
+                class_name=class_name,
+                automation_id=automation_id,
+                framework_id=framework_id,
+                state=state_str,
+                visible=ctrl.get("visible", True),
+                focused=ctrl.get("focused", False),
+                selected=ctrl.get("selected", False),
+                checked=ctrl.get("checked"),
+                uia_patterns=uia_patterns,
+                available_actions=available_actions,
+                keyboard_shortcuts=keyboard_shortcuts,
+                interaction_hints=interaction_hints,
+                element_id=element_id,
+                process_id=ctrl.get("process_id"),
+                framework=framework,
+                depth=0,  # Will be calculated in tree building
+            )
+            
+            elements.append(elem)
+        
+        return elements
         """Extract application name from window title/class."""
         known_apps = {
             "notepad": "Notepad",
@@ -863,3 +1084,280 @@ class Observer:
             'press and hold to confirm you are human',
         ]
         return any(indicator in content_lower for indicator in captcha_indicators)
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# Vision Perception System
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class VisionObservation:
+    """Structured vision observation result."""
+    source: str = "vision"
+    screen_width: int = 0
+    screen_height: int = 0
+    elements: List[Dict[str, Any]] = field(default_factory=list)
+    timestamp: float = field(default_factory=time.time)
+    confidence: float = 0.0
+    screenshot_path: Optional[str] = None
+    raw_text: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.source,
+            "screen_width": self.screen_width,
+            "screen_height": self.screen_height,
+            "elements": self.elements,
+            "timestamp": self.timestamp,
+            "confidence": self.confidence,
+            "screenshot_path": self.screenshot_path,
+            "raw_text": self.raw_text,
+        }
+
+
+class VisionPerception:
+    """Vision-based perception using OCR and visual analysis."""
+    
+    def __init__(self, registry: Optional[ToolRegistry] = None):
+        self.registry = registry or ToolRegistry()
+        self._computer = None
+    
+    def _get_computer(self):
+        if self._computer is None:
+            computer = self.registry.get("computer_tool")
+            if computer:
+                self._computer = computer
+        return self._computer
+    
+    async def capture_and_analyze(self, state: TaskState, focus: str = "general") -> VisionObservation:
+        """Capture screen and analyze using OCR/vision."""
+        computer = self._get_computer()
+        if not computer:
+            return VisionObservation(confidence=0.0, raw_text="Computer tool not available")
+        
+        # Capture screenshot
+        screenshot_result = await computer.get_screen(state)
+        if screenshot_result.get("status") != "success":
+            return VisionObservation(confidence=0.0, raw_text="Screenshot capture failed")
+        
+        screenshot_path = screenshot_result.get("screenshot_path", "")
+        if not screenshot_path or not os.path.exists(screenshot_path):
+            return VisionObservation(confidence=0.0, raw_text="Screenshot not saved")
+        
+        # Get screen dimensions
+        try:
+            from PIL import Image
+            with Image.open(screenshot_path) as img:
+                width, height = img.size
+        except Exception:
+            width, height = 1920, 1080  # defaults
+        
+        # OCR using pytesseract or fallback to LLM vision
+        elements = []
+        raw_text = ""
+        
+        # Try OCR first
+        try:
+            import pytesseract
+            raw_text = pytesseract.image_to_string(screenshot_path)
+            # Parse text into elements with bounding boxes
+            data = pytesseract.image_to_data(screenshot_path, output_type=pytesseract.Output.DICT)
+            for i in range(len(data['text'])):
+                text = data['text'][i].strip()
+                if text and len(text) > 1:
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    if w > 10 and h > 10:  # Filter out noise
+                        elements.append({
+                            "type": "text",
+                            "text": text,
+                            "bounds": [x, y, x + w, y + h],
+                            "confidence": data['conf'][i] / 100.0 if data['conf'][i] > 0 else 0.5,
+                            "source": "ocr"
+                        })
+        except ImportError:
+            # pytesseract not available, use LLM vision analysis
+            raw_text = await self._analyze_with_llm(screenshot_path)
+            # Parse LLM response into elements
+            elements = self._parse_llm_vision_response(raw_text)
+        except Exception as e:
+            raw_text = f"OCR error: {str(e)}"
+        
+        # If no elements found, try LLM vision
+        if not elements:
+            try:
+                vision_text = await self._analyze_with_llm(screenshot_path)
+                elements = self._parse_llm_vision_response(vision_text)
+                raw_text = vision_text
+            except Exception:
+                pass
+        
+        confidence = min(0.8, len(elements) * 0.1) if elements else 0.1
+        
+        return VisionObservation(
+            screen_width=width,
+            screen_height=height,
+            elements=elements,
+            confidence=confidence,
+            screenshot_path=screenshot_path,
+            raw_text=raw_text[:5000]  # Truncate
+        )
+    
+    async def _analyze_with_llm(self, screenshot_path: str) -> str:
+        """Analyze screenshot using LLM vision (Gemini/NVIDIA)."""
+        try:
+            from backend.tools.computer import Computer
+            computer = Computer(self.registry)
+            # Use computer's screenshot capabilities
+            # For now, return placeholder - in production would call LLM vision API
+            return "LLM vision analysis not fully implemented - placeholder"
+        except Exception:
+            return "LLM vision analysis unavailable"
+    
+    def _parse_llm_vision_response(self, response: str) -> List[Dict]:
+        """Parse LLM vision response into structured elements."""
+        elements = []
+        # Simple parsing - in production would be more sophisticated
+        lines = response.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if line and len(line) > 2:
+                elements.append({
+                    "type": "text",
+                    "text": line[:200],
+                    "bounds": [0, 0, 100, 20],
+                    "confidence": 0.6,
+                    "source": "vision"
+                })
+        return elements
+
+
+class PerceptionManager:
+    """Unified perception manager combining UIA and Vision."""
+    
+    def __init__(self, registry: Optional[ToolRegistry] = None):
+        self.registry = registry or ToolRegistry()
+        self.uia_observer = Observer(registry)
+        self.vision = VisionPerception(registry)
+        self._last_uia_state: Optional[SemanticState] = None
+        self._last_vision_state: Optional[VisionObservation] = None
+    
+    async def perceive(self, state: TaskState, use_vision: bool = False) -> Dict[str, Any]:
+        """
+        Get perception from UIA and optionally vision.
+        Returns fused perception data.
+        """
+        # Get UIA perception (primary)
+        uia_state = await self.uia_observer.get_structured_state(state)
+        self._last_uia_state = uia_state
+        
+        result = {
+            "uia": uia_state.to_dict(),
+            "source": "uia",
+            "fused": False
+        }
+        
+        # Get vision perception if requested or if UIA is insufficient
+        if use_vision or self._needs_vision_fallback(uia_state):
+            vision_state = await self.vision.capture_and_analyze(state)
+            self._last_vision_state = vision_state
+            
+            # Fuse UIA and vision
+            fused = self._fuse_perceptions(uia_state, vision_state)
+            result["vision"] = vision_state.to_dict()
+            result["fused"] = fused
+            result["source"] = "fused"
+        
+        return result
+    
+    def _needs_vision_fallback(self, uia_state: SemanticState) -> bool:
+        """Determine if vision fallback is needed."""
+        # Need vision if:
+        # - UIA confidence is low
+        # - Too few elements found
+        # - Specific element types not found (canvas, custom controls)
+        if uia_state.confidence < 0.7:
+            return True
+        if len(uia_state.elements) < 3:
+            return True
+        # Check for canvas/custom controls that UIA might miss
+        has_canvas = any("canvas" in e.role.lower() or "custom" in e.role.lower() for e in uia_state.elements)
+        if has_canvas:
+            return True
+        return False
+    
+    def _fuse_perceptions(self, uia_state: SemanticState, vision_state: VisionObservation) -> Dict[str, Any]:
+        """Fuse UIA and vision observations into unified perception."""
+        fused_elements = []
+        
+        # Start with UIA elements (higher confidence)
+        uia_elements_by_text = {}
+        for elem in uia_state.elements:
+            key = (elem.name.lower().strip(), tuple(elem.bounds))
+            uia_elements_by_text[key] = elem
+        
+        # Add vision elements, matching with UIA where possible
+        for v_elem in vision_state.elements:
+            v_text = v_elem.get("text", "").lower().strip()
+            v_bounds = v_elem.get("bounds", [])
+            
+            # Try to match with UIA element
+            matched = False
+            for key, uia_elem in uia_elements_by_text.items():
+                uia_name, uia_bounds = key
+                if v_text == uia_name or (v_text in uia_name or uia_name in v_text):
+                    # Check bounds overlap
+                    if self._bounds_overlap(uia_elem.bounds, v_bounds):
+                        # Merge: UIA element enhanced with vision data
+                        merged = uia_elem.to_dict()
+                        merged["vision_confirmed"] = True
+                        merged["vision_text"] = v_elem.get("text", "")
+                        merged["vision_confidence"] = v_elem.get("confidence", 0)
+                        merged["confidence"] = min(0.95, uia_elem.confidence + 0.1)
+                        fused_elements.append(merged)
+                        matched = True
+                        break
+            
+            if not matched:
+                # Vision-only element
+                fused_elements.append({
+                    "type": v_elem.get("type", "unknown"),
+                    "name": v_elem.get("text", "vision_element"),
+                    "bounds": v_elem.get("bounds", []),
+                    "confidence": v_elem.get("confidence", 0.5),
+                    "source": "vision",
+                    "vision_confirmed": False,
+                    "vision_text": v_elem.get("text", ""),
+                })
+        
+        # Add unmatched UIA elements
+        for elem in uia_state.elements:
+            key = (elem.name.lower().strip(), tuple(elem.bounds))
+            if not any(self._bounds_overlap(elem.bounds, v.get("bounds", [])) for v in vision_state.elements):
+                fused_elements.append(elem.to_dict())
+        
+        return {
+            "elements": fused_elements,
+            "confidence": min(0.95, uia_state.confidence + 0.1) if vision_state.elements else uia_state.confidence,
+            "source": "fused",
+            "uia_count": len(uia_state.elements),
+            "vision_count": len(vision_state.elements),
+            "fused_count": len(fused_elements),
+        }
+    
+    def _bounds_overlap(self, bounds1: List[int], bounds2: List[int]) -> bool:
+        """Check if two bounding boxes overlap significantly."""
+        if len(bounds1) != 4 or len(bounds2) != 4:
+            return False
+        x1_min, y1_min, x1_max, y1_max = bounds1
+        x2_min, y2_min, x2_max, y2_max = bounds2
+        
+        overlap_x = max(0, min(x1_max, x2_max) - max(x1_min, x2_min))
+        overlap_y = max(0, min(y1_max, y2_max) - max(y1_min, y2_min))
+        
+        area1 = (x1_max - x1_min) * (y1_max - y1_min)
+        area2 = (x2_max - x2_min) * (y2_max - y2_min)
+        overlap_area = overlap_x * overlap_y
+        
+        if area1 == 0 or area2 == 0:
+            return False
+        
+        return (overlap_area / min(area1, area2)) > 0.3

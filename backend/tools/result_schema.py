@@ -111,7 +111,7 @@ class ComputerActionResult(ToolResult):
 
 @dataclass
 class UIElement:
-    """Standardized UI element representation."""
+    """Standardized UI element representation with comprehensive metadata."""
     name: str
     role: str
     bounds: List[int]  # [x1, y1, x2, y2]
@@ -120,7 +120,25 @@ class UIElement:
     enabled: bool = True
     class_name: str = ""
     automation_id: str = ""
-
+    
+    # Enhanced metadata fields
+    framework_id: str = ""
+    state: str = ""  # "normal", "focused", "selected", "checked", "disabled", "hidden", "read_only", "required"
+    visible: bool = True
+    focused: bool = False
+    selected: bool = False
+    checked: Optional[bool] = None
+    parent_id: Optional[str] = None
+    children_ids: List[str] = field(default_factory=list)
+    uia_patterns: List[str] = field(default_factory=list)  # "invoke", "expand_collapse", "toggle", "scroll", "value", "range_value", "selection", "grid", "table", "text", "window"
+    available_actions: List[str] = field(default_factory=list)  # "click", "double_click", "right_click", "type", "select", "expand", "collapse", "scroll", "drag", "hover"
+    keyboard_shortcuts: List[str] = field(default_factory=list)
+    interaction_hints: List[str] = field(default_factory=list)
+    element_id: str = ""  # unique identifier for this element
+    process_id: Optional[int] = None
+    framework: str = ""  # "Win32", "WPF", "Chrome", "Edge", "Firefox", "Electron", "Java", "Qt", "Unknown"
+    depth: int = 0  # depth in UI tree
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -131,6 +149,22 @@ class UIElement:
             "enabled": self.enabled,
             "class_name": self.class_name,
             "automation_id": self.automation_id,
+            "framework_id": self.framework_id,
+            "state": self.state,
+            "visible": self.visible,
+            "focused": self.focused,
+            "selected": self.selected,
+            "checked": self.checked,
+            "parent_id": self.parent_id,
+            "children_ids": self.children_ids,
+            "uia_patterns": self.uia_patterns,
+            "available_actions": self.available_actions,
+            "keyboard_shortcuts": self.keyboard_shortcuts,
+            "interaction_hints": self.interaction_hints,
+            "element_id": self.element_id,
+            "process_id": self.process_id,
+            "framework": self.framework,
+            "depth": self.depth,
         }
 
 
@@ -167,6 +201,14 @@ class ScreenObservation:
     running_apps: List[str] = field(default_factory=list)
     timestamp: float = field(default_factory=__import__('time').time)
     source: str = "mixed"
+    
+    # Enhanced hierarchy and semantic understanding
+    ui_tree: Dict[str, Any] = field(default_factory=dict)  # full UI tree with parent/children
+    element_groups: Dict[str, List[UIElement]] = field(default_factory=dict)  # elements grouped by role
+    interaction_hints: List[str] = field(default_factory=list)
+    confidence: float = 0.95
+    window_class: str = ""
+    window_bounds: List[int] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -177,6 +219,12 @@ class ScreenObservation:
             "running_apps": self.running_apps,
             "timestamp": self.timestamp,
             "source": self.source,
+            "ui_tree": self.ui_tree,
+            "element_groups": {k: [e.to_dict() for e in v] for k, v in self.element_groups.items()},
+            "interaction_hints": self.interaction_hints,
+            "confidence": self.confidence,
+            "window_class": self.window_class,
+            "window_bounds": self.window_bounds,
         }
 
 
