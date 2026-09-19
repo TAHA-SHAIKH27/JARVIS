@@ -550,6 +550,11 @@ class AgentCore:
                         state.errors.append(f"Replanning failed: {str(e)}")
                         break
 
+                # ── CodeCore Self-Debugging Integration ─────────────────────────────
+                # If the failure is code-related, attempt self-debugging via CodeCore
+                if self._is_code_related_failure(atype, fail_msg, result):
+                    await self._attempt_codecore_self_debug(state, action, result, observation, fail_msg, event_queue)
+
                 elif classification == FailureClassification.FATAL.value or (not should_retry and state.retry_count >= max_retries):
                     # Fatal error or max retries exceeded
                     await emit("error", f"Fatal failure on step '{desc}': {fail_msg}. Task cannot continue.", icon="✗")
@@ -812,4 +817,101 @@ class AgentCore:
         state.human_verification_required = False
         state.waiting_for_user = False
         # The main loop will continue from the paused action
+        return {"status": "resumed", "resolution": resolution}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CodeCore Self-Debugging Integration
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _is_code_related_failure(self, action_type: str, error_message: str, result: dict) -> bool:
+        """Determine if a failure is code-related and suitable for CodeCore self-debugging."""
+        code_related_actions = {
+            "code_audit", "code_fix", "code_test", "code_preview_fix", 
+            "code_apply_fix", "code_process_file", "generate_image"
+        }
+        
+        if action_type in code_related_actions:
+            return True
+        
+        # Check error message for code-related patterns
+        error_lower = error_message.lower()
+        code_keywords = [
+            "syntax error", "indentation", "undefined", "attribute error",
+            "import error", "module not found", "name error", "type error",
+            "compilation error", "py_compile", "ast.parse", "traceback",
+            "nemotron", "nvidia", "nvidia_api_key", "huggingface"
+        ]
+        
+        return any(keyword in error_lower for keyword in code_keywords)
+
+    async def _attempt_codecore_self_debug(self, state: TaskState, action: ActionSpec, 
+                                            result: dict, observation: dict, 
+                                            error_message: str, event_queue: asyncio.Queue) -> bool:
+        """
+        Attempt to self-debug a code-related failure using CodeCore.
+        Returns True if debugging was attempted (regardless of success).
+        """
+        try:
+            from code_core import preview_file_fix, apply_file_fix, audit_codebase
+            
+            # Try to identify the problematic file from the error
+            target_file = self._extract_file_from_error(error_message, action)
+            
+            if not target_file:
+                return False
+            
+            await emit("codecore_debug", f"Attempting self-debug via CodeCore for {target_file}", 
+                      {"file": target_file, "error": error_message}, icon="🔧")
+            
+            # Step 1: Preview the fix
+            try:
+                preview = preview_file_fix(target_file, error_message)
+            except Exception as e:
+                await emit("codecore_debug", f"CodeCore preview failed: {str(e)}", icon="⚠")
+                return False
+            
+            if preview.get("status") != "success":
+                await emit("codecore_debug", f"CodeCore could not generate fix: {preview.get('message', 'Unknown error')}", icon="⚠")
+                return False
+            
+            # Step 2: Apply the fix with validation
+            try:
+                app_res = apply_file_fix(target_file, preview.get("proposed_content", ""))
+            except Exception as e:
+                await emit("codecore_debug", f"CodeCore apply failed: {str(e)}", icon="⚠")
+                return False
+            
+            if app_res.get("status") == "success":
+                await emit("codecore_debug", f"CodeCore successfully fixed {target_file}: {app_res.get('message', '')}", icon="✓")
+                # Retry the failed action
+                return True
+            else:
+                await emit("codecore_debug", f"CodeCore fix validation failed: {app_res.get('message', 'Validation error')}", icon="⚠")
+                return False
+                
+        except Exception as e:
+            await emit("codecore_debug", f"CodeCore self-debug error: {str(e)}", icon="⚠")
+            return False
+
+    def _extract_file_from_error(self, error_message: str, action: ActionSpec) -> Optional[str]:
+        """Extract the target file path from an error message or action parameters."""
+        import re
+        
+        # Check action parameters first
+        if action.parameters.get("target") and action.parameters["target"].endswith(".py"):
+            return action.parameters["target"]
+        if action.parameters.get("filepath") and action.parameters["filepath"].endswith(".py"):
+            return action.parameters["filepath"]
+        
+        # Try to extract from traceback
+        tb_match = re.search(r'File "([^"]+\.py)"', error_message)
+        if tb_match:
+            return tb_match.group(1)
+        
+        # Check for common patterns
+        file_match = re.search(r'([a-zA-Z0-9_/\-\.]+\.py)', error_message)
+        if file_match:
+            return file_match.group(1)
+        
+        return None
         return {"status": "resumed", "resolution": resolution}

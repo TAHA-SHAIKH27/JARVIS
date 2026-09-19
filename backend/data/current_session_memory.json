@@ -1,41 +1,5 @@
 [
   {
-    "id": "eacba1c7-df2a-41b9-ae6d-87e0eef0b1e8",
-    "role": "user",
-    "content": "Research Python history and create a Word document",
-    "metadata": {
-      "intent": "research"
-    },
-    "timestamp": "2026-09-19T09:01:37.963055+00:00"
-  },
-  {
-    "id": "3897d8ea-66b0-46a2-abc8-3527a3e59f46",
-    "role": "user",
-    "content": "Search for the weather in London",
-    "metadata": {
-      "intent": "research"
-    },
-    "timestamp": "2026-09-19T09:01:44.146712+00:00"
-  },
-  {
-    "id": "41d1a26a-f671-4a2f-84d5-ab6978cb8cf5",
-    "role": "user",
-    "content": "Create a folder named 'TestFolder' on Desktop",
-    "metadata": {
-      "intent": "conversation"
-    },
-    "timestamp": "2026-09-19T09:01:53.375454+00:00"
-  },
-  {
-    "id": "af326333-3d60-4e9b-9bca-b1791f2996c5",
-    "role": "user",
-    "content": "Open Notepad",
-    "metadata": {
-      "intent": "computer_action"
-    },
-    "timestamp": "2026-09-19T09:02:00.309613+00:00"
-  },
-  {
     "id": "5a219f28-44e9-40cd-96d1-313aafd9bbaf",
     "role": "user",
     "content": "Open Notepad and type 'Test message'",
@@ -178,5 +142,41 @@
       "intent": "computer_action"
     },
     "timestamp": "2026-09-19T09:52:49.297781+00:00"
+  },
+  {
+    "id": "20a41894-10e5-4ef0-a235-d89a9ae953d3",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T10:13:50.109527+00:00"
+  },
+  {
+    "id": "9aeafd44-7076-4562-82d3-7dec87ca50e0",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T10:20:48.765079+00:00"
+  },
+  {
+    "id": "9b3c893f-fd15-4f6c-83f7-d00fd450df93",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T10:22:51.477115+00:00"
+  },
+  {
+    "id": "6e315435-f6b8-4074-8106-b155aa3262d9",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T10:25:00.128229+00:00"
   }
 ]

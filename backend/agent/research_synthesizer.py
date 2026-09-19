@@ -393,6 +393,252 @@ Output ONLY the JSON object. Do not wrap in markdown or add explanations."""
         }
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Evidence Engine & Claim Verification
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def extract_evidence_blocks(self, source_id: int, source_title: str, source_url: str, 
+                                content: str, max_blocks: int = 10) -> List[EvidenceBlock]:
+        """
+        Extract structured evidence blocks from source content.
+        Each block is a self-contained piece of evidence that can support claims.
+        """
+        if not content:
+            return []
+
+        # Split content into paragraphs
+        paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 50]
+        
+        blocks = []
+        for i, para in enumerate(paragraphs[:max_blocks]):
+            # Generate unique block ID
+            block_id = hashlib.md5(f"{source_id}_{para[:50]}".encode()).hexdigest()[:12]
+            
+            block = EvidenceBlock(
+                source_id=source_id,
+                source_url=source_url,
+                source_title=source_title,
+                block_id=block_id,
+                text=para,
+                confidence=0.85
+            )
+            blocks.append(block)
+            # Store in evidence store
+            self.evidence_store[block_id] = block
+
+        return blocks
+
+    def extract_claims_from_sources(self, source_analyses: List[Dict[str, Any]], 
+                                    sources: List[Dict[str, Any]]) -> List[Claim]:
+        """
+        Extract verifiable claims from analyzed sources.
+        Returns a list of claims with their source evidence.
+        """
+        claims = []
+        
+        for idx, (src, analysis) in enumerate(zip(sources, source_analyses)):
+            source_id = idx + 1
+            source_title = src.get("title", f"Source {source_id}")
+            source_url = src.get("url", "")
+            content = analysis.get("summary", "") + " " + " ".join(analysis.get("key_facts", []))
+            
+            # Extract evidence blocks from this source
+            evidence_blocks = self.extract_evidence_blocks(source_id, source_title, source_url, content)
+            
+            # Extract claims from key facts, dates, and relevant claims
+            all_claim_texts = (
+                analysis.get("key_facts", []) + 
+                analysis.get("relevant_claims", []) +
+                analysis.get("important_dates_people_events", [])
+            )
+            
+            for claim_text in all_claim_texts:
+                if len(claim_text) < 20:
+                    continue
+                
+                claim_id = f"C{len(claims)+1:03d}"
+                # Find relevant evidence blocks for this claim
+                claim_evidence = [
+                    b for b in evidence_blocks 
+                    if any(word.lower() in b.text.lower() for word in claim_text.split()[:5])
+                ]
+                
+                claim = Claim(
+                    claim_id=claim_id,
+                    statement=claim_text,
+                    evidence_blocks=claim_evidence,
+                    confidence=0.7 if claim_evidence else 0.3
+                )
+                
+                claims.append(claim)
+                self.claims[claim_id] = claim
+        
+        return claims
+
+    def verify_claims(self, claims: List[Claim], min_evidence: int = 1) -> List[Claim]:
+        """
+        Verify each claim against its evidence blocks.
+        Updates claim status and confidence.
+        """
+        for claim in claims:
+            if not claim.evidence_blocks:
+                claim.status = "insufficient"
+                claim.confidence = 0.1
+                continue
+            
+            # Count supporting evidence
+            supporting = len(claim.evidence_blocks)
+            
+            if supporting >= min_evidence:
+                claim.status = "supported"
+                claim.confidence = min(0.95, 0.5 + 0.15 * supporting)
+            else:
+                claim.status = "insufficient"
+                claim.confidence = 0.3
+            
+            claim.verified_at = datetime.now().isoformat()
+        
+        return claims
+
+    def identify_gaps(self, claims: List[Claim], topic: str) -> List[str]:
+        """
+        Identify research gaps where claims are insufficient or contradictory.
+        Returns list of queries for iterative research.
+        """
+        gaps = []
+        
+        for claim in claims:
+            if claim.status == "insufficient":
+                gaps.append(f"Need evidence for: {claim.statement[:100]}")
+            elif claim.status == "contradicted":
+                gaps.append(f"Contradiction detected for: {claim.statement[:100]} - need clarification")
+        
+        # Check for topic coverage gaps
+        covered_terms = set()
+        for claim in claims:
+            covered_terms.update(claim.statement.lower().split())
+        
+        # Suggest deeper queries for uncovered aspects
+        if "timeline" not in covered_terms and "history" not in covered_terms:
+            gaps.append(f"Historical timeline of {topic}")
+        if "mechanism" not in covered_terms and "process" not in covered_terms:
+            gaps.append(f"Mechanism/process of {topic}")
+        if "impact" not in covered_terms and "effect" not in covered_terms:
+            gaps.append(f"Impact/implications of {topic}")
+        
+        return gaps[:5]  # Limit to top 5 gaps
+
+    def iterative_research(self, topic: str, initial_sources: List[Dict[str, Any]],
+                          max_iterations: int = 3, min_sources: int = 3) -> Dict[str, Any]:
+        """
+        Perform iterative research until sufficient evidence is gathered.
+        
+        Flow:
+        1. Analyze initial sources
+        2. Extract claims and verify
+        3. Identify gaps
+        4. Search for gap-filling sources
+        5. Repeat until satisfied or max iterations
+        """
+        all_sources = initial_sources[:]
+        all_analyses = []
+        all_claims = []
+        
+        for iteration in range(max_iterations):
+            # Analyze new sources
+            new_analyses = []
+            for src in all_sources[len(all_analyses):]:
+                analysis = self.analyze_source(src.get("title", ""), src.get("url", ""), 
+                                               src.get("content", src.get("snippet", "")))
+                new_analyses.append(analysis)
+            
+            all_analyses.extend(new_analyses)
+            
+            # Extract and verify claims
+            claims = self.extract_claims_from_sources(all_analyses, all_sources)
+            verified_claims = self.verify_claims(claims)
+            all_claims = verified_claims
+            
+            # Check if we have enough verified claims
+            supported_claims = [c for c in verified_claims if c.status == "supported"]
+            
+            if len(supported_claims) >= min_sources * 2:  # At least 2 claims per source
+                break
+            
+            # Identify gaps and generate new search queries
+            gaps = self.identify_gaps(verified_claims, topic)
+            
+            if not gaps:
+                break
+            
+            # In a real implementation, this would trigger browser_search
+            # For now, we just note the gaps for the next iteration
+            # The caller (AgentCore) should handle the actual search
+        
+        return {
+            "sources": all_sources,
+            "analyses": all_analyses,
+            "claims": all_claims,
+            "iterations": iteration + 1,
+            "gaps_remaining": self.identify_gaps(all_claims, topic)
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2. Cross-Source Comparison (Enhanced)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def compare_sources(self, topic: str, source_analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Compare findings across all analyzed sources.
+        Identifies consensus facts, unique findings, contradictions, and overarching takeaways.
+        """
+        if not source_analyses:
+            return {
+                "consensus_facts": [],
+                "unique_perspectives": [],
+                "contradictions": [],
+                "uncertainty_areas": [],
+                "overall_synthesis": "No source analyses available for comparison."
+            }
+
+        sources_summary = []
+        for idx, src in enumerate(source_analyses, 1):
+            sources_summary.append(
+                f"Source {idx}: {src.get('title', 'Unknown')} ({src.get('url', '')})\n"
+                f"- Summary: {src.get('summary', '')}\n"
+                f"- Key Facts: {'; '.join(src.get('key_facts', [])[:4])}\n"
+                f"- Dates/People: {'; '.join(src.get('important_dates_people_events', [])[:3])}\n"
+                f"- Unique Info: {'; '.join(src.get('unique_information', [])[:2])}\n"
+            )
+
+        prompt = f"""You are a senior research scientist comparing multiple sources on '{topic}'.
+
+SOURCES ANALYZED:
+{chr(10).join(sources_summary)}
+
+Perform a comparative synthesis in strictly valid JSON format:
+{{
+  "consensus_facts": ["fact agreed upon by multiple sources", "second consensus fact"],
+  "unique_perspectives": ["Source 1 provided insight on X", "Source 2 highlighted Y"],
+  "contradictions": ["note any variation in dates, emphasis, or differing viewpoints, or state 'No substantial contradictions noted across sources'"],
+  "uncertainty_areas": ["areas where sources disagree or lack sufficient detail"],
+  "overall_synthesis": "Comprehensive narrative comparing how the sources complement each other and summarizing the definitive findings."
+}}
+
+Output ONLY the JSON object. Do not wrap in markdown or add explanations."""
+
+        response = self._call_llm(prompt, "You are an expert research comparator. Return strictly valid JSON.")
+        if response:
+            try:
+                clean_json = re.sub(r"^```(?:json)?\s*", "", response.strip())
+                clean_json = re.sub(r"\s*```$", "", clean_json.strip())
+                return json.loads(clean_json)
+            except Exception:
+                pass
+
+        # Fallback: Deterministic Rule-Based Comparison
+        return self._rule_based_comparison(topic, source_analyses)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # 3. Report Synthesis
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -409,6 +655,11 @@ Output ONLY the JSON object. Do not wrap in markdown or add explanations."""
         Ensures NO raw webpage dumps, NO repeated sentences, and NO robotic boilerplate.
         The report is 100% topic-agnostic and covers the full depth of the subject.
         """
+        # Extract claims for evidence-based reporting
+        claims = self.extract_claims_from_sources(source_analyses, sources)
+        verified_claims = self.verify_claims(claims)
+        supported_claims = [c for c in verified_claims if c.status == "supported"]
+        
         # Attempt LLM-based comprehensive report generation
         sources_context = []
         for idx, (src, analysis) in enumerate(zip(sources, source_analyses), 1):
@@ -428,6 +679,12 @@ Output ONLY the JSON object. Do not wrap in markdown or add explanations."""
         if target_sections:
             section_instruction = f"\nThe report MUST contain EXACTLY {target_sections} main body sections (excluding references)."
 
+        # Include evidence summary in prompt
+        evidence_summary = f"VERIFIED CLAIMS ({len(supported_claims)}):\n"
+        for claim in supported_claims[:8]:
+            evidence_refs = [e.block_id for e in claim.evidence_blocks[:2]]
+            evidence_summary += f"- {claim.statement[:120]} (evidence: {', '.join(evidence_refs)})\n"
+
         prompt = f"""You are J.A.R.V.I.S. creating a comprehensive, authoritative research report on '{topic}'.
 
 CRITICAL RULES:
@@ -446,6 +703,9 @@ Consensus Facts:
 
 Unique Insights:
 * {unique_text}
+
+EVIDENCE-BASED CLAIMS:
+{evidence_summary}
 
 SOURCES METADATA:
 {chr(10).join(sources_context)}
