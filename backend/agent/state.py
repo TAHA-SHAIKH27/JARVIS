@@ -32,6 +32,15 @@ class TaskType(Enum):
     HUMAN_INTERVENTION = "human_intervention"
 
 
+class VerificationMethod(Enum):
+    UIA = "uia"
+    BROWSER_DOM = "browser_dom"
+    SCREENSHOT_VISION = "screenshot_vision"
+    FILE_SYSTEM = "file_system"
+    PROCESS_CHECK = "process_check"
+    OCR = "ocr"
+
+
 @dataclass
 class ActionSpec:
     type: str
@@ -45,6 +54,15 @@ class ActionSpec:
     required_context_keys: List[str] = field(default_factory=list)
     retry_strategy: Optional[str] = None
     is_critical: bool = True
+    
+    # Structured planning fields (target architecture)
+    goal: str = ""
+    tool: str = ""
+    expected_state: str = ""
+    verification_method: str = ""
+    fallback: str = ""
+    max_attempts: int = 3
+    confidence_threshold: float = 0.8
 
 
 @dataclass

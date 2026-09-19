@@ -15,6 +15,8 @@ from enum import Enum
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
+from backend.tools.result_schema import create_browser_result, SearchResult, ExtractedSource
+
 
 class BrowserPageState(Enum):
     """Detected state of the browser page after navigation/search."""
@@ -387,14 +389,8 @@ class Browser:
                 return await self.search_bing(query)
 
             if page_state.state == BrowserPageState.NETWORK_ERROR:
-                return {
-                    "status": "error",
-                    "verified": False,
-                    "page_state": page_state.state.value,
-                    "message": "Network error during search",
-                    "retryable": True,
-                    "details": page_state.details
-                }
+                return create_browser_result("search", "error", "Network error during search", 
+                    page_state=page_state.state.value, retryable=True, details=page_state.details)
 
             if page_state.state == BrowserPageState.EMPTY_RESULTS:
                 # A rendered Google page with no extractable results is often a
@@ -407,19 +403,14 @@ class Browser:
             if not results:
                 return await self.search_bing(query)
 
-            return {
-                "status": "success",
-                "verified": True,
-                "page_state": page_state.state.value,
-                "message": f"Search completed: {len(results)} results found",
-                "query": query,
-                "results": results,
-                "url": self.page.url,
-                "title": await self.page.title()
-            }
+            search_results = [SearchResult(title=r["title"], url=r["url"], snippet=r.get("snippet", ""), index=i).to_dict() for i, r in enumerate(results)]
+
+            return create_browser_result("search", "success", f"Search completed: {len(results)} results found",
+                query=query, results=search_results, url=self.page.url, title=await self.page.title(),
+                page_state=page_state.state.value)
 
         except Exception as e:
-            return {"status": "error", "verified": False, "message": f"Search failed: {str(e)}", "retryable": True}
+            return create_browser_result("search", "error", f"Search failed: {str(e)}", retryable=True)
 
     async def search_bing(self, query: str) -> Dict[str, Any]:
         """
@@ -757,19 +748,18 @@ class Browser:
                 self.page = await self.context.new_page()
             await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
             title = await self.page.title()
-            return {"status": "success", "message": f"Opened {url}", "url": url, "title": title}
+            return create_browser_result("open", "success", f"Opened {url}", url=url, title=title)
         except Exception as e:
             err_msg = str(e)
             if "closed" in err_msg.lower() or "crash" in err_msg.lower() or "target" in err_msg.lower():
-                # Recreate page and retry once
                 try:
                     await self._ensure_page()
                     await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
                     title = await self.page.title()
-                    return {"status": "success", "message": f"Opened {url} (recovered)", "url": url, "title": title}
+                    return create_browser_result("open", "success", f"Opened {url} (recovered)", url=url, title=title)
                 except Exception as retry_e:
-                    return {"status": "error", "message": f"Failed to open {url}: {str(retry_e)}"}
-            return {"status": "error", "message": f"Failed to open {url}: {err_msg}"}
+                    return create_browser_result("open", "error", f"Failed to open {url}: {str(retry_e)}")
+            return create_browser_result("open", "error", f"Failed to open {url}: {err_msg}")
 
     async def go_to(self, url: str) -> Dict[str, Any]:
         """Navigate to a URL."""
@@ -781,79 +771,74 @@ class Browser:
         try:
             title = await self.page.title()
             url = self.page.url
-            return {"status": "success", "title": title, "url": url, "message": f"Page title: {title}"}
+            return create_browser_result("get_page_title", "success", f"Page title: {title}", title=title, url=url)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to get page title: {str(e)}"}
+            return create_browser_result("get_page_title", "error", f"Failed to get page title: {str(e)}")
 
     async def click(self, selector: str) -> Dict[str, Any]:
         """Click a visible element and return observable before/after page state."""
         try:
             locator = self.page.locator(selector).first
             if await locator.count() == 0:
-                return {"status": "error", "message": f"Element not found: {selector}"}
+                return create_browser_result("click", "error", f"Element not found: {selector}")
             if not await locator.is_visible():
-                return {"status": "error", "message": f"Element is not visible: {selector}"}
+                return create_browser_result("click", "error", f"Element is not visible: {selector}")
             before_url = self.page.url
             await locator.click(timeout=8000)
-            # A click may update a SPA without a navigation; do not treat a
-            # load-state timeout as a failed click.
             try:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=3000)
             except Exception:
                 pass
-            return {
-                "status": "success", "message": f"Clicked: {selector}",
-                "before_url": before_url, "url": self.page.url,
-                "title": await self.page.title(),
-            }
+            return create_browser_result("click", "success", f"Clicked: {selector}",
+                before_url=before_url, url=self.page.url, title=await self.page.title())
         except Exception as e:
-            return {"status": "error", "message": f"Failed to click: {str(e)}"}
+            return create_browser_result("click", "error", f"Failed to click: {str(e)}")
 
     async def type(self, selector: str, text: str) -> Dict[str, Any]:
         """Fill an editable element and verify the value was accepted."""
         try:
             locator = self.page.locator(selector).first
             if await locator.count() == 0 or not await locator.is_visible():
-                return {"status": "error", "message": f"Editable element unavailable: {selector}"}
+                return create_browser_result("type", "error", f"Editable element unavailable: {selector}")
             await locator.fill(text, timeout=8000)
             value = await locator.input_value(timeout=3000)
             if value != text:
-                return {"status": "error", "message": f"Text was not retained by {selector}"}
-            return {"status": "success", "message": f"Typed into {selector}", "value": value}
+                return create_browser_result("type", "error", f"Text was not retained by {selector}")
+            return create_browser_result("type", "success", f"Typed into {selector}", value=value)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to type: {str(e)}"}
+            return create_browser_result("type", "error", f"Failed to type: {str(e)}")
 
     async def back(self) -> Dict[str, Any]:
         """Go back in browser history."""
         try:
             await self.page.go_back(wait_until="domcontentloaded")
-            return {"status": "success", "message": "Went back"}
+            return create_browser_result("back", "success", "Went back")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to go back: {str(e)}"}
+            return create_browser_result("back", "error", f"Failed to go back: {str(e)}")
 
     async def forward(self) -> Dict[str, Any]:
         """Go forward in browser history."""
         try:
             await self.page.go_forward(wait_until="domcontentloaded")
-            return {"status": "success", "message": "Went forward"}
+            return create_browser_result("forward", "success", "Went forward")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to go forward: {str(e)}"}
+            return create_browser_result("forward", "error", f"Failed to go forward: {str(e)}")
 
     async def new_tab(self) -> Dict[str, Any]:
         """Open a new tab."""
         try:
             self.page = await self.context.new_page()
-            return {"status": "success", "message": "New tab opened"}
+            return create_browser_result("new_tab", "success", "New tab opened")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to open new tab: {str(e)}"}
+            return create_browser_result("new_tab", "error", f"Failed to open new tab: {str(e)}")
 
     async def close_tab(self) -> Dict[str, Any]:
         """Close current tab."""
         try:
             await self.page.close()
-            return {"status": "success", "message": "Tab closed"}
+            return create_browser_result("close_tab", "success", "Tab closed")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to close tab: {str(e)}"}
+            return create_browser_result("close_tab", "error", f"Failed to close tab: {str(e)}")
 
     async def list_tabs(self) -> Dict[str, Any]:
         """List all tab URLs."""
@@ -869,9 +854,9 @@ class Browser:
         try:
             element = self.page.locator(selector)
             text = await element.text_content(timeout=5000)
-            return {"status": "success", "text": text, "selector": selector}
+            return create_browser_result("extract", "success", "Text extracted", text=text, selector=selector)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to extract: {str(e)}"}
+            return create_browser_result("extract", "error", f"Failed to extract: {str(e)}")
 
     async def get_page_text(self) -> Dict[str, Any]:
         """
@@ -881,7 +866,7 @@ class Browser:
         ads, cookies, footers, headers, buttons, and UI noise.
         """
         if not self.page:
-            return {"status": "error", "message": "No active browser page"}
+            return create_browser_result("get_page_text", "error", "No active browser page")
 
         try:
             # First attempt: execute in-browser DOM parser with noise stripping
@@ -1019,12 +1004,11 @@ class Browser:
                     data = await self.page.evaluate(js_extractor)
                     if data and data.get("text"):
                         clean_text = self._clean_extracted_text(data.get("text", ""))
-                        return {
-                            "status": "success",
-                            "text": clean_text[:12000],
-                            "title": data.get("title") or (await self.get_page_title()).get("title", ""),
-                            "url": data.get("url") or (await self.get_page_title()).get("url", "")
-                        }
+                        title_res = await self.get_page_title()
+                        return create_browser_result("get_page_text", "success", "Page text extracted",
+                            text=clean_text[:12000],
+                            title=title_res.get("title", ""),
+                            url=title_res.get("url", ""))
                 except Exception:
                     pass
 
@@ -1048,14 +1032,12 @@ class Browser:
 
             clean_text = self._clean_extracted_text(raw_text)
             title_result = await self.get_page_title()
-            return {
-                "status": "success",
-                "text": clean_text[:12000] if clean_text else "",
-                "title": title_result.get("title", ""),
-                "url": title_result.get("url", "")
-            }
+            return create_browser_result("get_page_text", "success", "Page text extracted",
+                text=clean_text[:12000] if clean_text else "",
+                title=title_result.get("title", ""),
+                url=title_result.get("url", ""))
         except Exception as e:
-            return {"status": "error", "message": f"Failed to get page text: {str(e)}"}
+            return create_browser_result("get_page_text", "error", f"Failed to get page text: {str(e)}")
 
     @staticmethod
     def _clean_extracted_text(raw_text: str) -> str:
@@ -1113,9 +1095,9 @@ class Browser:
                         links.append({"url": href, "text": text[:100]})
                 except Exception:
                     pass
-            return {"status": "success", "links": links[:limit]}
+            return create_browser_result("get_links", "success", f"Found {len(links)} links", links=links[:limit])
         except Exception as e:
-            return {"status": "error", "message": f"Failed to get links: {str(e)}"}
+            return create_browser_result("get_links", "error", f"Failed to get links: {str(e)}")
 
     async def screenshot(self) -> Dict[str, Any]:
         """Take a screenshot."""
@@ -1126,9 +1108,9 @@ class Browser:
             filename = f"browser_{int(time.time())}.png"
             path = os.path.join(img_dir, filename)
             await self.page.screenshot(path=path)
-            return {"status": "success", "message": f"Screenshot saved: {path}", "path": path}
+            return create_browser_result("screenshot", "success", f"Screenshot saved: {path}", path=path)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to screenshot: {str(e)}"}
+            return create_browser_result("screenshot", "error", f"Failed to screenshot: {str(e)}")
 
     async def search_images(self, query: str, limit: int = 8) -> List[str]:
         """Search Bing Images for a query and return candidate direct image URLs.

@@ -11,6 +11,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from system_ops import WORK_DIR
 from backend.tools.charts import render_chart
+from backend.tools.result_schema import create_office_result
 
 
 def _shade_cell(cell, fill_hex: str):
@@ -123,9 +124,9 @@ class Office:
                     print(f"[office] Chart embed skipped ({chart_err})")
 
             doc.save(save_path)
-            return {"status": "success", "message": f"Word document created: {save_path}", "path": save_path}
+            return create_office_result("create_docx", "success", f"Word document created: {save_path}", path=save_path, document_type="docx")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to create Word document: {str(e)}"}
+            return create_office_result("create_docx", "error", f"Failed to create Word document: {str(e)}")
 
     @staticmethod
     def _add_styled_table(doc: Document, table_data: List[List]):
@@ -339,24 +340,23 @@ class Office:
         try:
             if os.path.exists(path):
                 os.startfile(path) if os.name == 'nt' else None
-                return {"status": "success", "message": f"Opened document: {path}"}
-            return {"status": "error", "message": f"Document not found: {path}"}
+                return create_office_result("open_document", "success", f"Opened document: {path}", path=path)
+            return create_office_result("open_document", "error", f"Document not found: {path}")
         except Exception as e:
-            return {"status": "error", "message": f"Failed to open document: {str(e)}"}
+            return create_office_result("open_document", "error", f"Failed to open document: {str(e)}")
 
     @staticmethod
     async def verify_document(path: str) -> Dict[str, Any]:
         """Verify a document exists, has content, and contains clean synthesized analysis."""
         try:
             if not os.path.exists(path):
-                return {"status": "error", "message": f"Document not found: {path}", "verified": False}
+                return create_office_result("verify_document", "error", f"Document not found: {path}", verified=False)
 
             doc = Document(path)
             paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
             full_text = "\n".join(paragraphs).lower()
             word_count = sum(len(p.split()) for p in paragraphs)
 
-            # Check for obvious web navigation garbage
             noise_markers = [
                 "cookie policy", "terms of use", "privacy policy", "sign in to continue",
                 "create an account", "all rights reserved", "navigation menu", "skip to content",
@@ -364,27 +364,19 @@ class Office:
             ]
             noise_detected = [m for m in noise_markers if m in full_text]
 
-            # Check for synthesis structure
             has_summary = any("summary" in p.lower() for p in paragraphs[:5])
             has_findings = any("finding" in p.lower() or "analysis" in p.lower() for p in paragraphs)
             has_references = any("reference" in p.lower() or "source" in p.lower() for p in paragraphs)
 
             is_valid = len(paragraphs) >= 3 and word_count >= 50
 
-            return {
-                "status": "success" if is_valid else "error",
-                "verified": is_valid,
-                "message": f"Document verified: {len(paragraphs)} paragraphs, {word_count} words.",
-                "path": path,
-                "paragraph_count": len(paragraphs),
-                "word_count": word_count,
-                "has_summary": has_summary,
-                "has_findings": has_findings,
-                "has_references": has_references,
-                "noise_detected": noise_detected
-            }
+            return create_office_result("verify_document", "success" if is_valid else "error",
+                f"Document verified: {len(paragraphs)} paragraphs, {word_count} words.",
+                verified=is_valid, path=path, paragraph_count=len(paragraphs), word_count=word_count,
+                has_summary=has_summary, has_findings=has_findings, has_references=has_references,
+                noise_detected=noise_detected)
         except Exception as e:
-            return {"status": "error", "message": f"Failed to verify document: {str(e)}", "verified": False}
+            return create_office_result("verify_document", "error", f"Failed to verify document: {str(e)}", verified=False)
 
     @staticmethod
     async def create_pptx(
@@ -466,9 +458,9 @@ class Office:
                 Office._build_pptx_slide(prs, slide_data, idx, len(slides or []))
 
             prs.save(save_path)
-            return {"status": "success", "message": f"Presentation created: {save_path}", "path": save_path}
+            return create_office_result("create_pptx", "success", f"Presentation created: {save_path}", path=save_path, document_type="pptx", slide_count=len(slides or []))
         except Exception as e:
-            return {"status": "error", "message": f"Failed to create PowerPoint: {str(e)}"}
+            return create_office_result("create_pptx", "error", f"Failed to create PowerPoint: {str(e)}")
 
     @staticmethod
     def _build_pptx_slide(prs, slide_data: Dict, slide_num: int = 1, total_slides: int = 1):

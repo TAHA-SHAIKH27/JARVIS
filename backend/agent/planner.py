@@ -7,7 +7,7 @@ import re
 import os
 from typing import List, Dict, Any, Optional
 
-from backend.agent.state import TaskState, TaskType, ActionSpec, Plan
+from backend.agent.state import TaskState, TaskType, ActionSpec, Plan, VerificationMethod
 
 
 # ── Prompt sent to the LLM ────────────────────────────────────────────────────
@@ -15,7 +15,18 @@ PLANNER_SYSTEM_PROMPT = """You are the JARVIS Agent Planner. Convert the user's 
 
 RULES:
 1. Output ONLY a valid JSON array. No markdown fences, no explanation.
-2. Each element is an action object with a "type", "description", "expected_outcome", and "required_context_keys" field.
+2. Each element is an action object with these fields:
+   - "type": action type (required)
+   - "description": short human-readable description (required)
+   - "expected_outcome": what should be true after this action (required)
+   - "required_context_keys": state keys needed before this action (optional, default [])
+   - "goal": the specific sub-goal this action achieves (optional)
+   - "tool": the tool that executes this action (optional, auto-filled)
+   - "expected_state": description of expected system state after action (optional)
+   - "verification_method": how to verify - "uia", "browser_dom", "screenshot_vision", "file_system", "process_check", "ocr" (optional)
+   - "fallback": fallback strategy if action fails (optional)
+   - "max_attempts": maximum retry attempts (optional, default 3)
+   - "confidence_threshold": minimum confidence for verification (optional, default 0.8)
 3. Use the EXACT action types listed below — no invented types.
 4. Be precise: include all required parameters for each action type.
 5. Break complex tasks into the minimal necessary ordered steps.
@@ -29,38 +40,38 @@ RULES:
 AVAILABLE ACTION TYPES AND THEIR PARAMETERS:
 
 // Desktop automation
-{"type": "open_app_wait", "app_name": "notepad", "window_title": "Notepad", "description": "Open Notepad", "expected_outcome": "Notepad application is running and visible", "required_context_keys": []}
-{"type": "type_in_app",   "text": "Hello world",  "window_title": "Notepad", "description": "Type text in Notepad", "expected_outcome": "The text 'Hello world' is typed into Notepad", "required_context_keys": []}
-{"type": "press_key",     "key": "ctrl+s",        "description": "Press Ctrl+S to save", "expected_outcome": "Save dialog is opened or file is saved", "required_context_keys": []}
-{"type": "calculator_compute", "expression": "125 * 48", "expected": "6000", "description": "Calculate 125 × 48", "expected_outcome": "Calculation result is computed", "required_context_keys": []}
+{"type": "open_app_wait", "app_name": "notepad", "window_title": "Notepad", "description": "Open Notepad", "expected_outcome": "Notepad application is running and visible", "required_context_keys": [], "goal": "Launch Notepad", "tool": "computer.open_app", "expected_state": "Notepad window visible and focused", "verification_method": "uia", "fallback": "retry_with_longer_timeout", "max_attempts": 3}
+{"type": "type_in_app", "text": "Hello world", "window_title": "Notepad", "description": "Type text in Notepad", "expected_outcome": "The text 'Hello world' is typed into Notepad", "required_context_keys": [], "goal": "Enter text into Notepad", "tool": "computer.type_text", "expected_state": "Text appears in Notepad edit control", "verification_method": "uia", "fallback": "pyautogui_type", "max_attempts": 2}
+{"type": "press_key", "key": "ctrl+s", "description": "Press Ctrl+S to save", "expected_outcome": "Save dialog is opened or file is saved", "required_context_keys": [], "goal": "Trigger save shortcut", "tool": "computer.press_key", "expected_state": "Save dialog visible", "verification_method": "uia", "fallback": "retry", "max_attempts": 2}
+{"type": "calculator_compute", "expression": "125 * 48", "expected": "6000", "description": "Calculate 125 × 48", "expected_outcome": "Calculation result is computed", "required_context_keys": [], "goal": "Compute mathematical expression", "tool": "computer.calculator", "expected_state": "Calculator displays result 6000", "verification_method": "process_check", "fallback": "retry", "max_attempts": 3}
 
 // General Windows UI automation. Use find_ui_element before click_ui whenever a label is available.
-{"type": "inspect_ui", "target": "Settings", "description": "Inspect visible UI", "expected_outcome": "Matching UI controls are discovered", "required_context_keys": []}
-{"type": "find_ui_element", "text": "Save", "description": "Find the Save button", "expected_outcome": "The requested control is located", "required_context_keys": []}
-{"type": "click_ui", "text": "Save", "description": "Click Save", "expected_outcome": "The requested control is clicked", "required_context_keys": []}
-{"type": "type_ui", "text": "Hello", "description": "Type into the focused control", "expected_outcome": "Text is entered", "required_context_keys": []}
-{"type": "screenshot_ui", "description": "Capture the current screen", "expected_outcome": "A screenshot file is saved", "required_context_keys": []}
+{"type": "inspect_ui", "target": "Settings", "description": "Inspect visible UI", "expected_outcome": "Matching UI controls are discovered", "required_context_keys": [], "goal": "Discover UI elements", "tool": "computer.inspect_ui", "expected_state": "UI elements list available", "verification_method": "uia", "fallback": "screenshot_vision", "max_attempts": 2}
+{"type": "find_ui_element", "text": "Save", "description": "Find the Save button", "expected_outcome": "The requested control is located", "required_context_keys": [], "goal": "Locate Save button", "tool": "computer.find_element", "expected_state": "Save button element found with bounds", "verification_method": "uia", "fallback": "coordinate_click", "max_attempts": 3}
+{"type": "click_ui", "text": "Save", "description": "Click Save", "expected_outcome": "The requested control is clicked", "required_context_keys": [], "goal": "Click Save button", "tool": "computer.click", "expected_state": "Save dialog opens", "verification_method": "uia", "fallback": "coordinate_click", "max_attempts": 3}
+{"type": "type_ui", "text": "Hello", "description": "Type into the focused control", "expected_outcome": "Text is entered", "required_context_keys": [], "goal": "Type text into focused control", "tool": "computer.type_text", "expected_state": "Text appears in target control", "verification_method": "uia", "fallback": "pyautogui_type", "max_attempts": 2}
+{"type": "screenshot_ui", "description": "Capture the current screen", "expected_outcome": "A screenshot file is saved", "required_context_keys": [], "goal": "Capture screen", "tool": "computer.screenshot", "expected_state": "Screenshot file exists", "verification_method": "file_system", "fallback": "retry", "max_attempts": 2}
 
 // File system (VERIFIED versions - these check actual filesystem)
-{"type": "create_folder_verified", "path": "C:/Users/username/Desktop/FOLDER_NAME", "description": "Create folder on Desktop", "expected_outcome": "Folder exists at the specified path", "required_context_keys": []}
-{"type": "write_file_verified",    "path": "C:/full/path/file.txt", "content": "text", "description": "Create file", "expected_outcome": "File exists with the correct content", "required_context_keys": []}
-{"type": "verify_file",           "path": "C:/full/path/file.txt", "description": "Verify file/folder exists", "expected_outcome": "File presence is confirmed", "required_context_keys": []}
-{"type": "create_docx",           "path": "C:/full/path/doc.docx", "title": "Title", "content": "body text with sources, markdown tables (| a | b |) and optional [CHART:bar] Title / label: value blocks are supported", "headings": ["Heading 1", "Heading 2"], "description": "Create Word document", "expected_outcome": "Word document is created", "required_context_keys": []}
-{"type": "create_pptx",           "path": "C:/full/path/deck.pptx", "title": "Deck Title", "slides": [{"title": "Slide 1 Title", "bullets": ["Point one", "Point two"], "table": [["Header", "Value"], ["A", "1"]], "chart": {"type": "bar", "title": "Chart", "labels": ["Jan", "Feb"], "values": [30, 60]}, "image_subject": "topic-specific visual subject (only where a picture genuinely supports the slide, max 2 slides)", "image_url": "https://.../relevant.jpg", "notes": "Speaker notes"}], "description": "Create PowerPoint presentation. Bullets must be concise (max 8 words each) - slides are never dumps of scraped webpage text. When the task involves research, JARVIS builds the deck from the analyzed findings automatically.", "expected_outcome": "PowerPoint presentation is created", "required_context_keys": []}
+{"type": "create_folder_verified", "path": "C:/Users/username/Desktop/FOLDER_NAME", "description": "Create folder on Desktop", "expected_outcome": "Folder exists at the specified path", "required_context_keys": [], "goal": "Create folder", "tool": "filesystem.create_folder", "expected_state": "Folder exists on disk", "verification_method": "file_system", "fallback": "retry", "max_attempts": 2}
+{"type": "write_file_verified", "path": "C:/full/path/file.txt", "content": "text", "description": "Create file", "expected_outcome": "File exists with the correct content", "required_context_keys": [], "goal": "Write file", "tool": "filesystem.write_file", "expected_state": "File exists with content", "verification_method": "file_system", "fallback": "retry", "max_attempts": 2}
+{"type": "verify_file", "path": "C:/full/path/file.txt", "description": "Verify file/folder exists", "expected_outcome": "File presence is confirmed", "required_context_keys": [], "goal": "Verify file exists", "tool": "filesystem.verify_file", "expected_state": "File confirmed on disk", "verification_method": "file_system", "fallback": "retry", "max_attempts": 2}
+{"type": "create_docx", "path": "C:/full/path/doc.docx", "title": "Title", "content": "body text with sources, markdown tables (| a | b |) and optional [CHART:bar] Title / label: value blocks are supported", "headings": ["Heading 1", "Heading 2"], "description": "Create Word document", "expected_outcome": "Word document is created", "required_context_keys": [], "goal": "Generate Word document", "tool": "office.create_docx", "expected_state": "DOCX file exists with content", "verification_method": "file_system", "fallback": "simplified_document", "max_attempts": 2}
+{"type": "create_pptx", "path": "C:/full/path/deck.pptx", "title": "Deck Title", "slides": [{"title": "Slide 1 Title", "bullets": ["Point one", "Point two"], "table": [["Header", "Value"], ["A", "1"]], "chart": {"type": "bar", "title": "Chart", "labels": ["Jan", "Feb"], "values": [30, 60]}, "image_subject": "topic-specific visual subject (only where a picture genuinely supports the slide, max 2 slides)", "image_url": "https://.../relevant.jpg", "notes": "Speaker notes"}], "description": "Create PowerPoint presentation. Bullets must be concise (max 8 words each) - slides are never dumps of scraped webpage text. When the task involves research, JARVIS builds the deck from the analyzed findings automatically.", "expected_outcome": "PowerPoint presentation is created", "required_context_keys": [], "goal": "Generate PowerPoint", "tool": "office.create_pptx", "expected_state": "PPTX file exists with slides", "verification_method": "file_system", "fallback": "simplified_presentation", "max_attempts": 2}
 
 // Browser (uses visible Playwright Chromium, headless=False)
 // browser_search automatically extracts and stores results in state.search_results
 // If Google blocks with CAPTCHA, browser_search automatically falls back to Bing — no special handling needed
-{"type": "browser_search",   "query": "National Science Day India", "description": "Search Google", "expected_outcome": "Search results are retrieved", "required_context_keys": []}
+{"type": "browser_search", "query": "National Science Day India", "description": "Search Google", "expected_outcome": "Search results are retrieved", "required_context_keys": [], "goal": "Search web for topic", "tool": "browser.search", "expected_state": "Search results page with results", "verification_method": "browser_dom", "fallback": "fallback_to_bing", "max_attempts": 3}
 // browser_navigate: navigate to a URL (use from state.search_results)
-{"type": "browser_navigate", "url": "https://example.com", "source_index": 0, "description": "Navigate to source 1", "expected_outcome": "Browser navigates to the specified URL", "required_context_keys": ["search_results"]}
+{"type": "browser_navigate", "url": "https://example.com", "source_index": 0, "description": "Navigate to source 1", "expected_outcome": "Browser navigates to the specified URL", "required_context_keys": ["search_results"], "goal": "Open search result", "tool": "browser.navigate", "expected_state": "Target page loaded", "verification_method": "browser_dom", "fallback": "retry_navigation", "max_attempts": 3}
 // browser_extract: extracts text from current page, stores in state.extracted_sources
-{"type": "browser_extract",  "description": "Extract text from current page", "expected_outcome": "Text is extracted from the page", "required_context_keys": ["current_page_url"]}
-{"type": "browser_get_title","description": "Get current page title", "expected_outcome": "Page title is retrieved", "required_context_keys": []}
-{"type": "browser_click", "selector": "button[type=submit]", "expected_url_contains": "", "expected_text": "", "description": "Click a web control", "expected_outcome": "The requested web control changes the page as expected", "required_context_keys": []}
-{"type": "browser_type", "selector": "input[name=q]", "text": "query", "description": "Fill a web form", "expected_outcome": "The form field contains the requested text", "required_context_keys": []}
-{"type": "browser_new_tab", "description": "Open a new browser tab", "expected_outcome": "A new browser tab is available", "required_context_keys": []}
-{"type": "report_page_finding", "query": "current Python release", "description": "Report an evidence-based finding from the page", "expected_outcome": "A finding from extracted page content is available", "required_context_keys": ["extracted_sources"]}
+{"type": "browser_extract", "description": "Extract text from current page", "expected_outcome": "Text is extracted from the page", "required_context_keys": ["current_page_url"], "goal": "Extract page content", "tool": "browser.extract", "expected_state": "Page text stored in state", "verification_method": "browser_dom", "fallback": "retry_extraction", "max_attempts": 2}
+{"type": "browser_get_title", "description": "Get current page title", "expected_outcome": "Page title is retrieved", "required_context_keys": [], "goal": "Get page title", "tool": "browser.get_title", "expected_state": "Page title available", "verification_method": "browser_dom", "fallback": "retry", "max_attempts": 2}
+{"type": "browser_click", "selector": "button[type=submit]", "expected_url_contains": "", "expected_text": "", "description": "Click a web control", "expected_outcome": "The requested web control changes the page as expected", "required_context_keys": [], "goal": "Click web element", "tool": "browser.click", "expected_state": "Page updated after click", "verification_method": "browser_dom", "fallback": "retry", "max_attempts": 2}
+{"type": "browser_type", "selector": "input[name=q]", "text": "query", "description": "Fill a web form", "expected_outcome": "The form field contains the requested text", "required_context_keys": [], "goal": "Fill web form", "tool": "browser.type", "expected_state": "Form field populated", "verification_method": "browser_dom", "fallback": "retry", "max_attempts": 2}
+{"type": "browser_new_tab", "description": "Open a new browser tab", "expected_outcome": "A new browser tab is available", "required_context_keys": [], "goal": "Open new tab", "tool": "browser.new_tab", "expected_state": "New tab active", "verification_method": "browser_dom", "fallback": "retry", "max_attempts": 2}
+{"type": "report_page_finding", "query": "current Python release", "description": "Report an evidence-based finding from the page", "expected_outcome": "A finding from extracted page content is available", "required_context_keys": ["extracted_sources"], "goal": "Report finding from page", "tool": "browser.report_finding", "expected_state": "Finding available in state", "verification_method": "browser_dom", "fallback": "retry", "max_attempts": 2}
 
 // System info
 {"type": "open_app_wait", "app_name": "chrome", "window_title": "Chrome", "description": "Open Chrome", "expected_outcome": "Chrome browser is open", "required_context_keys": []}
@@ -641,6 +652,15 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
         produces = []
         consumes = []
         
+        # Structured planning fields
+        goal = action.get("goal", description)
+        tool = action.get("tool", _action_type_to_tool(atype))
+        expected_state = action.get("expected_state", expected_outcome)
+        verification_method = action.get("verification_method", _default_verification_method(atype))
+        fallback = action.get("fallback", _default_fallback(atype))
+        max_attempts = action.get("max_attempts", 3)
+        confidence_threshold = action.get("confidence_threshold", 0.8)
+        
         if atype == "browser_search":
             produces = ["search_results", "current_page_url", "current_page_title"]
         elif atype == "browser_navigate":
@@ -713,7 +733,7 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
                     break
         
         # Extract parameters (exclude type and description etc)
-        params = {k: v for k, v in action.items() if k not in ("type", "description", "expected_outcome", "required_context_keys")}
+        params = {k: v for k, v in action.items() if k not in ("type", "description", "expected_outcome", "required_context_keys", "goal", "tool", "expected_state", "verification_method", "fallback", "max_attempts", "confidence_threshold")}
         
         spec = ActionSpec(
             type=atype,
@@ -725,11 +745,80 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
             verification={},  # Will be filled by validator
             expected_outcome=expected_outcome,
             required_context_keys=required_context_keys,
-            is_critical=atype != "speak"
+            is_critical=atype != "speak",
+            # Structured planning fields
+            goal=goal,
+            tool=tool,
+            expected_state=expected_state,
+            verification_method=verification_method,
+            fallback=fallback,
+            max_attempts=max_attempts,
+            confidence_threshold=confidence_threshold,
         )
         specs.append(spec)
     
     return specs
+
+
+def _action_type_to_tool(action_type: str) -> str:
+    """Map action type to tool name."""
+    tool_map = {
+        "open_app_wait": "computer.open_app",
+        "type_in_app": "computer.type_text",
+        "press_key": "computer.press_key",
+        "calculator_compute": "computer.calculator",
+        "inspect_ui": "computer.inspect_ui",
+        "find_ui_element": "computer.find_element",
+        "click_ui": "computer.click",
+        "type_ui": "computer.type_text",
+        "screenshot_ui": "computer.screenshot",
+        "create_folder_verified": "filesystem.create_folder",
+        "write_file_verified": "filesystem.write_file",
+        "verify_file": "filesystem.verify_file",
+        "create_docx": "office.create_docx",
+        "create_pptx": "office.create_pptx",
+        "browser_search": "browser.search",
+        "browser_navigate": "browser.navigate",
+        "browser_extract": "browser.extract",
+        "browser_get_title": "browser.get_title",
+        "browser_click": "browser.click",
+        "browser_type": "browser.type",
+        "browser_new_tab": "browser.new_tab",
+        "report_page_finding": "browser.report_finding",
+        "speak": "speech.speak",
+    }
+    return tool_map.get(action_type, "unknown")
+
+
+def _default_verification_method(action_type: str) -> str:
+    """Return default verification method for action type."""
+    if action_type in ("open_app_wait", "inspect_ui", "find_ui_element", "click_ui", "type_ui"):
+        return VerificationMethod.UIA.value
+    elif action_type in ("browser_search", "browser_navigate", "browser_extract", "browser_click", "browser_type"):
+        return VerificationMethod.BROWSER_DOM.value
+    elif action_type in ("create_folder_verified", "write_file_verified", "verify_file", "create_docx", "create_pptx"):
+        return VerificationMethod.FILE_SYSTEM.value
+    elif action_type in ("calculator_compute", "press_key"):
+        return VerificationMethod.PROCESS_CHECK.value
+    elif action_type == "screenshot_ui":
+        return VerificationMethod.SCREENSHOT_VISION.value
+    return VerificationMethod.UIA.value
+
+
+def _default_fallback(action_type: str) -> str:
+    """Return default fallback strategy for action type."""
+    fallback_map = {
+        "open_app_wait": "retry_with_longer_timeout",
+        "find_ui_element": "coordinate_click",
+        "click_ui": "coordinate_click",
+        "type_ui": "pyautogui_type",
+        "browser_search": "fallback_to_bing",
+        "browser_navigate": "retry_navigation",
+        "browser_extract": "retry_extraction",
+        "create_docx": "simplified_document",
+        "create_pptx": "simplified_presentation",
+    }
+    return fallback_map.get(action_type, "retry")
 
 
 def _infer_task_type(task: str, goal_analysis: Dict[str, Any]) -> TaskType:

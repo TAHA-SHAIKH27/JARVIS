@@ -2,6 +2,7 @@
 Agent Observer — verifies REAL system state after each action.
 Never returns "success" based on assumptions.
 Detects CAPTCHA, consent pages, and other browser states.
+Provides structured state representation for semantic computer understanding.
 """
 import asyncio
 import os
@@ -11,11 +12,20 @@ from typing import Any, Dict, Optional, List
 from backend.agent.state import TaskState, ActionSpec, VerificationResult
 from backend.agent.registry import ToolRegistry
 from backend.tools.browser import Browser, BrowserPageState
+from backend.tools.result_schema import ScreenObservation, UIElement, WindowInfo
 
 
 class Observer:
     def __init__(self, registry: Optional[ToolRegistry] = None):
         self.registry = registry or ToolRegistry()
+        self._computer = None
+
+    def _get_computer(self):
+        if self._computer is None:
+            computer = self.registry.get("computer_tool")
+            if computer:
+                self._computer = computer
+        return self._computer
 
     async def observe(self, state: TaskState, focus: str = "general") -> Dict[str, Any]:
         """Lightweight general observation (used at start of each loop iteration)."""
@@ -36,6 +46,112 @@ class Observer:
         observations["observations"].append(f"System snapshot taken: focus={focus}")
         return observations
 
+    async def get_structured_state(self, state: TaskState) -> ScreenObservation:
+        """
+        Get a structured representation of the current computer state.
+        
+        Returns a ScreenObservation dataclass with:
+        - application: application name
+        - window_title: active window title
+        - elements: list of UIElement objects
+        - active_window: WindowInfo object
+        - running_apps: list of running process names
+        - timestamp: float
+        - source: "uia" | "win32" | "mixed"
+        """
+        application = None
+        window_title = None
+        elements: List[UIElement] = []
+        active_window: Optional[WindowInfo] = None
+        running_apps: List[str] = []
+        timestamp = time.time()
+        source = "mixed"
+
+        # Get active window
+        computer = self._get_computer()
+        if computer:
+            active = await computer.get_active_window(state)
+            if active.get("status") == "success":
+                win_data = active["window"]
+                active_window = WindowInfo(
+                    handle=win_data["handle"],
+                    title=win_data["title"],
+                    class_name=win_data["class_name"],
+                    bounds=win_data["bounds"],
+                    is_active=win_data.get("is_active", True),
+                    process_id=win_data.get("process_id"),
+                    process_name=win_data.get("process_name", ""),
+                )
+                window_title = win_data["title"]
+                application = self._extract_app_name(window_title, win_data["class_name"])
+
+        # Get running apps
+        try:
+            import psutil
+            running = set()
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    running.add(proc.info["name"].lower())
+                except Exception:
+                    pass
+            running_apps = list(running)
+        except Exception:
+            running_apps = []
+
+        # Get UI elements for active window
+        if window_title and computer:
+            elements_result = await computer.inspect_controls(window_title, state=state)
+            if elements_result.get("status") == "success":
+                for ctrl in elements_result.get("controls", []):
+                    bounds = ctrl.get("bounds", ctrl.get("rect", []))
+                    if len(bounds) == 4:
+                        elements.append(UIElement(
+                            name=ctrl.get("name") or ctrl.get("title") or ctrl.get("automation_id") or "unnamed",
+                            role=ctrl.get("role", ctrl.get("control_type", "")).lower(),
+                            bounds=bounds,
+                            confidence=ctrl.get("confidence", 0.95 if ctrl.get("enabled") else 0.5),
+                            source=ctrl.get("source", "uia"),
+                            enabled=ctrl.get("enabled", True),
+                            class_name=ctrl.get("class_name", ctrl.get("class", "")),
+                            automation_id=ctrl.get("automation_id", ""),
+                        ))
+
+        return ScreenObservation(
+            application=application or "Unknown",
+            window_title=window_title or "Unknown",
+            elements=elements,
+            active_window=active_window,
+            running_apps=running_apps,
+            timestamp=timestamp,
+            source=source,
+        )
+
+    def _extract_app_name(self, window_title: str, class_name: str) -> str:
+        """Extract application name from window title/class."""
+        known_apps = {
+            "notepad": "Notepad",
+            "calc": "Calculator",
+            "mspaint": "Paint",
+            "chrome": "Google Chrome",
+            "msedge": "Microsoft Edge",
+            "firefox": "Firefox",
+            "explorer": "File Explorer",
+            "winword": "Microsoft Word",
+            "excel": "Microsoft Excel",
+            "powerpnt": "Microsoft PowerPoint",
+            "cmd": "Command Prompt",
+            "taskmgr": "Task Manager",
+            "vscode": "Visual Studio Code",
+            "code": "Visual Studio Code",
+        }
+        title_lower = window_title.lower()
+        class_lower = class_name.lower()
+        for key, name in known_apps.items():
+            if key in title_lower or key in class_lower:
+                return name
+        # Fallback: use first word of title
+        return window_title.split()[0] if window_title else "Unknown"
+
     # ─────────────────────────────────────────────────────────────────────────
     # Per-action verifiers
     # ─────────────────────────────────────────────────────────────────────────
@@ -52,6 +168,7 @@ class Observer:
         classification: "success" | "retryable" | "human_required" | "recoverable" | "fatal"
         """
         atype = action.type
+        computer = self._get_computer()
 
         if atype == "open_app_wait":
             window_title = action.parameters.get("window_title", action.parameters.get("app_name", ""))
@@ -88,10 +205,27 @@ class Observer:
                 return {"verified": True, "message": f"Found UI control: {element.get('title') or element.get('text', 'unnamed')}", "classification": "success"}
             return {"verified": False, "message": result.get("message", "UI control not found") if result else "UI control not found", "classification": "recoverable"}
 
-        elif atype in ("click_ui", "type_ui"):
+        elif atype == "click_ui":
             if result and result.get("status") == "success":
-                return {"verified": True, "message": result.get("message", f"UI action {atype} completed"), "classification": "success"}
-            return {"verified": False, "message": result.get("message", f"UI action {atype} failed") if result else "UI action failed", "classification": "retryable"}
+                target = action.parameters.get("text", action.parameters.get("element", {}).get("title", "target"))
+                if computer:
+                    await asyncio.sleep(0.3)
+                    verification = await computer.get_active_window(state)
+                    if verification.get("status") == "success":
+                        return {"verified": True, "message": f"Clicked {target}, window active: {verification['window']['title']}", "classification": "success"}
+                return {"verified": True, "message": result.get("message", f"Clicked {target}"), "classification": "success"}
+            return {"verified": False, "message": result.get("message", f"UI click failed") if result else "UI click failed", "classification": "retryable"}
+
+        elif atype == "type_ui":
+            if result and result.get("status") == "success":
+                target = action.parameters.get("element", {}).get("title", "focused control")
+                if computer:
+                    await asyncio.sleep(0.3)
+                    verification = await computer.get_active_window(state)
+                    if verification.get("status") == "success":
+                        return {"verified": True, "message": f"Typed into {target} in {verification['window']['title']}", "classification": "success"}
+                return {"verified": True, "message": result.get("message", f"Typed into {target}"), "classification": "success"}
+            return {"verified": False, "message": result.get("message", f"UI type failed") if result else "UI type failed", "classification": "retryable"}
 
         elif atype == "screenshot_ui":
             path = result.get("path", "") if result else ""
@@ -332,14 +466,13 @@ class Observer:
             def enum_cb(hwnd, ctx):
                 text = win32gui.GetWindowText(hwnd)
                 if text and window_title.lower() in text.lower():
-                    ctx.append(text)
+                    ctx.append({"title": text, "handle": str(hwnd)})
 
             win32gui.EnumWindows(enum_cb, found)
             if found:
-                return {"verified": True, "message": f"Window found: {found[0]}"}
+                return {"verified": True, "message": f"Window found: {found[0]['title']}", "window": found[0]}
             return {"verified": False, "message": f"Window '{window_title}' not found"}
         except ImportError:
-            # win32gui not available — fall back to psutil process check
             try:
                 import psutil
                 for proc in psutil.process_iter(["name"]):
@@ -355,32 +488,33 @@ class Observer:
         """Verify a file exists on disk."""
         if os.path.isfile(path):
             size = os.path.getsize(path)
-            return {"verified": True, "message": f"File exists: {path} ({size} bytes)"}
-        return {"verified": False, "message": f"File NOT found: {path}"}
+            return {"verified": True, "message": f"File exists: {path} ({size} bytes)", "classification": "success"}
+        return {"verified": False, "message": f"File NOT found: {path}", "classification": "recoverable"}
 
     def verify_folder_exists(self, path: str) -> Dict[str, Any]:
         """Verify a folder exists on disk."""
         if os.path.isdir(path):
-            return {"verified": True, "message": f"Folder exists: {path}"}
-        return {"verified": False, "message": f"Folder NOT found: {path}"}
+            return {"verified": True, "message": f"Folder exists: {path}", "classification": "success"}
+        return {"verified": False, "message": f"Folder NOT found: {path}", "classification": "recoverable"}
 
     def verify_docx(self, path: str) -> Dict[str, Any]:
         """Open and read a DOCX to confirm it has content."""
         try:
             from docx import Document
             if not os.path.isfile(path):
-                return {"verified": False, "message": f"DOCX not found: {path}"}
+                return {"verified": False, "message": f"DOCX not found: {path}", "classification": "recoverable"}
             doc = Document(path)
             paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
             if paragraphs:
                 return {
                     "verified": True,
                     "message": f"DOCX verified: {len(paragraphs)} paragraphs, path={path}",
-                    "paragraph_count": len(paragraphs)
+                    "paragraph_count": len(paragraphs),
+                    "classification": "success"
                 }
-            return {"verified": False, "message": f"DOCX exists but has no readable content: {path}"}
+            return {"verified": False, "message": f"DOCX exists but has no readable content: {path}", "classification": "recoverable"}
         except Exception as e:
-            return {"verified": False, "message": f"DOCX read error: {str(e)}"}
+            return {"verified": False, "message": f"DOCX read error: {str(e)}", "classification": "retryable"}
 
     def verify_pptx(self, path: str) -> Dict[str, Any]:
         """Open and verify a PPTX presentation file exists and has slides."""
@@ -595,14 +729,12 @@ class Observer:
             from pywinauto import Application
             app = Application(backend="uia").connect(title_re=f".*{window_title}.*", timeout=3)
             win = app.top_window()
-            # Notepad uses an Edit control
             edit = win.child_window(control_type="Edit")
             content = edit.window_text()
             if expected_text.lower() in content.lower():
-                return {"verified": True, "message": f"Text found in {window_title}: '{expected_text[:50]}'"}
-            return {"verified": False, "message": f"Text '{expected_text[:50]}' NOT found in {window_title}. Content starts: '{content[:80]}'"}
+                return {"verified": True, "message": f"Text found in {window_title}: '{expected_text[:50]}'", "content": content}
+            return {"verified": False, "message": f"Text '{expected_text[:50]}' NOT found in {window_title}. Content starts: '{content[:80]}'", "content": content}
         except Exception as e:
-            # If we can't read the content, at least confirm the window is there
             win_check = self.verify_window_exists(window_title)
             if win_check["verified"]:
                 return {"verified": True, "message": f"Window present (text read unavailable): {win_check['message']}"}

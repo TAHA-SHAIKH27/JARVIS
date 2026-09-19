@@ -1,9 +1,24 @@
 """
 Agent Verifier — determines whether an action truly succeeded based on
 the Observer's structured verification result with failure classification.
+
+Verification outcomes:
+- SUCCESS: Both executor and observer confirm action completed as expected
+- PARTIAL_SUCCESS: Executor succeeded but observer could only partially verify
+- FAILURE: Action did not achieve expected outcome
+- UNKNOWN: Cannot determine outcome (missing verifier, etc.)
 """
+from enum import Enum
 from typing import Any, Dict, Optional
 from backend.agent.state import TaskState, ActionSpec, FailureClassification
+from backend.tools.result_schema import ToolResultStatus
+
+
+class VerificationOutcome(Enum):
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    FAILURE = "failure"
+    UNKNOWN = "unknown"
 
 
 class Verifier:
@@ -23,161 +38,234 @@ class Verifier:
         Returns:
           {
             "verified":    bool,
-            "status":      "success" | "failure" | "retry" | "human_required" | "recoverable" | "fatal",
+            "outcome":     "success" | "partial_success" | "failure" | "unknown",
+            "status":      "success" | "retry" | "human_required" | "recoverable" | "fatal",
             "message":     str,
             "should_retry": bool,
             "classification": FailureClassification value,
             "requires_user": bool,  # for human_required
             "recoverable": bool,    # for recoverable failures
+            "confidence":  float,   # 0.0 - 1.0 confidence in verification
           }
         """
         # If the executor itself reported an error, mark unverified
         exec_ok = result.get("status") != "error" if result else False
+        exec_message = result.get("message", "") if result else "Executor returned no result"
         obs_verified = observation.get("verified", False)
         obs_message = observation.get("message", "")
         classification = observation.get("classification", "recoverable")
+        obs_confidence = observation.get("confidence", 0.5)
+
+        # Determine base confidence
+        base_confidence = 0.8 if exec_ok else 0.3
+        if obs_verified:
+            base_confidence = max(base_confidence, 0.9)
+        elif not exec_ok:
+            base_confidence = min(base_confidence, 0.2)
+        else:
+            # Exec OK but observer couldn't verify
+            base_confidence = 0.5
+
+        # Adjust confidence based on observation confidence
+        confidence = (base_confidence + obs_confidence) / 2
 
         if exec_ok and obs_verified:
             return {
                 "verified": True,
+                "outcome": VerificationOutcome.SUCCESS.value,
                 "status": "success",
-                "message": obs_message or result.get("message", "Action succeeded"),
+                "message": obs_message or exec_message or "Action succeeded",
                 "should_retry": False,
                 "classification": FailureClassification.COMPLETED.value,
                 "requires_user": False,
                 "recoverable": True,
+                "confidence": confidence,
             }
         elif not exec_ok:
             # Executor error - check if it's a known recoverable error
-            exec_msg = result.get("message", "Executor reported error") if result else "Executor returned no result"
-            # Check for specific error types
-            if "timeout" in exec_msg.lower() or "timed out" in exec_msg.lower():
+            if "timeout" in exec_message.lower() or "timed out" in exec_message.lower():
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
                     "status": "retry",
-                    "message": exec_msg,
+                    "message": exec_message,
                     "should_retry": True,
                     "classification": FailureClassification.RETRYABLE.value,
                     "requires_user": False,
                     "recoverable": True,
+                    "confidence": 0.2,
                 }
             return {
                 "verified": False,
+                "outcome": VerificationOutcome.FAILURE.value,
                 "status": "failure",
-                "message": exec_msg,
+                "message": exec_message,
                 "should_retry": True,
                 "classification": FailureClassification.RECOVERABLE.value,
                 "requires_user": False,
                 "recoverable": True,
+                "confidence": 0.1,
             }
         else:
             # Executor OK but observer did not confirm
             # Use the classification from observer
-            cls = FailureClassification(classification) if classification in [c.value for c in FailureClassification] else FailureClassification.RECOVERABLE
+            try:
+                cls = FailureClassification(classification) if classification in [c.value for c in FailureClassification] else FailureClassification.RECOVERABLE
+            except ValueError:
+                cls = FailureClassification.RECOVERABLE
 
             if cls == FailureClassification.HUMAN_REQUIRED:
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
                     "status": "human_required",
                     "message": f"Human intervention required: {obs_message}",
                     "should_retry": False,  # Don't auto-retry, wait for user
                     "classification": cls.value,
                     "requires_user": True,
                     "recoverable": True,
+                    "confidence": 0.0,
                 }
             elif cls == FailureClassification.RETRYABLE:
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
                     "status": "retry",
                     "message": f"Temporary failure (retryable): {obs_message}",
                     "should_retry": True,
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": True,
+                    "confidence": 0.3,
                 }
             elif cls == FailureClassification.RECOVERABLE:
+                # Check if this is a partial success (some progress made)
+                if obs_message and ("found" in obs_message.lower() or "partial" in obs_message.lower() or "some" in obs_message.lower()):
+                    return {
+                        "verified": False,
+                        "outcome": VerificationOutcome.PARTIAL_SUCCESS.value,
+                        "status": "recoverable",
+                        "message": f"Partial progress: {obs_message}",
+                        "should_retry": True,
+                        "classification": cls.value,
+                        "requires_user": False,
+                        "recoverable": True,
+                        "confidence": 0.5,
+                    }
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
                     "status": "recoverable",
                     "message": f"Strategy failed (recoverable): {obs_message}",
                     "should_retry": True,  # Will retry with different strategy or re-plan
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": True,
+                    "confidence": 0.3,
                 }
             elif cls == FailureClassification.FATAL:
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
                     "status": "fatal",
                     "message": f"Fatal error: {obs_message}",
                     "should_retry": False,
                     "classification": cls.value,
                     "requires_user": False,
                     "recoverable": False,
+                    "confidence": 0.0,
                 }
             else:
                 return {
                     "verified": False,
+                    "outcome": VerificationOutcome.UNKNOWN.value,
                     "status": "recoverable",
                     "message": f"Verification failed: {obs_message}",
                     "should_retry": True,
                     "classification": FailureClassification.RECOVERABLE.value,
                     "requires_user": False,
                     "recoverable": True,
+                    "confidence": 0.2,
                 }
 
     def verify(self, state: TaskState, intended_result: Any = None) -> Dict[str, Any]:
         """
         Overall task verification — used for final status after the loop.
         Checks state.errors and state.completed_steps.
+        Returns structured verification with outcome classification.
         """
+        total_steps = len(state.plan.actions) if state.plan and state.plan.actions else 0
+        completed = len(state.completed_steps)
+        failed = len(state.failed_steps)
+        
         if state.completion_status == "completed":
             return {
                 "verification_status": "completed",
+                "outcome": VerificationOutcome.SUCCESS.value,
                 "confidence": 1.0,
                 "retry_count": state.retry_count,
                 "completed_steps": state.completed_steps,
+                "total_steps": total_steps,
                 "active_app": state.active_app,
                 "errors": state.errors.copy(),
             }
 
-        if state.retry_count >= 3:
+        if state.retry_count >= 3 and completed == 0:
             return {
                 "verification_status": "failed",
+                "outcome": VerificationOutcome.FAILURE.value,
                 "confidence": 0.0,
                 "retry_count": state.retry_count,
                 "completed_steps": state.completed_steps,
+                "total_steps": total_steps,
                 "active_app": state.active_app,
                 "errors": state.errors.copy(),
             }
 
         if state.errors:
             # If there are errors but some steps completed, it's partial
-            status = "failed" if not state.completed_steps else "partial"
+            if completed > 0:
+                return {
+                    "verification_status": "partial",
+                    "outcome": VerificationOutcome.PARTIAL_SUCCESS.value,
+                    "confidence": 0.4,
+                    "retry_count": state.retry_count,
+                    "completed_steps": state.completed_steps,
+                    "total_steps": total_steps,
+                    "failed_steps": failed,
+                    "active_app": state.active_app,
+                    "errors": state.errors.copy(),
+                }
             return {
-                "verification_status": status,
-                "confidence": 0.3,
+                "verification_status": "failed",
+                "outcome": VerificationOutcome.FAILURE.value,
+                "confidence": 0.1,
                 "retry_count": state.retry_count,
                 "completed_steps": state.completed_steps,
+                "total_steps": total_steps,
                 "active_app": state.active_app,
                 "errors": state.errors.copy(),
             }
 
-        if state.completed_steps:
+        if completed > 0:
             return {
                 "verification_status": "completed",
+                "outcome": VerificationOutcome.SUCCESS.value,
                 "confidence": 0.9,
                 "retry_count": state.retry_count,
                 "completed_steps": state.completed_steps,
+                "total_steps": total_steps,
                 "active_app": state.active_app,
                 "errors": [],
             }
 
         return {
             "verification_status": "pending",
+            "outcome": VerificationOutcome.UNKNOWN.value,
             "confidence": 0.0,
             "retry_count": state.retry_count,
             "completed_steps": state.completed_steps,
+            "total_steps": total_steps,
             "active_app": state.active_app,
             "errors": state.errors.copy(),
         }

@@ -1,92 +1,182 @@
 [
   {
-    "id": "1db0d044-1dd8-40b4-be8b-9db7b5a04824",
+    "id": "390209c6-67f4-44d2-b89b-a320b48ea275",
     "role": "user",
-    "content": "create a ppt on the topic greenhouse effect gather info from 5 websites",
+    "content": "Calculate 125 * 48",
+    "metadata": {
+      "intent": "calculation"
+    },
+    "timestamp": "2026-09-19T08:03:33.965402+00:00"
+  },
+  {
+    "id": "362b5975-fcd1-457c-93f5-adcb5293bc0a",
+    "role": "user",
+    "content": "Research Python history and create a Word document",
+    "metadata": {
+      "intent": "research"
+    },
+    "timestamp": "2026-09-19T08:03:40.330267+00:00"
+  },
+  {
+    "id": "93ec0630-c2ef-4019-bfe3-a50d23ef0119",
+    "role": "user",
+    "content": "Search for the weather in London",
+    "metadata": {
+      "intent": "research"
+    },
+    "timestamp": "2026-09-19T08:03:46.463563+00:00"
+  },
+  {
+    "id": "4a7ef109-16c2-4968-9bfa-9f21712e2d6a",
+    "role": "user",
+    "content": "Create a folder named 'TestFolder' on Desktop",
     "metadata": {
       "intent": "conversation"
     },
-    "timestamp": "2026-09-15T06:07:48.648736+00:00"
+    "timestamp": "2026-09-19T08:03:52.565588+00:00"
   },
   {
-    "id": "8afcff11-1df7-4440-84a0-bf48e724eae7",
+    "id": "3badd3c2-0ef5-482e-ac63-b28e79487aef",
     "role": "user",
-    "content": "search for greenhouse effect from 3 sources and then create a ppt",
+    "content": "Open Notepad",
+    "metadata": {
+      "intent": "computer_action"
+    },
+    "timestamp": "2026-09-19T08:03:59.547124+00:00"
+  },
+  {
+    "id": "c49dfb4d-a6d9-4aa1-8688-b0eb3b76880a",
+    "role": "user",
+    "content": "Open Notepad and type 'Test message'",
+    "metadata": {
+      "intent": "computer_action"
+    },
+    "timestamp": "2026-09-19T08:04:09.785699+00:00"
+  },
+  {
+    "id": "c9263be6-83ee-45fd-a013-4bf13bbc982e",
+    "role": "user",
+    "content": "Research the history of Python and create a Word document",
     "metadata": {
       "intent": "research"
     },
-    "timestamp": "2026-09-15T06:37:04.349727+00:00"
+    "timestamp": "2026-09-19T08:12:37.737992+00:00"
   },
   {
-    "id": "c8240e84-9379-43f1-98fa-39e9998f6fdc",
+    "id": "3fd7b9ad-159e-4568-9e84-48995dc7b7f7",
     "role": "user",
-    "content": "search for the topic greenhouse effect from 3 sources and make a ppt",
+    "content": "Calculate 25 * 40",
+    "metadata": {
+      "intent": "calculation"
+    },
+    "timestamp": "2026-09-19T08:12:41.699119+00:00"
+  },
+  {
+    "id": "c3221958-d4f2-4285-abc4-9cd68c00ab27",
+    "role": "user",
+    "content": "Open Chrome and search for AI news",
     "metadata": {
       "intent": "research"
     },
-    "timestamp": "2026-09-15T06:38:39.437068+00:00"
+    "timestamp": "2026-09-19T08:12:44.764681+00:00"
   },
   {
-    "id": "3e354196-6f4c-4fa2-b550-b6a0d3344b9f",
+    "id": "c948a56a-3d99-42ae-8f6b-95a9f90c5680",
     "role": "user",
-    "content": "search for the topic greenhouse effect from 3 websites and me a ppt on it of 5 slides",
+    "content": "Create a folder called 'Projects' on my Desktop",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T08:12:47.812747+00:00"
+  },
+  {
+    "id": "b587663e-8dd4-448f-ae4f-7b3f905a7d6a",
+    "role": "user",
+    "content": "Open Notepad and type 'Hello World'",
+    "metadata": {
+      "intent": "computer_action"
+    },
+    "timestamp": "2026-09-19T08:12:50.952312+00:00"
+  },
+  {
+    "id": "ffcbcac4-9e89-402a-b8fc-2a8d23db69f8",
+    "role": "user",
+    "content": "Calculate 125 * 48",
+    "metadata": {
+      "intent": "calculation"
+    },
+    "timestamp": "2026-09-19T08:12:57.083198+00:00"
+  },
+  {
+    "id": "cedb162b-c7b6-4f1f-82ab-6cfa42a1a9b0",
+    "role": "user",
+    "content": "Research Python history and create a Word document",
     "metadata": {
       "intent": "research"
     },
-    "timestamp": "2026-09-16T12:02:47.407341+00:00"
+    "timestamp": "2026-09-19T08:13:04.921581+00:00"
   },
   {
-    "id": "6c06f803-8acc-4470-94bb-4cb3017c2b36",
+    "id": "10560908-416a-40f8-b2d1-73bbde185111",
     "role": "user",
-    "content": "search for the topic greenhouse effect from 3 websites and me a ppt on it of 5 slides",
+    "content": "Search for the weather in London",
     "metadata": {
       "intent": "research"
     },
-    "timestamp": "2026-09-16T12:03:28.777818+00:00"
+    "timestamp": "2026-09-19T08:13:11.433775+00:00"
   },
   {
-    "id": "0e8e785c-0692-42f0-baa4-de432242b9d4",
+    "id": "825f6828-fde7-4f54-8e58-27e0c1705d16",
     "role": "user",
-    "content": "search for the topic greenhouse effect and make a PPT of three slide",
+    "content": "Create a folder named 'TestFolder' on Desktop",
     "metadata": {
-      "intent": "research"
+      "intent": "conversation"
     },
-    "timestamp": "2026-09-16T12:12:19.291602+00:00"
+    "timestamp": "2026-09-19T08:13:17.778872+00:00"
   },
   {
-    "id": "bdc7e365-e3f1-40b0-bcad-feaf8d113cca",
+    "id": "3f5c671f-3b81-4b18-9ce5-c86151fafe3e",
     "role": "user",
-    "content": "search for the topic greenhouse effect and then create a ppt of 5 slides.",
+    "content": "Open Notepad",
     "metadata": {
-      "intent": "research"
+      "intent": "computer_action"
     },
-    "timestamp": "2026-09-16T12:33:57.416321+00:00"
+    "timestamp": "2026-09-19T08:13:24.527834+00:00"
   },
   {
-    "id": "2b7d0fd5-8cb7-4fba-91bd-fa38777e1a55",
+    "id": "2e99cc31-1f60-4499-bf09-5bd00275cf98",
     "role": "user",
-    "content": "search for the topic IRON MAN from 5 soucres and create a ppt",
+    "content": "Open Notepad and type 'Test message'",
     "metadata": {
-      "intent": "research"
+      "intent": "computer_action"
     },
-    "timestamp": "2026-09-16T21:35:08.655194+00:00"
+    "timestamp": "2026-09-19T08:13:34.595810+00:00"
   },
   {
-    "id": "a0b1d53c-d250-4577-b98e-57f98c608998",
+    "id": "44988d32-ac4d-487a-b897-4c008ed6f1f9",
     "role": "user",
-    "content": "search for ht etopic iron man afrom 5 sourcesnd create a word document of it",
+    "content": "open notepad and type hello",
     "metadata": {
-      "intent": "research"
+      "intent": "computer_action"
     },
-    "timestamp": "2026-09-16T21:41:35.280929+00:00"
+    "timestamp": "2026-09-19T08:15:36.641636+00:00"
   },
   {
-    "id": "3e0c7c46-65e5-4838-b0cb-aa065d6987bd",
+    "id": "8e652e26-2958-400e-9a98-6098bea3d147",
     "role": "user",
-    "content": "search for the topic iron man and create a word document",
+    "content": "recover from an intentional failure",
     "metadata": {
-      "intent": "research"
+      "intent": "conversation"
     },
-    "timestamp": "2026-09-16T21:42:21.215181+00:00"
+    "timestamp": "2026-09-19T08:16:16.103884+00:00"
+  },
+  {
+    "id": "351329da-b1df-4f31-900f-a2871887be16",
+    "role": "user",
+    "content": "recover from an intentional failure",
+    "metadata": {
+      "intent": "conversation"
+    },
+    "timestamp": "2026-09-19T08:29:50.033100+00:00"
   }
 ]
