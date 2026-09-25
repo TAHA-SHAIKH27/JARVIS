@@ -7,7 +7,6 @@ pydantic==2.13.4
 # ── HTTP & configuration ──────────────────────────────────────────
 requests==2.34.1
 python-dotenv==1.0.1
-PyYAML==6.0.3
 
 # ── AI / cloud service integrations ───────────────────────────────
 google-auth==2.56.2
@@ -27,6 +26,7 @@ playwright==1.62.0
 
 # ── System monitoring / telemetry ─────────────────────────────────
 psutil==6.1.1
+mss==10.2.0
 
 # ── Windows-only desktop automation ───────────────────────────────
 PyAutoGUI==0.9.54; sys_platform == "win32"
