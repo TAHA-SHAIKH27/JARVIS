@@ -1,6 +1,88 @@
-# J.A.R.V.I.S. — PHASE 1 + PHASE 2 IMPLEMENTATION PLAN
+# J.A.R.V.I.S. — PHASE 1 + PHASE 2 + PHASE 3 IMPLEMENTATION PLAN
 
-## Advanced Persistent Memory System (Phase 2 in progress)
+## Multimodal Intelligence + Full System Integration (Phase 3 in progress)
+
+> Single plan file for all phases. Updated after every step. No other plan files will be created.
+
+---
+
+## PHASE 3 — Multimodal Intelligence + Full System Integration
+
+### P3.1 Date / Time
+
+- **Phase 3 start:** 2026-09-25 (UTC)
+- **Last updated:** 2026-09-25 (UTC) — audit + baseline done, plan created
+
+### P3.2 Objective
+
+One continuous loop — USER → UNDERSTAND → MEMORY → PLAN → MODEL ROUTER →
+VALIDATED FREE MODEL → ACT → OBSERVE (UIA/DOM/screenshot/vision/OCR) →
+VERIFY → RECOVER → MEMORY UPDATE — with no second agent, no new paid deps,
+no ADB/phone/watchdog additions, and no unvalidated models enabled.
+
+### P3.3 Audit state (2026-09-25, inspected before any change)
+
+- Phase 1 INTACT: router-first goal/plan/replan (`planner.py:1313,1517,1650`)
+  with legacy fallback; registry evidence in `model_registry_store.json`.
+  Validated ENABLED FREE: laguna-xs-2.1 (primary), llama-3.2-11b-vision
+  (vision/tools), omni-reasoning (heavy), riva-translate, 2× safety,
+  embed-vl-1b-v2. Glimmer/GLM-Flash/Nemotron-Lightning NOT routable
+  (UNAVAILABLE/DISCOVERED/disabled-slow — must stay off).
+- Phase 2 INTACT: SQLite memory + API + agent hooks (`core.py` retrieval,
+  command interception, episodic+learning update).
+- Loop INTACT: executor rejects unknown action types closed
+  (`executor.py:568`); verifier + final-outcome checks exist; recovery
+  engine is crash/code-repair (Nemotron), model fallback lives in router.
+- CONCRETE GAP: `VisionPerception._analyze_with_llm`
+  (`observer.py:1261`) is a PLACEHOLDER — vision fallback never reaches a
+  real model. Hierarchy (UIA first, vision only when insufficient) exists
+  and must be preserved.
+- OCR: nemotron-parse-2.0 UNAVAILABLE → stays disabled; fallback is
+  pytesseract-or-Gemini inside observer/vision tool (preserved).
+- Voice: SAPI/Web Speech preserved; NVIDIA voice models UNVERIFIED → no
+  integration (riva-translate available, no translation feature to use it).
+- Baseline suite 2026-09-25: **185 passed** (full list in §P3.8).
+
+### P3.4 Planned steps
+
+1. Vision fallback: route `_analyze_with_llm` through the Model Router
+   vision profile (bounded candidates, health recording, graceful-off).
+   Glimmer/GLM never enabled. → verify → test → commit → push.
+2. `test_phase3_integration.py`: router fallback/health, vision
+   mocked/unavailable/empty/timeout, OCR-disabled path, computer/browser/
+   office/voice spot checks, recovery + e2e workflows. → commit → push.
+3. Fresh live probe of the vision model (§26) before claiming it works;
+   record evidence; final report; STOP.
+
+### P3.5 Checklist
+
+- [x] Audit + baseline 185 passed recorded
+- [x] This Phase 3 plan section created
+- [ ] Vision fallback via validated model only (graceful-off otherwise)
+- [ ] No unvalidated model enabled (Glimmer/GLM/parse-2.0/voice stay off)
+- [ ] Phase 3 integration tests green
+- [ ] Fresh §26 vision probe with recorded evidence
+- [ ] Full suite green + per-component commit/push verified
+
+### P3.6 Verification requirements (per logical change)
+
+EDIT/CREATE → VERIFY → TEST → REVIEW DIFF → UPDATE THIS FILE → COMMIT →
+PUSH → VERIFY PUSH → NEXT. No batching; fix failures before committing;
+stop the line on push failure.
+
+### P3.7 GitHub checkpoints
+
+Vision integration → push; tests → push; final plan+report → push. Each
+with inspected diff, no secrets, focused message, verified `main...origin/main`.
+
+### P3.8 Work log (append after every step)
+
+- 2026-09-25 — Audit + baseline (185 passed: agent/memory/planner/
+  restart/whatsapp/phase1-models/gmail/scheduler suites) + created Phase 3
+  section. Files changed: `IMPLEMENTATION_PLAN.md`. Commit/push: PENDING
+  (checkpoint with this change).
+
+---
 
 > Single plan file for all phases. Updated after every step. No other plan files will be created.
 
