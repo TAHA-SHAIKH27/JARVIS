@@ -138,7 +138,23 @@ recorded below. Never claim commit/push without evidence.
   `py_compile` clean; smoke (tmp DB): add→get→list→candidates→restart
   new-instance persist→delete all OK; existing `test_phase1_memory` +
   `test_phase1_runtime` 11 passed; no stray DB in `backend/data`.
-  Commit/push: PENDING (checkpoint with this change).
+  Commit/push: DONE — commit `1cbe579` "Phase 2: memory schema + SQLite
+  storage with legacy migration", push `4a1553c..1cbe579 main -> main`,
+  in sync verified 2026-09-25.
+- 2026-09-25 — Embeddings (validated-only) + rerank (graceful-off) + ranking.
+  Files created: `backend/agent/memory_embeddings.py` (ONLY
+  `nvidia/llama-nemotron-embed-vl-1b-v2`; nemoretriever/nv-embed-v1/
+  nv-embedcode forbidden; registry-only `is_available`, correct
+  query/passage `input_type`, vector cache, never raises), `backend/agent/
+  memory_rerank.py` (no validated FREE reranker → `is_available False`,
+  input order preserved with honest reason; future ENABLED rerank model
+  would be used via provider protocol), `backend/agent/memory_ranking.py`
+  (weights semantic .50 > importance .15 > confidence/recency .10 …,
+  metadata-only `explain`, context-budget cap, optional rerank pass).
+  Verification: registry resolves embed id with zero network calls;
+  rerank None/False (matches Phase 1 UNVERIFIED verdict); lexical smoke
+  ranks "favorite color: blue" above "favorite food: pizza"; 11 Phase 1
+  tests still pass. Commit/push: PENDING (checkpoint with this change).
 
 ---
 
