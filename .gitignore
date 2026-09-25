@@ -65,3 +65,7 @@ backend/data/session_memory.json
 backend/data/current_session_memory.json
 backend/data/last_audit.json
 backend/agent/model_registry_store.json
+
+# Startup crash reports + repaired-file archive (per-incident user artifacts)
+STARTUP CRASH/
+FIXED CRASH FILE/

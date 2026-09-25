@@ -236,6 +236,20 @@ class JarvisSupervisor:
         print(f" [WATCHDOG] Error Info:   {t_err}")
         print("!"*65 + "\n")
 
+        # User-facing crash report: plain-language summary under
+        # "STARTUP CRASH/" + a NEW cmd window telling the user it exists.
+        try:
+            import crash_report
+            summary_path = crash_report.write_crash_summary(
+                crash_output, parsed, self.recovery_count)
+            log(f"Crash summary written: {summary_path}")
+            crash_report.pop_crash_console(
+                summary_path,
+                os.path.basename(t_file) if t_file else "unknown",
+                t_err or "")
+        except Exception as e:
+            log(f"Crash summary step failed (non-fatal): {e}")
+
         if self.recovery_count > MAX_CRASH_RECOVERIES:
             log(f"Max recovery limit ({MAX_CRASH_RECOVERIES}) reached. Halting auto-recovery to prevent infinite loops.")
             log("Please review watchdog_crash.log and fix errors manually.")
@@ -246,6 +260,18 @@ class JarvisSupervisor:
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
+            # Archive the repaired file under "FIXED CRASH FILE/" and show
+            # the user a repair summary in a cmd window.
+            try:
+                import crash_report
+                fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
+                log(f"Repaired file archived: {fixed_path}")
+                crash_report.show_fix_summary(
+                    fixed_path,
+                    os.path.basename(result.get("file", "") or "unknown"),
+                    result.get("message", ""))
+            except Exception as e:
+                log(f"Fix-summary step failed (non-fatal): {e}")
             return self.prompt_user_after_recovery(result)
         elif result.get("status") == "unhealthy_backend":
             # Backend became unhealthy (health check failures) but no code crash detected.
@@ -285,6 +311,18 @@ class JarvisSupervisor:
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
+            # Archive the repaired file under "FIXED CRASH FILE/" and show
+            # the user a repair summary in a cmd window.
+            try:
+                import crash_report
+                fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
+                log(f"Repaired file archived: {fixed_path}")
+                crash_report.show_fix_summary(
+                    fixed_path,
+                    os.path.basename(result.get("file", "") or "unknown"),
+                    result.get("message", ""))
+            except Exception as e:
+                log(f"Fix-summary step failed (non-fatal): {e}")
             return self.prompt_user_after_recovery(result)
         elif result.get("status") == "unhealthy_backend":
             # Backend became unhealthy (health check failures) but no code crash detected.

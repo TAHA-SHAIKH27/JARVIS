@@ -92,6 +92,26 @@ comes from reading the integration and call paths.
 `d492aa6` (G4) → `41f31ac` (G5) → this report. All pushed to `main` on
 `TAHA-SHAIKH27/JARVIS`.
 
+## 8. Follow-up: full audit coverage + crash-report flow (2026-09-25/26)
+- **Audit now covers all sources**: `code_core.audit_codebase()` walks the
+  workspace (86 files: every root/backend `.py` + all `src` JS/JSX/MJS/CJS,
+  skipping node_modules/dist/build/runtime dirs) in ~1s, still offline. Also
+  handles a stale UTF-16 duplicate (`backend/agent/core_git.py`, tracked but
+  imported nowhere — left untouched per no-delete rule). Verified: 86 files,
+  100% health. Commit `ce1f690`.
+- **New `crash_report.py`** (stdlib-only): on watchdog crash — plain-language
+  `STARTUP CRASH/crash_<ts>.txt` (what happened, why in plain words,
+  responsible file + marked line excerpt, next steps, traceback tail); auto-pop
+  NEW cmd window announcing the summary; after successful Nemotron repair the
+  fixed copy is archived to `FIXED CRASH FILE/<name>_fixed_<ts>.py` plus a
+  repair-summary cmd popup. Wired into both watchdog crash handlers; every new
+  step is non-fatal-guarded so reporting can never break recovery.
+  Verified: simulated `handle_crash` writes summary + notice; file+line
+  attribution resolves real workspace files; archive copies byte-identical;
+  watchdog `--test-mode` + recovery `--check` pass. NOT live-tested: actual
+  `start cmd` popup (no GUI in this container) and end-to-end Nemotron repair
+   of a real crash — needs your Windows run.
+
 ## 7. What needs your manual Windows/live testing
 1. `python -m pytest` full suite on the host (numpy there is healthy).
 2. Live WhatsApp schedule → wait → delivery confirmation, plus reschedule/cancel.
