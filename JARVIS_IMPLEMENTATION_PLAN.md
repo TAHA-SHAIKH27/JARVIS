@@ -64,10 +64,14 @@ keep what is correct, and correct/complete only the gaps.
   Verified steps still resume at `current_step` (never replayed); only the
   unverified step is retried after re-observation. Verified: core imports OK;
   in-flight marker round-trip + observer snapshot pass on an isolated store.
-- [ ] G4. Document pipeline extracts full text (+OCR) but has no provenance /
-  section / retrieval record linking document knowledge to tasks. FIX (minimal):
-  add stdlib provenance helper in `document_intel.py` (sections + chunk index
-  + source record) without touching the existing extract/generate pipeline.
+- [x] G4. Document pipeline extracts full text (+OCR) but has no provenance /
+  section / retrieval record linking document knowledge to tasks.
+  FIXED 2026-09-25 (minimal, stdlib-only, existing pipeline untouched):
+  `document_intel.index_document()` (heading/Page/Slide-aware sections,
+  overlapping chunks with source/section/char-offset provenance) +
+  `retrieve_sections()` (lexical ranking, provenance-preserving hits).
+  Verified: 2-section sample indexes to 2 chunks; query returns the correct
+  section with source; empty query/index degrade to [].
 - [ ] G5. `JARVIS_TASK_DB` default (`jarvis_tasks.db` at repo root) and scheduler
   JSON stores are untracked runtime artifacts — verify `.gitignore` covers them
   so commits stay clean.
