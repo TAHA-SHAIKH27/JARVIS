@@ -558,7 +558,10 @@ class Observer:
             return {"verified": False, "message": result.get("message", f"UI type failed") if result else "UI type failed", "classification": "retryable"}
 
         elif atype == "screenshot_ui":
-            path = result.get("path", "") if result else ""
+            # Computer results carry `screenshot_path`; browser ones `path`.
+            path = ""
+            if result:
+                path = result.get("path", "") or result.get("screenshot_path", "")
             if path and os.path.isfile(path):
                 return {"verified": True, "message": f"Screenshot saved: {path}", "path": path, "classification": "success"}
             return {"verified": False, "message": "UI screenshot was not saved", "classification": "recoverable"}
@@ -607,6 +610,13 @@ class Observer:
                 if source_index is not None and state.search_results:
                     if 0 <= source_index < len(state.search_results):
                         expected_url = state.search_results[source_index].get("url", "")
+                        # Compare against the unwrapped destination (the
+                        # executor navigates past redirect wrappers).
+                        try:
+                            from backend.tools.browser import unwrap_search_url
+                            expected_url = unwrap_search_url(expected_url)
+                        except Exception:
+                            pass
                         return await self.verify_browser_page(browser, expected_url_fragment=expected_url)
                 return await self.verify_browser_page(browser)
             return {"verified": False, "message": "No browser available to verify navigation", "classification": "fatal"}
@@ -657,6 +667,51 @@ class Observer:
             if result and result.get("status") == "success":
                 return {"verified": True, "message": "New browser tab verified", "classification": "success"}
             return {"verified": False, "message": result.get("message", "New browser tab failed") if result else "No browser result", "classification": "retryable"}
+
+        elif atype == "browser_download":
+            path = result.get("path", "") if result else ""
+            if result and result.get("status") == "success" and path and os.path.isfile(path):
+                return {"verified": True, "message": f"Download verified: {path}", "path": path, "classification": "success"}
+            return {"verified": False, "message": result.get("message", "Download was not verified") if result else "No download result", "classification": "recoverable"}
+
+        elif atype == "browser_login":
+            # Assisted login always pauses for the human (password/2FA/CAPTCHA).
+            # The follow-up browser_login_check verifies the actual login.
+            return {"verified": False, "message": result.get("message", "Login needs human completion") if result else "Login needs human completion", "classification": "human_required", "page_state": "login"}
+
+        elif atype == "browser_login_check":
+            if result and result.get("logged_in"):
+                return {"verified": True, "message": result.get("message", "Login verified"), "classification": "success"}
+            return {"verified": False, "message": result.get("message", "Login not yet verified — still waiting on human") if result else "No login result", "classification": "human_required", "page_state": "login"}
+
+        elif atype == "browser_parallel_research":
+            count = len(result.get("sources", [])) if result else 0
+            if result and result.get("status") == "success" and count:
+                return {"verified": True, "message": f"Parallel research banked {count} source(s)", "classification": "success", "results_count": count}
+            return {"verified": False, "message": result.get("message", "Parallel research extracted nothing") if result else "No parallel result", "classification": "recoverable"}
+
+        elif atype == "browser_extract_table":
+            path = result.get("path", "") if result else ""
+            if result and result.get("status") == "success" and path and os.path.isfile(path):
+                return {"verified": True, "message": result.get("message", f"Table saved: {path}"), "path": path, "classification": "success"}
+            return {"verified": False, "message": result.get("message", "Table extraction was not verified") if result else "No table result", "classification": "recoverable"}
+
+        elif atype in ("run_shell", "run_tests", "git_op"):
+            if not result:
+                return {"verified": False, "message": "No terminal result", "classification": "retryable"}
+            if result.get("status") == "success" and result.get("exit_code", -1) == 0:
+                tail = (result.get("stdout", "") or "").strip().splitlines()
+                tail_txt = tail[-1][:300] if tail else result.get("message", "Command succeeded")
+                return {"verified": True, "message": f"Exit 0: {tail_txt}", "classification": "success"}
+            msg = result.get("message", "Command failed")
+            # Policy blocks are deterministic — retrying cannot help.
+            if "Blocked by terminal policy" in msg:
+                return {"verified": False, "message": msg, "classification": "fatal"}
+            if "timed out" in msg:
+                return {"verified": False, "message": msg, "classification": "retryable"}
+            err_tail = (result.get("stderr", "") or "").strip().splitlines()
+            detail = err_tail[-1][:300] if err_tail else msg[:300]
+            return {"verified": False, "message": f"Exit {result.get('exit_code', '?')}: {detail}", "classification": "recoverable"}
 
         elif atype == "browser_extract_search_results":
             if browser:
@@ -815,10 +870,12 @@ class Observer:
             return {"verified": False, "message": f"Window check error: {str(e)}"}
 
     def verify_file_exists(self, path: str) -> Dict[str, Any]:
-        """Verify a file exists on disk."""
+        """Verify a file OR folder exists on disk (verify_file covers both)."""
         if os.path.isfile(path):
             size = os.path.getsize(path)
             return {"verified": True, "message": f"File exists: {path} ({size} bytes)", "classification": "success"}
+        if os.path.isdir(path):
+            return {"verified": True, "message": f"Folder exists: {path}", "classification": "success"}
         return {"verified": False, "message": f"File NOT found: {path}", "classification": "recoverable"}
 
     def verify_folder_exists(self, path: str) -> Dict[str, Any]:
@@ -1201,16 +1258,61 @@ class VisionPerception:
             raw_text=raw_text[:5000]  # Truncate
         )
     
-    async def _analyze_with_llm(self, screenshot_path: str) -> str:
-        """Analyze screenshot using LLM vision (Gemini/NVIDIA)."""
+    async def _analyze_with_llm(self, screenshot_path: str, prompt: str = "") -> str:
+        """Analyze a screenshot through the Phase 1 Model Router (vision profile).
+
+        Tries ENABLED + validated FREE vision models in router order (at most
+        3 candidates, one attempt each), recording health per model. Returns
+        "" when no validated vision model can serve, so the observation
+        hierarchy degrades gracefully instead of failing.
+
+        Observation only: the returned text is parsed into element dicts by
+        the caller. It never authorizes actions — every action still flows
+        through executor → observer → verifier. Unvalidated catalog names
+        (e.g. Muse Glimmer, GLM-5.3-Flash) can never reach this path because
+        router.candidates() only yields ENABLED + validated + FREE entries.
+        """
         try:
-            from backend.tools.computer import Computer
-            computer = Computer(self.registry)
-            # Use computer's screenshot capabilities
-            # For now, return placeholder - in production would call LLM vision API
-            return "LLM vision analysis not fully implemented - placeholder"
+            import base64
+            with open(screenshot_path, "rb") as handle:
+                image_b64 = base64.b64encode(handle.read()).decode("ascii")
+        except (OSError, ValueError):
+            return ""
+        if not image_b64:
+            return ""
+        try:
+            from backend.agent import model_factory
+            from backend.agent.model_router import profile_for
+            registry, providers, router = model_factory.build_router()
+            tried = 0
+            for record in router.candidates(profile_for("vision")):
+                if tried >= 3:
+                    break
+                provider = providers.get((record.provider or "").lower())
+                if provider is None:
+                    continue
+                tried += 1
+                try:
+                    resp = provider.vision(
+                        record.model_id,
+                        prompt or ("Describe the visible UI: list interactive controls "
+                                   "(buttons, fields, links) with their labels, one per line."),
+                        image_b64, "image/png", timeout_s=90)
+                    text = (resp.text or "").strip()
+                    if text:
+                        registry.record_success(record.model_id, resp.latency_s)
+                        return text
+                    registry.record_failure(record.model_id, "unavailable")
+                except Exception as exc:
+                    category = getattr(getattr(exc, "category", None), "value", "unknown")
+                    try:
+                        registry.record_failure(record.model_id, category)
+                    except Exception:
+                        pass
+                    continue
+            return ""
         except Exception:
-            return "LLM vision analysis unavailable"
+            return ""
     
     def _parse_llm_vision_response(self, response: str) -> List[Dict]:
         """Parse LLM vision response into structured elements."""

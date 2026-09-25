@@ -79,8 +79,19 @@ with inspected diff, no secrets, focused message, verified `main...origin/main`.
 
 - 2026-09-25 — Audit + baseline (185 passed: agent/memory/planner/
   restart/whatsapp/phase1-models/gmail/scheduler suites) + created Phase 3
-  section. Files changed: `IMPLEMENTATION_PLAN.md`. Commit/push: PENDING
-  (checkpoint with this change).
+  section. Files changed: `IMPLEMENTATION_PLAN.md`. Commit/push: DONE —
+  commit `80a4da5` "Phase 3: plan plus audit baseline 185 passed", push
+  `8815dd1..80a4da5 main -> main`, in sync verified 2026-09-25.
+- 2026-09-25 — Vision fallback via Model Router (`observer.py` ONLY hunk:
+  `_analyze_with_llm` placeholder → router vision profile, ≤3 candidates,
+  health recording, graceful ""). NOTE: `observer.py`/`phase2_runtime.py`
+  carry pre-existing working-tree changes (dirty since before Phase 2,
+  covered by the 185 baseline); this checkpoint commits file state =
+  baseline-verified + the described hunks, no re-attribution. Glimmer/GLM
+  unreachable by construction (candidates() = ENABLED+validated+FREE).
+  Verification: py_compile clean; 20/20 new Phase 3 tests pass (mocked
+  success/empty/timeout/no-candidates/missing-file + hierarchy predicate).
+  Commit/push: PENDING (checkpoint with this change).
 
 ---
 
