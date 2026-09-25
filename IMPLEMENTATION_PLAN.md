@@ -91,7 +91,18 @@ with inspected diff, no secrets, focused message, verified `main...origin/main`.
   unreachable by construction (candidates() = ENABLED+validated+FREE).
   Verification: py_compile clean; 20/20 new Phase 3 tests pass (mocked
   success/empty/timeout/no-candidates/missing-file + hierarchy predicate).
-  Commit/push: PENDING (checkpoint with this change).
+  Commit/push: DONE — commit `aa25aab`, push `80a4da5..aa25aab main ->
+  main`, in sync verified 2026-09-25.
+- 2026-09-25 — Bridge hardening + `test_phase3_integration.py` (20 tests).
+  `phase2_runtime.py` ONLY hunk: `_execute_phase2_action` falls through
+  (returns None) when the computer tool is unavailable instead of raising
+  RuntimeError — found because the new unknown-action test exposed it;
+  production (AgentCore registers the tool) unchanged. Tests cover §25:
+  validated-only vision selection, OCR profile with no validated model,
+  health circuit-break, 5 vision cases, 3 hierarchy cases, executor
+  closed-rejection, observer browser/office branches, verifier, voice
+  idle preservation, memory loop, stubbed e2e. Same pre-existing-dirt note
+  applies to `phase2_runtime.py`. Commit/push: PENDING (checkpoint).
 
 ---
 

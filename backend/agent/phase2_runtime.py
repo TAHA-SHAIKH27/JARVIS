@@ -23,8 +23,17 @@ Computer-use rules:
 
 
 async def _execute_phase2_action(executor: Any, action: Any, state: Any):
-    """Provide additional computer primitives while preserving existing actions."""
-    computer = executor._computer()
+    """Provide additional computer primitives while preserving existing actions.
+
+    Returns None when the action is not a Phase 2 primitive OR the computer
+    tool is unavailable, so execution always falls through to the wrapped
+    Executor (which rejects unknown types closed) instead of raising."""
+    try:
+        computer = executor._computer()
+    except Exception:
+        return None
+    if computer is None:
+        return None
     params = executor._inject_state_data(action, state)
     atype = action.type
 
