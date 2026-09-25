@@ -205,7 +205,34 @@ class TaskCheckpointStore:
             return [dict(r) | {"payload": self._loads(r["payload_json"], {})} for r in rows]
 
     def history_for_task(self, task_id: str, limit: int = 500) -> List[Dict[str, Any]]:
-        return self.search_history(task_id, limit)
+        with self._lock, self._connect() as c:
+            rows = c.execute(
+                "SELECT * FROM task_history WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, int(limit))).fetchall()
+            return [dict(r) | {"payload": self._loads(r["payload_json"], {})} for r in rows]
+
+    def latest_action_started(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recent action_started event without a later verified checkpoint."""
+        with self._lock, self._connect() as c:
+            row = c.execute(
+                "SELECT * FROM task_history WHERE task_id=? AND event_type='action_started' "
+                "ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+            if not row:
+                return None
+            payload = self._loads(row["payload_json"], {})
+            step = row["step_index"]
+            verified = c.execute(
+                "SELECT 1 FROM checkpoints WHERE task_id=? AND step_index=? AND status='verified'",
+                (task_id, step)).fetchone()
+            if verified:
+                return None
+            return dict(row) | {"payload": payload}
+
+    def record_action_started(self, task_id: str, step_index: int, action: Dict[str, Any]):
+        self.save_state(task_id, "running", step_index,
+                        event_type="action_started",
+                        payload={"action": action})
+
 
     def _history_conn(self, c, task_id: str, event_type: str,
                       step_index: Optional[int], payload: Dict[str, Any]):
