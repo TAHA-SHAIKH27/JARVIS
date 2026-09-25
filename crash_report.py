@@ -141,10 +141,10 @@ b) The watchdog writes a short error-focused prompt (file, exact lines,
    what happened) into your local OpenCode session, which fixes it with
    full project context. (If that fails, the NVIDIA window repair is tried
    automatically as backup.)
-c) The model returns corrected lines; the watchdog repairs a COPY of the
-   file with ONLY that chunk changed and checks the result compiles.
-   Your ORIGINAL file in the project is never touched.
-d) The repaired file copy is stored under the "FIXED CRASH FILE" folder.
+c) The model fixes the file directly, changing ONLY the culprit lines,
+   and the watchdog checks the result compiles. A backup is kept first,
+   so you can always roll back.
+d) A record copy of the repaired file is stored under "FIXED CRASH FILE".
 e) The repair summary appears in the SAME command window (it waits for it).
 
 5) LAST OUTPUT BEFORE THE CRASH (technical detail)
@@ -269,7 +269,7 @@ def pop_interactive_repair_console(summary_path: str, target_file: str,
         "  Press any key in the popup window: it will cd to the",
         "  project, run `opencode` with the repair prompt attached,",
         "  and show the repair summary in the SAME window.",
-        "  Your original project file will NOT be modified.",
+        "  The file is fixed directly; a backup is kept for rollback.",
         "",
     ]
     for ln in lines:
@@ -318,10 +318,9 @@ def show_fix_summary(archived_path: str, nice_name: str, detail: str,
         "",
         f"  Result : {(detail or 'repaired and validated')[:160]}",
         "",
-        "  Your original project file was NOT modified.",
-        "  To use the fix, copy the saved file over the original",
-        "  yourself after reviewing it. The pre-repair backup is",
-        "  also kept under the .backup folder.",
+        "  Your file was fixed directly in the project.",
+        "  A record copy is saved under FIXED CRASH FILE, and the",
+        "  pre-repair backup under .backup lets you roll back.",
         "",
     ]
     for ln in lines:

@@ -148,13 +148,10 @@ comes from reading the integration and call paths.
   13 models tried total — Glimmer stays the repair default. Muse Spark
   provider kept dormant (no key = clean fallback); Spark is pay-as-you-go,
   so Glimmer-only stands per your call.
-- **Single-window + copy-only repair (your correction)**: only ONE cmd popup
+- **Single-window + in-place repair (your corrections)**: only ONE cmd popup
   opens; it waits in place (polls up to 30 min) and prints the repair summary
-  in the SAME window. `recover_from_crash(..., in_place=False)` repairs a
-  staging copy — the project original is never written (verified
-  byte-identical after repair; legacy `in_place=True` default preserved for
-  the `--recover` CLI). Rollback prompt skips writes in copy-only mode; the
-  fixed copy is the deliverable and you copy it over yourself after review.
+  in the SAME window. Repairs land directly in the project file (backup
+  kept for rollback; record copy archived) — no copy/paste round-trip.
 
 ## 7. What needs your manual Windows/live testing
 1. `python -m pytest` full suite on the host (numpy there is healthy).

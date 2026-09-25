@@ -500,28 +500,14 @@ def build_opencode_prompt(target_file: str, target_line: int,
     return prompt, excerpt
 
 
-def validate_and_archive_visible_fix(target_file: str, snapshot: bytes,
-                                     backup_path: str) -> dict:
+def validate_and_archive_visible_fix(target_file: str, backup_path: str) -> dict:
     """Settle a repair performed by the visible cmd-shell session.
 
-    Validates the current file content; on success archives a fixed COPY
-    under FIXED CRASH FILE/ and ALWAYS restores the original bytes, so the
-    project file ends untouched either way.
+    The session edits the project file directly (in place). This validates
+    the result and stores a record COPY under FIXED CRASH FILE/. The
+    pre-repair backup remains the rollback path.
     """
-    try:
-        with open(target_file, "rb") as f:
-            current = f.read()
-    except OSError as e:
-        return {"valid": False, "repaired_copy": None,
-                "message": f"Could not read file after visible repair: {e}"}
     is_valid, val_msg = validate_python_file(target_file)
-    # Restore the original no matter what — copy-only guarantee.
-    try:
-        with open(target_file, "wb") as f:
-            f.write(snapshot)
-    except OSError as e:
-        return {"valid": False, "repaired_copy": None,
-                "message": f"Original restore failed (manual check needed): {e}"}
     if not is_valid:
         return {"valid": False, "repaired_copy": None,
                 "message": f"Visible repair did not validate: {val_msg}"}
@@ -532,13 +518,13 @@ def validate_and_archive_visible_fix(target_file: str, snapshot: bytes,
         stem, ext = os.path.splitext(os.path.basename(target_file))
         dest = os.path.join(
             fixed_dir, f"{stem}_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
-        with open(dest, "wb") as f:
-            f.write(current)
+        with open(target_file, "rb") as src, open(dest, "wb") as out:
+            out.write(src.read())
     except OSError as e:
         return {"valid": False, "repaired_copy": None,
                 "message": f"Validated but archive failed: {e}"}
     return {"valid": True, "repaired_copy": dest,
-            "message": f"Visible session repaired and validated; copy archived. Original untouched."}
+            "message": f"Visible session repaired and validated in place; record copy archived."}
 
 
 def _repair_via_opencode(target_file: str, target_line: int,
@@ -663,10 +649,12 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
 
     in_place=True  (default, legacy): repair is written into the original file,
                    with automatic rollback from backup on failure.
-    in_place=False (watchdog crash flow): the original file is NEVER written.
-                   Repair happens on a staging copy; on success the fixed copy
-                   is archived under "FIXED CRASH FILE/" and its path is
-                   returned as result["repaired_copy"].
+    in_place=False (legacy copy-only): repair happens on a staging copy;
+                   on success the fixed copy is archived under
+                   "FIXED CRASH FILE/" and its path is returned as
+                   result["repaired_copy"]; the original is never written.
+                   Kept for API compatibility; the watchdog now repairs
+                   in place (in_place=True).
     """
     if not os.path.exists(crash_log_path):
         return {"status": "error", "message": f"Crash log not found: {crash_log_path}"}

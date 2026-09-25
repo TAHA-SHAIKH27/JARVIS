@@ -185,13 +185,6 @@ class JarvisSupervisor:
             sub_choice = "q"
 
         if sub_choice == "r":
-            if result.get("repaired_copy"):
-                # Copy-only repair: the project original was never modified,
-                # so there is nothing to revert — say so and stand down
-                # WITHOUT writing to the original file.
-                log(f"No rollback needed: original {basename} was never modified (copy-only repair).")
-                print(f"\n[GUARDIAN] Nothing to revert, sir — your original '{basename}' was never touched.")
-                return False
             if backup_path and os.path.exists(backup_path):
                 recovery_engine.restore_backup(backup_path, target_file)
                 log(f"Reverted {basename} back to backup state. Watchdog standing down.")
@@ -226,19 +219,12 @@ class JarvisSupervisor:
                                   summary_path: str) -> dict:
         """Run the repair inside the popup cmd window and settle the result.
 
-        Snapshot the original, pop the interactive shell (it runs `opencode`
-        visibly and signals done_<token>.txt), wait, then validate + archive
-        the fixed COPY and restore the original. Any failure returns a
-        non-success dict so the caller falls back to headless recovery.
+        The visible session edits the project file directly (in place); a
+        pre-repair backup is kept for rollback. On settle, a record copy is
+        archived. Any failure returns a non-success dict so the caller falls
+        back to headless recovery.
         """
         import time as _time
-        try:
-            import crash_report
-            with open(t_file, "rb") as f:
-                snapshot = f.read()
-        except OSError as e:
-            return {"status": "error",
-                    "message": f"Could not snapshot original: {e}"}
         try:
             backup_path = recovery_engine.create_backup(t_file, tag="crash_recovery")
         except Exception:
@@ -274,7 +260,7 @@ class JarvisSupervisor:
                     "message": f"Visible opencode run exited with code {exit_code}"}
         try:
             settled = recovery_engine.validate_and_archive_visible_fix(
-                t_file, snapshot, backup_path)
+                t_file, backup_path)
         except Exception as e:
             return {"status": "error", "message": f"Settle failed: {e}"}
         if not settled.get("valid"):
@@ -346,7 +332,7 @@ class JarvisSupervisor:
 
         log("Invoking Independent Guardian Recovery Engine...")
         result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
-                                                   in_place=False)
+                                                   in_place=True)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
@@ -402,7 +388,7 @@ class JarvisSupervisor:
 
         log("Invoking Independent Recovery Engine for unhealthy backend...")
         result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
-                                                   in_place=False)
+                                                   in_place=True)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
