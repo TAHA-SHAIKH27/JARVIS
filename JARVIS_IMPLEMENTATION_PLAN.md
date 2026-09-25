@@ -72,14 +72,27 @@ keep what is correct, and correct/complete only the gaps.
   `retrieve_sections()` (lexical ranking, provenance-preserving hits).
   Verified: 2-section sample indexes to 2 chunks; query returns the correct
   section with source; empty query/index degrade to [].
-- [ ] G5. `JARVIS_TASK_DB` default (`jarvis_tasks.db` at repo root) and scheduler
-  JSON stores are untracked runtime artifacts — verify `.gitignore` covers them
-  so commits stay clean.
+- [x] G5. `JARVIS_TASK_DB` default (`jarvis_tasks.db` at repo root) and scheduler
+  JSON stores are untracked runtime artifacts — FIXED 2026-09-25: `.gitignore`
+  now also covers `jarvis_tasks.db*`, `backend/data/session_memory.json`,
+  `backend/data/current_session_memory.json`, `backend/data/last_audit.json`,
+  `backend/agent/model_registry_store.json` (scheduler/memory entries already
+  covered). Verified via `git check-ignore`. NOTE: `current_session_memory.json`
+  (modified) and `session_memory.json` (deleted) are PRE-EXISTING tracked
+  runtime noise in the worktree — left untouched, never staged into commits
+  (all commits use explicit `git add <files>`).
 - [ ] G6. Full pytest suite cannot run in THIS environment: Python 3.14 +
   installed numpy crashes the interpreter at import (access violation in
-  `numpy/_core/multiarray`). Verification here uses targeted stdlib-only checks
-  (task_persistence, local_model, scheduler, planner imports); full regression
-  must run on the Windows JARVIS machine.
+  `numpy/_core/multiarray`). PARTIAL 2026-09-25 — per-file runs in this
+  container, all passing (199 total):
+  test_scheduler 12, phase1_memory+phase2_memory 57, phase1_runtime 4,
+  planner_direct+whatsapp_ops+memory_restart 13, gmail_notify 10,
+  phase3_integration 20, phase1_models 83.
+  Pre-existing failures NOT caused by this pass (files untouched by my edits):
+  test_agent.py collection error (subscripts ActionSpec at module import);
+  test_architecture.py 4 + test_computer_use_engine.py 6 (no pytest-asyncio
+  plugin installed); test_research_pipeline.py (SystemExit at import).
+  Full regression must still run on the Windows JARVIS host.
 
 ## Planned corrections (one edit → verify → plan → commit → push each)
 1. Planner experience injection (G1).
