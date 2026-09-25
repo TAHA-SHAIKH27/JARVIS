@@ -123,6 +123,12 @@ comes from reading the integration and call paths.
   file: valid fix in 27.8s wall time. Honest limit: the validation gate is
   syntax-only, so a fixed-syntax/wrong-logic snippet can still pass — same as
   before, just faster now.
+- **Race round 2 (2026-09-26)**: Glimmer re-run 7.1s VALID (unbeaten);
+  gemma-3-4b-it / granite-8b-code / mistral-nemo-minitron-8b / kimi-k2.6 all
+  404 (listed but not servable on this key), gpt-oss-20b 180s timeout.
+  13 models tried total — Glimmer stays the repair default. Muse Spark
+  provider kept dormant (no key = clean fallback); Spark is pay-as-you-go,
+  so Glimmer-only stands per your call.
 - **Single-window + copy-only repair (your correction)**: only ONE cmd popup
   opens; it waits in place (polls up to 30 min) and prints the repair summary
   in the SAME window. `recover_from_crash(..., in_place=False)` repairs a
