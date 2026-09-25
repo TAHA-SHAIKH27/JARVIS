@@ -375,6 +375,154 @@ def oauth_logout():
     """Unlink the Google account, forcing the app back to API-key/offline mode."""
     return google_oauth.logout()
 
+
+# ── Proactive Gmail watcher (normal-mode announcements) ──────────────────────
+# Background thread: one check shortly after start (restart check) + every
+# poll_minutes. Important mail → voice announcement (queued, never cuts off
+# current speech) + on-screen toast via /api/notifications. Same guarded
+# worker pattern as the startup audit: never raises, never blocks boot.
+import collections as _collections
+
+_NOTIFICATIONS = _collections.deque(maxlen=20)
+_NOTIFICATIONS_LOCK = threading.Lock()
+_GMAIL_WORKER_STARTED = False
+
+
+def _push_notification(kind: str, title: str, body: str, speak: str = "") -> Dict[str, Any]:
+    item = {"id": str(uuid.uuid4()), "kind": kind, "title": title, "body": body,
+            "speak": speak, "dismissed": False, "ts": time.time()}
+    with _NOTIFICATIONS_LOCK:
+        _NOTIFICATIONS.append(item)
+    return item
+
+
+def _announce_mail(message: Dict[str, Any]) -> None:
+    """Speak + queue one important mail. Best-effort only."""
+    speak_text = message.get("speak") or ""
+    title = f"Important mail from {message.get('from_name', 'Unknown sender')}"
+    _push_notification("gmail", title, str(message.get("subject", "")), speak_text)
+    if not speak_text:
+        return
+    try:
+        voice = get_voice_system()
+        # Priority 5, no interrupt: announcements wait their turn behind any
+        # active reply instead of cutting it off mid-sentence.
+        voice.speak(speak_text, priority=5, interrupt=False)
+    except Exception as exc:
+        print(f"[gmail] TTS announce failed: {exc}")
+
+
+def _gmail_check_cycle(reason: str) -> Dict[str, Any]:
+    """Run one poll cycle + announce. Returns the raw cycle result."""
+    try:
+        from backend.tools import gmail_notify
+        result = gmail_notify.check_for_important()
+    except Exception as exc:
+        print(f"[gmail] check failed ({reason}): {exc}")
+        return {"status": "error", "announced": []}
+    if result.get("status") == "not_linked":
+        print("[gmail] Not linked — link Gmail in Settings to enable mail announcements.")
+        return result
+    for message in result.get("announced", []):
+        _announce_mail(message)
+        print(f"[gmail] Announced ({reason}): {message.get('from_name', '?')} — "
+              f"{str(message.get('subject', ''))[:80]}")
+    return result
+
+
+def _gmail_watch_worker() -> None:
+    """Restart check after grace, then every poll_minutes. Never raises."""
+    try:
+        time.sleep(60)  # let TTS + UI settle before the first announcement
+        from backend.tools import gmail_notify
+        watch = gmail_notify.load_watch()
+        if watch.get("announce_on_restart", True):
+            _gmail_check_cycle("restart")
+        while True:
+            try:
+                minutes = float(gmail_notify.load_watch().get("poll_minutes") or 30)
+            except (TypeError, ValueError):
+                minutes = 30
+            time.sleep(max(60.0, minutes * 60.0))
+            _gmail_check_cycle("scheduled")
+    except Exception as exc:
+        print(f"[gmail] watcher stopped: {exc}")
+
+
+def _ensure_gmail_worker() -> None:
+    global _GMAIL_WORKER_STARTED
+    if _GMAIL_WORKER_STARTED:
+        return
+    _GMAIL_WORKER_STARTED = True
+    thread = threading.Thread(target=_gmail_watch_worker,
+                              name="jarvis-gmail-watch", daemon=True)
+    thread.start()
+
+
+_ensure_gmail_worker()
+
+
+@app.get("/api/gmail/status")
+def gmail_status():
+    """Gmail link state + watcher schedule for the Settings UI."""
+    try:
+        from backend.tools import gmail_notify
+        watch = gmail_notify.load_watch()
+        seen = gmail_notify.load_seen()
+        return {"linked": gmail_notify.is_gmail_linked(),
+                "poll_minutes": watch.get("poll_minutes", 30),
+                "vip_senders": watch.get("vip_senders", []),
+                "last_check": seen.get("last_check", 0.0)}
+    except Exception as exc:
+        return {"linked": False, "error": str(exc)[:160]}
+
+
+@app.post("/api/gmail/login")
+def gmail_login():
+    """Link Gmail (read-only). Opens the browser for consent; blocks like /api/oauth/login."""
+    from backend.tools import gmail_notify
+    res = gmail_notify.start_gmail_oauth_flow()
+    if res["status"] == "error":
+        raise HTTPException(status_code=400, detail=res["message"])
+    return res
+
+
+@app.post("/api/gmail/logout")
+def gmail_logout():
+    from backend.tools import gmail_notify
+    return gmail_notify.logout_gmail()
+
+
+@app.post("/api/gmail/check")
+def gmail_check_now():
+    """Manual 'check mail now' — same cycle the scheduler runs."""
+    return _gmail_check_cycle("manual")
+
+
+@app.get("/api/notifications")
+def list_notifications():
+    """Undismissed toasts for the UI (polled alongside /api/status)."""
+    with _NOTIFICATIONS_LOCK:
+        items = [dict(n) for n in _NOTIFICATIONS if not n.get("dismissed")]
+    return {"notifications": items, "count": len(items)}
+
+
+class DismissRequest(BaseModel):
+    id: str = ""
+    all: bool = False
+
+
+@app.post("/api/notifications/dismiss")
+def dismiss_notification(req: DismissRequest):
+    with _NOTIFICATIONS_LOCK:
+        removed = 0
+        for item in _NOTIFICATIONS:
+            if req.all or (req.id and item.get("id") == req.id):
+                if not item.get("dismissed"):
+                    item["dismissed"] = True
+                    removed += 1
+    return {"status": "success", "dismissed": removed}
+
 @app.get("/api/status")
 def read_status():
     return {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}
@@ -411,6 +559,8 @@ async def voice_command(req: VoiceCommandRequest):
         return {"status": "interrupted", "speak": "Interrupted, sir."}
     elif result.get("status") == "mid_task_instruction":
         return {"status": "mid_task_instruction", "speak": "Instruction noted, sir. Updating task."}
+    elif result.get("status") == "task_queued":
+        return {"status": "task_queued", "speak": "Noted, sir — queued to run after the current task."}
     elif result.get("status") == "new_command":
         # Process as new command
         command_req = CommandRequest(prompt=req.prompt.strip(), apiKey=None)
@@ -1546,6 +1696,30 @@ async def agent_resume(req: dict):
         raise HTTPException(status_code=409, detail="This agent run is not waiting for human intervention.")
     result = await run["core"].resume_after_human(state, req.get("resolution", {}))
     return {"status": "success", "run_id": run_id, "data": result}
+
+
+@app.post("/api/agent/instruct")
+async def agent_instruct(req: dict):
+    """Send a new command to a running agent: related changes merge into
+    the live plan (restart from the top); independent work is queued next.
+    Interruptions ("stop", "cancel") halt the run."""
+    from backend.agent.clarify import is_interruption
+    run_id = req.get("run_id", "")
+    text = (req.get("text", "") or "").strip()
+    run = agent_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="No active agent run found for this run_id.")
+    if not text:
+        raise HTTPException(status_code=400, detail="Instruction text is empty.")
+    core, state = run["core"], run["state"]
+    if is_interruption(text):
+        core.request_interrupt(f"User interruption: {text}")
+        return {"status": "interrupted", "run_id": run_id,
+                "speak": "Stopping, sir."}
+    verdict = core.enqueue_instruction(text, getattr(state, "task", ""))
+    return {"status": verdict["verdict"], "run_id": run_id,
+            "speak": verdict["message"],
+            "queued": list(getattr(state, "queued_tasks", []) or [])}
 
 
 # ── Agent endpoints end ───────────────────────────────────────────────────

@@ -234,6 +234,27 @@ recorded below. Never claim commit/push without evidence.
 
 ---
 
+## PHASE 3 — Proactive Gmail announcements (in progress, 2026-09-25)
+
+User-asked: normal-mode JARVIS announces important mail unasked — spoken
+aloud (backend TTS queue, never interrupts active speech) + on-screen toast.
+WhatsApp explicitly deferred by user. Schedule: check on every backend
+restart + every 30 min. Important-only: VIP senders or urgent keywords.
+
+- 2026-09-25 — Backend monitor. Files created: `backend/tools/
+  gmail_notify.py` (own gmail.readonly OAuth scope + `token_gmail.json`, so
+  the Gemini token is untouched; REST via `requests`, no new deps;
+  VIP/keyword filter; `gmail_seen.json` dedup across restarts; never
+  raises), `test_gmail_notify.py` (10 tests, mocked REST). Files modified:
+  `main.py` (daemon watcher thread: 60s grace → restart check → 30-min
+  loop; `/api/gmail/status|login|logout|check`; `/api/notifications` +
+  dismiss; `/api/status` shape unchanged), `.gitignore` (gmail
+  watch/seen/token). Verification: 10/10 monitor tests; endpoint smoke
+  (status/check/notifications/dismiss, unlinked graceful). Commit/push:
+  PENDING (checkpoint with this change).
+
+---
+
 # J.A.R.V.I.S. — PHASE 1 IMPLEMENTATION PLAN (history, preserved)
 
 ## Multi-Model Intelligence + Model Router

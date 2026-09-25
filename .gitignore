@@ -49,3 +49,8 @@ work_files/
 
 # Phase 2 persistent memory database (local runtime data, survives restarts)
 backend/data/jarvis_memory.db*
+
+# Gmail watcher: private VIP list, seen-state, and OAuth token (never commit)
+backend/data/gmail_watch.json
+backend/data/gmail_seen.json
+token_gmail.json
