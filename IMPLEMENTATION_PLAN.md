@@ -260,6 +260,20 @@ restart + every 30 min. Important-only: VIP senders or urgent keywords.
   **173 passed** (163 + 10 gmail), zero regressions. Commit/push: DONE —
   commit `66ee08d`, push `0f70806..66ee08d main -> main`, in sync verified
   2026-09-25. Phase 3 Gmail watcher COMPLETE (WhatsApp deferred per user).
+- 2026-09-25 — Normal-mode reminders + scheduled WhatsApp (user-asked).
+  Truth: reminders were stored but nothing ever fired them; WhatsApp was
+  send-now-only. Files created: `backend/tools/scheduler.py` (stdlib time
+  parser: relative/at-today-tomorrow/weekday, aware ISO; reminder parse/
+  add/list/cancel on Phase 1 store; WhatsApp job store
+  `scheduled_whatsapp.json` surviving restarts; 30s daemon ticker; direct
+  `/api/command`-shaped handler; never raises), `test_scheduler.py` (12
+  tests, mocked stores). Files modified: `main.py` (direct handler before
+  Gemini in `process_command`; ticker callbacks: reminder voice+toast,
+  scheduled send via existing desktop sender with spoken success/failure),
+  `.gitignore` (scheduler/reminder private data). Verification: 12/12 new;
+  live `/api/command` smoke (set→list→cancel both features, no LLM);
+  FULL suite **185 passed**, zero regressions. Commit/push: PENDING
+  (checkpoint with this change).
 
 ---
 

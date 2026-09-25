@@ -54,3 +54,7 @@ backend/data/jarvis_memory.db*
 backend/data/gmail_watch.json
 backend/data/gmail_seen.json
 token_gmail.json
+
+# Normal-mode scheduler: private message content + personal reminders (never commit)
+backend/data/scheduled_whatsapp.json
+backend/data/reminders.json

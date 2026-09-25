@@ -523,6 +523,60 @@ def dismiss_notification(req: DismissRequest):
                     removed += 1
     return {"status": "success", "dismissed": removed}
 
+
+# ── Normal-mode scheduler ticker (reminders + scheduled WhatsApp) ────────────
+# Fires due reminders (voice + toast, exactly once) and sends due scheduled
+# WhatsApp messages via the existing desktop sender. Same guarded daemon
+# pattern as the Gmail watcher; stores are file-backed so jobs survive
+# backend/PC restarts.
+def _on_reminder_due(payload: Dict[str, Any]) -> None:
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return
+    speak_text = f"Sir, reminder: {text[:200]}."
+    _push_notification("reminder", "Reminder", text[:200], speak_text)
+    try:
+        get_voice_system().speak(speak_text, priority=5, interrupt=False)
+    except Exception as exc:
+        print(f"[scheduler] reminder TTS failed: {exc}")
+
+
+def _send_scheduled_whatsapp(contact: str, message: str) -> Dict[str, Any]:
+    try:
+        return whatsapp_ops.send_whatsapp_message(contact, message)
+    except Exception as exc:
+        return {"status": "error", "message": f"Scheduled send failed: {exc}"}
+
+
+def _on_whatsapp_result(job: Dict[str, Any], result: Dict[str, Any]) -> None:
+    contact = str(job.get("contact") or "Unknown")
+    ok = result.get("status") == "success"
+    if ok:
+        speak_text = f"Scheduled WhatsApp delivered to {contact}, sir."
+        _push_notification("whatsapp", "WhatsApp delivered",
+                           f"To {contact}: {str(job.get('message') or '')[:120]}",
+                           speak_text)
+    else:
+        speak_text = (f"Sir, the scheduled WhatsApp to {contact} failed: "
+                      f"{str(result.get('message') or 'unknown error')[:160]}")
+        _push_notification("whatsapp", "WhatsApp failed", speak_text, speak_text)
+    try:
+        get_voice_system().speak(speak_text, priority=5, interrupt=False)
+    except Exception as exc:
+        print(f"[scheduler] whatsapp TTS failed: {exc}")
+
+
+def _ensure_scheduler_worker() -> None:
+    try:
+        from backend.tools import scheduler as _scheduler
+        _scheduler.ensure_scheduler_worker(_on_reminder_due, _on_whatsapp_result,
+                                           _send_scheduled_whatsapp)
+    except Exception as exc:
+        print(f"[scheduler] worker failed to start: {exc}")
+
+
+_ensure_scheduler_worker()
+
 @app.get("/api/status")
 def read_status():
     return {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}
@@ -966,6 +1020,17 @@ async def process_command(req: CommandRequest):
             "refresh_files": False,
             "image_data": None
         }
+
+    # Normal-mode deterministic handlers: reminders + scheduled WhatsApp are
+    # answered instantly without an LLM round-trip (same style as the reset
+    # keywords above). Immediate WhatsApp sends fall through to Gemini below.
+    try:
+        from backend.tools import scheduler as _scheduler
+        _direct = _scheduler.handle_schedule_command(req.prompt)
+        if _direct is not None:
+            return _direct
+    except Exception as exc:
+        print(f"[scheduler] direct handler failed: {exc}")
 
     # Load config once
     config = load_config()
