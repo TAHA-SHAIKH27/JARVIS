@@ -530,8 +530,15 @@ class AgentCore:
 
         # ── Step 3: Execute actions respecting dependencies ───────────────
         max_retries = 3
-        action_index = 0
-        completed_indices: Set[int] = set()
+        # Resume only after a durable verified checkpoint. The next action is
+        # the first action after the highest verified step.
+        action_index = _resume_step if _resume_mode else 0
+        completed_indices: Set[int] = set(state.completed_steps if _resume_mode else [])
+        if _resume_mode:
+            await emit("task_resumed",
+                       f"Resuming from verified checkpoint {action_index}",
+                       {"task_id": _resume_record["task_id"], "resume_step": action_index,
+                        "completed_steps": list(state.completed_steps)}, icon="▶")
 
         while action_index < len(actions):
             # Check for interruption before each action
@@ -615,6 +622,18 @@ class AgentCore:
 
             state.current_step = action_index
             self._current_action_start_time = time.time()
+
+            # Persist the action BEFORE execution. If JARVIS crashes after a
+            # real-world side effect but before verification, restart recovery
+            # can inspect this marker instead of blindly repeating the action.
+            try:
+                _task_store.record_action_started(
+                    _resume_record["task_id"], action_index,
+                    {"type": atype, "description": desc, "parameters": action.parameters},
+                )
+            except Exception:
+                pass
+
             await emit("step_started", personality.narrate_start(atype, desc, action_index, len(actions), action.parameters),
                       {"action": atype, "step": action_index + 1, "total": len(actions), "description": desc}, icon="→")
 
@@ -645,6 +664,16 @@ class AgentCore:
 
             # Log execution step
             self._log_execution(action_index + 1, len(actions), action, result or {}, observation or {}, verification or {})
+            try:
+                _task_store.save_state(
+                    _resume_record["task_id"], "running", action_index,
+                    state={"task": task, "action_output": result or {}, "observation": observation or {}},
+                    event_type="action_observed",
+                    payload={"action": atype, "result": result or {}, "observation": observation or {},
+                             "verification": verification or {}},
+                )
+            except Exception:
+                pass
             
             if verification["verified"]:
 
