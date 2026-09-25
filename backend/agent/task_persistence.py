@@ -213,6 +213,50 @@ class TaskCheckpointStore:
             "INSERT INTO task_history(task_id,event_type,step_index,payload_json,created_at) VALUES(?,?,?,?,?)",
             (task_id, event_type, step_index, self._json(payload), time.time()))
 
+def serialize_plan(plan: Any) -> Dict[str, Any]:
+    """Serialize the existing Plan/ActionSpec objects without coupling storage to them."""
+    actions = []
+    for a in getattr(plan, "actions", []) or []:
+        actions.append({
+            "type": a.type, "description": a.description, "parameters": a.parameters,
+            "depends_on": a.depends_on, "produces": a.produces, "consumes": a.consumes,
+            "verification": a.verification, "expected_outcome": a.expected_outcome,
+            "required_context_keys": a.required_context_keys, "retry_strategy": a.retry_strategy,
+            "is_critical": a.is_critical, "goal": a.goal, "tool": a.tool,
+            "expected_state": a.expected_state, "verification_method": a.verification_method,
+            "fallback": a.fallback, "max_attempts": a.max_attempts,
+            "confidence_threshold": a.confidence_threshold,
+        })
+    return {
+        "goal": getattr(plan, "goal", ""), "task_type": getattr(getattr(plan, "task_type", None), "value", "simple"),
+        "estimated_steps": getattr(plan, "estimated_steps", 0), "is_valid": getattr(plan, "is_valid", False),
+        "validation_errors": getattr(plan, "validation_errors", []),
+        "final_outcome_verification": getattr(plan, "final_outcome_verification", {}),
+        "actions": actions,
+    }
+
+
+def deserialize_plan(data: Dict[str, Any]) -> Any:
+    """Rebuild the existing Plan type from persisted JSON."""
+    from backend.agent.state import ActionSpec, Plan, TaskType
+    actions = []
+    for raw in (data or {}).get("actions", []) or []:
+        item = dict(raw)
+        actions.append(ActionSpec(**{k: item[k] for k in (
+            "type","description","parameters","depends_on","produces","consumes","verification",
+            "expected_outcome","required_context_keys","retry_strategy","is_critical","goal","tool",
+            "expected_state","verification_method","fallback","max_attempts","confidence_threshold"
+        ) if k in item}))
+    try:
+        task_type = TaskType((data or {}).get("task_type", "simple"))
+    except ValueError:
+        task_type = TaskType.SIMPLE
+    return Plan(actions=actions, goal=(data or {}).get("goal",""),
+                task_type=task_type, estimated_steps=(data or {}).get("estimated_steps",len(actions)),
+                validation_errors=(data or {}).get("validation_errors",[]),
+                is_valid=bool((data or {}).get("is_valid",False)),
+                final_outcome_verification=(data or {}).get("final_outcome_verification",{}))
+
 
 _default_store: Optional[TaskCheckpointStore] = None
 _default_lock = threading.RLock()
