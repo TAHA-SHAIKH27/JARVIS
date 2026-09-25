@@ -219,6 +219,13 @@ class AgentCore:
                     confidence=Confidence.HIGH,
                     tags=["task-outcome", str(status or "unknown")],
                     source_reference=f"agent run, status={status}")
+            # Learn stable user choices from the chat itself so JARVIS gets
+            # better with use (learned facts are MEDIUM/conversation-scoped
+            # and can never overwrite explicit HIGH preferences).
+            try:
+                api.learn_from_exchange(task, status)
+            except Exception:
+                pass
         except Exception:
             pass
 

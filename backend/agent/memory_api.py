@@ -105,8 +105,14 @@ _PREFER_RE = re.compile(r"^i\s+(?:prefer|like|love|use|own)\s+(.+)$", re.I)
 
 def topic_key(content: str) -> str:
     """Coarse conflict scope: 'favorite color: blue' and 'my favorite color
-    is red' share topic 'favorite color'. Returns '' when no topic applies."""
+    is red' share topic 'favorite color'. Hedged chat phrasing ('I think my
+    favorite color is green') maps to the same topic so learned guesses can
+    never slip past an explicit fact. Returns '' when no topic applies."""
     text = " ".join((content or "").strip().split())
+    if not text:
+        return ""
+    text = re.sub(r"^(?:i\s+(?:think|feel|believe|guess|suppose)\s+)+", "",
+                  text, flags=re.I).strip()
     if not text:
         return ""
     match = _KEY_VALUE_RE.match(text)
@@ -356,6 +362,8 @@ class JarvisMemory:
             return {"status": "success", "hits": hits, "count": len(hits),
                     "dropped": ranked["dropped"], "embed_used": embed_used,
                     "embed_model": embed_model, "rerank_used": rerank_used,
+                    "used_chars": ranked["used_chars"],
+                    "budget_chars": ranked["budget_chars"],
                     "corrupted_skipped": found.get("corrupted_skipped", 0)}
 
     def retrieve(self, memory_id: str) -> Dict[str, Any]:
@@ -506,6 +514,71 @@ class JarvisMemory:
                  for h in hits]
         return "\n".join(lines)
 
+    # -- learning from conversation (gets better with use) -----------------------
+    _LEARN_CUES = (
+        re.compile(r"\bi\s+(?:really\s+|always\s+|usually\s+|generally\s+)?"
+                   r"(?:like|love|prefer|enjoy|hate|dislike)\b", re.I),
+        re.compile(r"\bmy\s+favorite\b", re.I),
+        re.compile(r"\bmy\s+[a-z][a-z\s]{1,40}?\s+is\s+[a-z0-9]", re.I),
+        re.compile(r"\b(?:always|never)\s+(?:use|open|save|put|create|start)\b", re.I),
+        re.compile(r"\bcall\s+me\s+[a-z]", re.I),
+    )
+
+    @staticmethod
+    def _looks_like_memory_command(text: str) -> bool:
+        """Side-effect-free command detection (unlike handle_explicit_command,
+        which EXECUTES). Used to keep learning from double-storing commands."""
+        lowered = (text or "").strip().casefold()
+        if not lowered:
+            return True
+        return bool(
+            JarvisMemory._REMEMBER_LEAD.match(text.strip())
+            or JarvisMemory._DONT_REMEMBER_LEAD.match(text.strip())
+            or JarvisMemory._FORGET_LEAD.match(text.strip())
+            or JarvisMemory._CORRECT_LEAD.match(text.strip())
+            or JarvisMemory._WHAT_REMEMBER.search(lowered)
+            or JarvisMemory._SHOW_REMEMBER.search(lowered)
+            or lowered.startswith("forget ")
+            or "remember" in lowered
+            or "forget everything" in lowered
+            or "clear memory" in lowered)
+
+    def learn_from_exchange(self, user_text: str,
+                            status: str = "completed") -> Dict[str, Any]:
+        """Extract stable user choices from an ordinary chat turn so JARVIS
+        improves with use — no explicit "remember" needed.
+
+        Learned facts are stored as USER memories with source=conversation and
+        confidence=MEDIUM (inferred, never presented as verified fact). The
+        normal authority rules apply: learned MEDIUM text can never overwrite
+        an explicit HIGH preference, and secrets are refused as always.
+        Returns {"status", "learned": [contents]}. Never raises."""
+        try:
+            if (status or "") not in ("completed", "partial"):
+                return {"status": "skipped", "reason": "task not successful",
+                        "learned": []}
+            raw = (user_text or "").strip()
+            if not raw or self._looks_like_memory_command(raw):
+                return {"status": "skipped", "reason": "memory command or empty",
+                        "learned": []}
+            learned: List[str] = []
+            for sentence in re.split(r"[.!?\n]+", raw):
+                piece = " ".join(sentence.split()).strip()
+                if not (4 <= len(piece) <= 220):
+                    continue
+                if not any(cue.search(piece) for cue in self._LEARN_CUES):
+                    continue
+                result = self.add(piece, memory_type=MemoryType.USER,
+                                  source=MemorySource.CONVERSATION,
+                                  confidence=Confidence.MEDIUM,
+                                  tags=["learned", "preference"],
+                                  source_reference=f"learned from chat: {raw[:200]}")
+                if result.get("status") == "success":
+                    learned.append(result["memory"]["content"])
+            return {"status": "success", "learned": learned}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)[:160], "learned": []}
+
     # -- explicit natural-language controls --------------------------------------
     _REMEMBER_LEAD = re.compile(
         r"^(?:please\s+)?(?:can\s+you\s+)?(?:i\s+want\s+you\s+to\s+)?"
@@ -541,7 +614,7 @@ class JarvisMemory:
                 who = "this project" if scope == MemoryType.PROJECT else "you"
                 return {"action": "show",
                         "speak": f"I don't have any memories stored about {who} yet, sir.",
-                        "memories": []}
+                        "memories": [], "count": 0}
             lines = "; ".join(m["content"][:120] for m in memories[:10])
             who = "this project" if scope == MemoryType.PROJECT else "you"
             return {"action": "show",
@@ -555,7 +628,8 @@ class JarvisMemory:
                                  use_embeddings=False, use_rerank=False)
             hits = result.get("hits", [])
             if not hits:
-                return {"action": "show", "speak": "No relevant memories found, sir.", "hits": []}
+                return {"action": "show", "speak": "No relevant memories found, sir.",
+                        "hits": [], "count": 0}
             lines = "; ".join(h["content"][:120] for h in hits)
             return {"action": "show",
                     "speak": f"Relevant memories, sir: {lines}.",

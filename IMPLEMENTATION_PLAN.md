@@ -183,7 +183,22 @@ recorded below. Never claim commit/push without evidence.
   interception via real `process()`; normal task completes with Phase 2
   context in state; `test_agent_integration`+Phase 1 memory/runtime 17
   passed; test-run DB had 0 rows (pytest skip works) and was removed;
-  gitignore verified. Commit/push: PENDING (checkpoint with this change).
+  gitignore verified. Commit/push: DONE — commit `866eaf8`, push
+  `75ac930..866eaf8 main -> main`, in sync verified 2026-09-25.
+- 2026-09-25 — Chat learning + planner obeys memory (user-asked).
+  Files modified: `backend/agent/memory_api.py` (`learn_from_exchange`:
+  preference cues from ordinary chat → USER/MEDIUM/conversation, never
+  overwrites explicit HIGH, secrets refused; side-effect-free command
+  detector; hedge-stripping topic keys so "I think my X is green" conflicts
+  correctly; consistent `count`/`used_chars` shapes), `backend/agent/
+  core.py` (MEMORY UPDATE also learns choices), `backend/agent/planner.py`
+  (LLM prompt — router + Gemini — gains bounded preferences block from
+  state Phase 2 context; rule path byte-identical).
+  Files created: `backend/agent/test_phase2_memory.py` (50 tests: all §23
+  topics + learning + planner enrichment + agent integration).
+  Verification: 50/50 new pass; FULL suite **163 passed** (113 baseline + 50
+  new), zero regressions; test-run DB had 0 rows and was removed.
+  Commit/push: PENDING (checkpoint with this change).
 
 ---
 
