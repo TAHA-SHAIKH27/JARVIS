@@ -351,6 +351,24 @@ def _extract_syntax_error_line(filepath: str) -> tuple[int, str]:
         return 0, f"Validation check blocked: {e}"
 
 
+# Surgical window repair model. Benchmarked 2026-09-26 on the identical
+# broken window (syntax + loop-bound bug), timed to a VALID fix:
+#   meta/muse-glimmer-30b 15.6s VALID | z-ai/glm-5.3-flash 52.7s VALID |
+#   nemotron-3.5-lightning 98.5s invalid | deepseek-coder/codestral/nano-30b,
+#   mistral-7b 404 | kimi-k3 400 | deepseek-v4.1-flash 180s timeout.
+# Overridable via config.json "nvidia_repair_model".
+REPAIR_MODEL_DEFAULT = "meta/muse-glimmer-30b"
+
+
+def _get_repair_model() -> str:
+    """Surgical-repair model id, configurable via config.json."""
+    try:
+        model = str(load_config().get("nvidia_repair_model", "") or "").strip()
+    except Exception:
+        model = ""
+    return model or REPAIR_MODEL_DEFAULT
+
+
 def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, traceback_text: str) -> tuple[bool, str]:
     """Surgically repair a focused line window around target_line without rewriting the whole file."""
     with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -384,7 +402,7 @@ def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, t
         f"Output the corrected snippet for lines {start_idx + 1}-{end_idx} inside ```python ... ```."
     )
 
-    llm_response = call_nemotron(prompt, system_prompt)
+    llm_response = call_nemotron(prompt, system_prompt, model=_get_repair_model())
     fixed_snippet = extract_code_from_llm_response(llm_response)
     if not fixed_snippet or len(fixed_snippet.strip()) < 5:
         return False, "Empty snippet returned by model"

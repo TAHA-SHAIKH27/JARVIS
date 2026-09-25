@@ -111,6 +111,18 @@ comes from reading the integration and call paths.
   watchdog `--test-mode` + recovery `--check` pass. NOT live-tested: actual
   `start cmd` popup (no GUI in this container) and end-to-end Nemotron repair
    of a real crash — needs your Windows run.
+- **Repair-model speed race (2026-09-26)**: same broken window (missing colon
+  + off-by-one loop bound), same prompt, timed to a VALID fix —
+  `meta/muse-glimmer-30b` 15.6s VALID (winner) vs `z-ai/glm-5.3-flash` 52.7s
+  VALID vs `nemotron-3.5-lightning` 98.5s invalid vs deepseek-coder-6.7b /
+  codestral-22b / nemotron-nano-3-30b / mistral-7b 404 (not servable on this
+  key) vs kimi-k3 400 vs deepseek-v4.1-flash 180s timeout. (Note: Muse Spark
+  itself is not served on NVIDIA NIM; Glimmer is the NVIDIA-served Muse
+  model.) Surgical repair now uses Glimmer via `nvidia_repair_model` in
+  config.json (default `meta/muse-glimmer-30b`); end-to-end proof on a scratch
+  file: valid fix in 27.8s wall time. Honest limit: the validation gate is
+  syntax-only, so a fixed-syntax/wrong-logic snippet can still pass — same as
+  before, just faster now.
 - **Single-window + copy-only repair (your correction)**: only ONE cmd popup
   opens; it waits in place (polls up to 30 min) and prints the repair summary
   in the SAME window. `recover_from_crash(..., in_place=False)` repairs a
