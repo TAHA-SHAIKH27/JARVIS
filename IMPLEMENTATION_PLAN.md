@@ -11,7 +11,7 @@
 ### P3.1 Date / Time
 
 - **Phase 3 start:** 2026-09-25 (UTC)
-- **Last updated:** 2026-09-25 (UTC) — audit + baseline done, plan created
+- **Last updated:** 2026-09-25 (UTC) — Phase 3 COMPLETE, stopping
 
 ### P3.2 Objective
 
@@ -58,11 +58,11 @@ no ADB/phone/watchdog additions, and no unvalidated models enabled.
 
 - [x] Audit + baseline 185 passed recorded
 - [x] This Phase 3 plan section created
-- [ ] Vision fallback via validated model only (graceful-off otherwise)
-- [ ] No unvalidated model enabled (Glimmer/GLM/parse-2.0/voice stay off)
-- [ ] Phase 3 integration tests green
-- [ ] Fresh §26 vision probe with recorded evidence
-- [ ] Full suite green + per-component commit/push verified
+- [x] Vision fallback via validated model only (graceful-off otherwise)
+- [x] No unvalidated model enabled (Glimmer/GLM/parse-2.0/voice stay off)
+- [x] Phase 3 integration tests green (20/20)
+- [x] Fresh §26 vision probe with recorded evidence (below)
+- [x] Full suite green (205) + per-component commit/push verified
 
 ### P3.6 Verification requirements (per logical change)
 
@@ -102,7 +102,30 @@ with inspected diff, no secrets, focused message, verified `main...origin/main`.
   health circuit-break, 5 vision cases, 3 hierarchy cases, executor
   closed-rejection, observer browser/office branches, verifier, voice
   idle preservation, memory loop, stubbed e2e. Same pre-existing-dirt note
-  applies to `phase2_runtime.py`. Commit/push: PENDING (checkpoint).
+  applies to `phase2_runtime.py`. Commit/push: DONE — commit `2bcab2b`,
+  push `aa25aab..2bcab2b main -> main`, in sync verified 2026-09-25.
+- 2026-09-25 — §26 live probe + completion. Probe (one real request, 1x1
+  PNG, "Reply with exactly: OK", 90s budget): `meta/
+  llama-3.2-11b-vision-instruct` → `{"ok": true, "latency_s": 0.96,
+  "text": "OK"}` on 2026-09-25. Vision fallback is therefore live-capable
+  today, not just mocked. Registry store left untouched (no re-validation
+  run claimed). FULL suite: **205 passed** (185 baseline + 20 new), zero
+  regressions; test-run DB removed; no secrets committed.
+
+### P3.9 Phase 3 completion state (final, verified 2026-09-25)
+
+- Router remains functional (goal/plan/replan router-first verified by
+  audit + existing tests; no change needed, none made).
+- Phase 2 memory remains functional (loop hooks + 50 tests intact).
+- Computer/Browser/Office/Observer/Verifier/Voice/Recovery preserved;
+  executor still rejects unknown types closed.
+- UIA → DOM → screenshot → vision hierarchy intact; vision now reaches
+  the validated model (0.96s live proof) and degrades to "" otherwise.
+- OCR stays disabled (parse-2.0 UNAVAILABLE, profile has no validated
+  model); NVIDIA voice models stay off (UNVERIFIED); Glimmer/GLM stay off.
+- No second agent, no new deps, no ADB/phone/watchdog additions.
+- Commits: `80a4da5` (plan+baseline), `aa25aab` (vision), `2bcab2b`
+  (bridge+tests) (+ this final plan update next). STOPPING here.
 
 ---
 
