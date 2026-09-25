@@ -534,14 +534,18 @@ class JarvisMemory:
         if self._WHAT_REMEMBER.search(lowered) or lowered.strip() in (
                 "what do you remember?", "what do you remember about me?",
                 "what do you remember about me"):
-            result = self.list(limit=50)
+            scope = MemoryType.PROJECT if "project" in lowered else MemoryType.USER
+            result = self.list(memory_type=scope, limit=50)
             memories = result.get("memories", [])
             if not memories:
-                return {"action": "show", "speak": "I don't have any memories stored about you yet, sir.",
+                who = "this project" if scope == MemoryType.PROJECT else "you"
+                return {"action": "show",
+                        "speak": f"I don't have any memories stored about {who} yet, sir.",
                         "memories": []}
             lines = "; ".join(m["content"][:120] for m in memories[:10])
+            who = "this project" if scope == MemoryType.PROJECT else "you"
             return {"action": "show",
-                    "speak": f"I remember {len(memories)} thing(s) about you, sir: {lines}.",
+                    "speak": f"I remember {len(memories)} thing(s) about {who}, sir: {lines}.",
                     "memories": memories, "count": len(memories)}
 
         show_match = self._SHOW_REMEMBER.search(lowered)

@@ -167,8 +167,23 @@ recorded below. Never claim commit/push without evidence.
   `py_compile` clean; smoke (tmp DB): dedup, supersede (active=1/history=2),
   LOW-vs-HIGH refusal, 2 secret refusals, search/retrieve/explain, update,
   5 explicit commands incl. real forget (dog count 0), expiry, context
-  budget all OK; 11 Phase 1 tests pass; no stray DB. Commit/push: PENDING
-  (checkpoint with this change).
+  budget all OK; 11 Phase 1 tests pass; no stray DB. Commit/push: DONE —
+  commit `75ac930`, push `6d8e179..75ac930 main -> main`, in sync verified
+  2026-09-25.
+- 2026-09-25 — Project memory + agent integration (single-agent subsystem).
+  Files created: `backend/agent/project_memory.py` (16 curated PROJECT facts
+  with file/registry provenance, idempotent seed, overview; never the repo).
+  Files modified: `backend/agent/core.py` (lazy `memory` property,
+  `memory_context_for` retrieval into state, explicit-command interception
+  before planning, episodic verified-outcome update after final verification
+  — all guarded, pytest runs skip episodic writes), `backend/agent/
+  memory_api.py` ("about me"→USER scope, "about project"→PROJECT scope),
+  `.gitignore` (local `jarvis_memory.db*`), `IMPLEMENTATION_PLAN.md`.
+  Verification: seed 16 added → re-seed 16 deduped; remember/show
+  interception via real `process()`; normal task completes with Phase 2
+  context in state; `test_agent_integration`+Phase 1 memory/runtime 17
+  passed; test-run DB had 0 rows (pytest skip works) and was removed;
+  gitignore verified. Commit/push: PENDING (checkpoint with this change).
 
 ---
 

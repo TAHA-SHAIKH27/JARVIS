@@ -23,6 +23,7 @@ Supports:
 """
 import asyncio
 import json
+import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Set, Callable
@@ -35,6 +36,8 @@ from backend.agent.planner import Planner
 from backend.agent.executor import Executor
 from backend.agent.observer import Observer
 from backend.agent.verifier import Verifier
+from backend.agent import personality
+from backend.agent import clarify
 
 
 class AgentCore:
@@ -139,9 +142,85 @@ class AgentCore:
         self._status_callback: Optional[Callable[[AgentStatus, str], None]] = None
         self._mid_task_instruction: Optional[str] = None
         self._mid_task_instruction_processed = False
+        # Mid-run command queue: [{"text": str, "verdict": "merged"|"queued"|None}]
+        self._pending_instructions: List[Dict[str, Any]] = []
+        self._active_task: str = ""
         self._tts_task: Optional[asyncio.Task] = None
         self._current_action_start_time: Optional[float] = None
         self._execution_lock = asyncio.Lock()
+
+        # Phase 1: multi-model intelligence. Built lazily so import-time and
+        # offline behavior are unchanged; Planner also uses it directly.
+        self._model_router = None
+        self._model_registry = None
+        self._model_providers = None
+
+        # Phase 2: persistent memory subsystem (single-agent subsystem, not a
+        # separate agent). Lazy so import-time and offline behavior stay put.
+        self._jarvis_memory = None
+
+    @property
+    def model_router(self):
+        """The single Model Router for this agent (JARVIS -> Router -> models)."""
+        if self._model_router is None:
+            from backend.agent import model_factory
+            registry, providers, router = model_factory.build_router()
+            self._model_registry = registry
+            self._model_providers = providers
+            self._model_router = router
+        return self._model_router
+
+    @property
+    def memory(self):
+        """Phase 2 memory façade (None when unavailable — tasks still run)."""
+        if self._jarvis_memory is None:
+            try:
+                from backend.agent.memory_api import JarvisMemory
+                self._jarvis_memory = JarvisMemory()
+            except Exception:
+                return None
+        return self._jarvis_memory
+
+    def memory_context_for(self, task: str, limit: int = 6,
+                           max_chars: int = 1500) -> str:
+        """MEMORY RETRIEVAL step: compact relevant memories for a task.
+
+        Lexical-only (no network) so planning never stalls. Never raises —
+        returns "" when memory is unavailable."""
+        try:
+            api = self.memory
+            if api is None:
+                return ""
+            return api.memory_context(task or "", limit=limit, max_chars=max_chars)
+        except Exception:
+            return ""
+
+    def _memory_store_outcome(self, task: str, status: str, speak: str) -> None:
+        """MEMORY UPDATE step: bank the VERIFIED outcome as episodic memory.
+
+        Skipped for automated test runs (PYTEST_CURRENT_TEST) so CI noise
+        never pollutes long-term memory. Never raises — memory must never
+        break task execution."""
+        try:
+            import os as _os
+            if _os.environ.get("PYTEST_CURRENT_TEST"):
+                return
+            api = self.memory
+            if api is None:
+                return
+            from backend.agent.memory_schema import (
+                Confidence, MemorySource, MemoryType)
+            summary = (speak or status or "").strip()
+            content = f"Task '{(task or '')[:200]}' finished with status {status}."
+            if summary:
+                content += f" Outcome: {summary[:400]}"
+            api.add(content, memory_type=MemoryType.EPISODIC,
+                    source=MemorySource.VERIFIED_TASK_RESULT,
+                    confidence=Confidence.HIGH,
+                    tags=["task-outcome", str(status or "unknown")],
+                    source_reference=f"agent run, status={status}")
+        except Exception:
+            pass
 
     def set_status_callback(self, callback: Callable[[AgentStatus, str], None]):
         """Set callback for status updates (for frontend SSE)."""
@@ -163,9 +242,28 @@ class AgentCore:
         self._interrupt_reason = ""
 
     def inject_mid_task_instruction(self, instruction: str):
-        """Inject a mid-task instruction to update current task."""
-        self._mid_task_instruction = instruction
-        self._mid_task_instruction_processed = False
+        """Queue a mid-task instruction (voice-service compatible entry)."""
+        text = (instruction or "").strip()
+        if text:
+            self._pending_instructions.append({"text": text})
+
+    def enqueue_instruction(self, text: str, current_task: str = "") -> Dict[str, Any]:
+        """Accept a new command while a run is active; triage immediately.
+
+        Returns {"verdict": "merged"|"queued", "message": str} so the caller
+        (HTTP/voice) can confirm instantly. Merged items restart the plan;
+        queued items run after the current task finishes."""
+        text = (text or "").strip()
+        if not text:
+            return {"verdict": "ignored", "message": "Empty instruction ignored, sir."}
+        task = current_task or getattr(self, "_active_task", "") or ""
+        verdict = clarify.classify_instruction(task, text)
+        self._pending_instructions.append({"text": text})
+        if verdict["related"]:
+            return {"verdict": "merged",
+                    "message": f"Noted, sir — folding that into the current task ({verdict['reason']}) and restarting the plan."}
+        return {"verdict": "queued",
+                "message": f"Noted, sir — that's separate work, so I've queued it to run right after this task."}
 
     async def _check_interrupt(self, event_queue: Optional[asyncio.Queue] = None) -> bool:
         """Check for interruption and handle it gracefully."""
@@ -182,45 +280,64 @@ class AgentCore:
         return False
 
     async def _handle_mid_task_instruction(self, state: TaskState, event_queue: Optional[asyncio.Queue] = None) -> bool:
-        """Process mid-task instruction if available."""
-        if self._mid_task_instruction and not self._mid_task_instruction_processed:
-            instruction = self._mid_task_instruction
-            self._mid_task_instruction_processed = True
-            
-            if event_queue:
-                await event_queue.put({
-                    "type": "mid_task_instruction",
-                    "message": f"Processing mid-task instruction: {instruction}",
-                    "icon": "🔄",
-                    "data": {"instruction": instruction},
-                    "ts": time.time(),
-                })
-            
-            # Update task context with new instruction
-            state.task = f"{state.task} | Mid-task update: {instruction}"
-            
-            # Replan from current state
-            try:
-                failure_context = {
-                    "step_index": state.current_step,
-                    "action_type": "mid_task_update",
-                    "reason": f"Mid-task instruction: {instruction}",
-                    "classification": "recoverable"
-                }
-                new_actions = self.planner.replan(state.task, state, failure_context)
-                # Replace plan but keep completed steps
-                state.plan = Plan(actions=new_actions, goal=state.interpreted_goal, task_type=state.task_type)
-                return True
-            except Exception as e:
+        """Drain queued mid-run commands: related ones merge into the task
+        (fresh plan, restart from step one); independent ones wait their
+        turn in state.queued_tasks. Returns True when the plan changed."""
+        if not self._pending_instructions:
+            return False
+        items = self._pending_instructions
+        self._pending_instructions = []
+        merged: List[str] = []
+        for item in items:
+            text = item.get("text", "") if isinstance(item, dict) else str(item)
+            if not text.strip():
+                continue
+            verdict = clarify.classify_instruction(state.task, text)
+            if verdict["related"]:
+                merged.append(text)
+            else:
+                queued = getattr(state, "queued_tasks", None)
+                if queued is None:
+                    queued = []
+                    state.queued_tasks = queued
+                if text not in queued:
+                    queued.append(text)
                 if event_queue:
                     await event_queue.put({
-                        "type": "error",
-                        "message": f"Failed to process mid-task instruction: {str(e)}",
-                        "icon": "✗",
+                        "type": "task_queued",
+                        "message": f"Queued for after this task, sir: {text[:80]}",
+                        "icon": "⏳",
+                        "data": {"instruction": text, "queue": list(queued)},
                         "ts": time.time(),
                     })
+        if not merged:
             return False
-        return False
+        change = " + ".join(m[:100] for m in merged)
+        if event_queue:
+            await event_queue.put({
+                "type": "plan_restarted",
+                "message": f"Understood, sir — folding that in ({change}) and restarting the plan from the top.",
+                "icon": "🔄",
+                "data": {"changes": merged},
+                "ts": time.time(),
+            })
+        state.task = f"{state.task} | Change: {change}"
+        try:
+            new_actions = await asyncio.to_thread(
+                self.planner.plan_task, state.task, state)
+            # plan_task rebuilds state.plan from scratch; the caller resets
+            # execution to step one (user asked for a restart, not a resume).
+            _ = new_actions
+            return True
+        except Exception as e:
+            if event_queue:
+                await event_queue.put({
+                    "type": "error",
+                    "message": f"Failed to process mid-task instruction: {str(e)}",
+                    "icon": "✗",
+                    "ts": time.time(),
+                })
+            return False
 
     async def _emit_status(self, status: 'AgentCore.AgentStatus', message: str, event_queue: Optional[asyncio.Queue] = None):
         """Emit status update event."""
@@ -288,14 +405,66 @@ class AgentCore:
         state.last_replan_reason = ""
         state.final_outcome_verified = False
         state.final_outcome_data = {}
+        state.queued_tasks = []
+        self._active_task = task
+        # NOTE: _pending_instructions is NOT cleared here — instructions may
+        # legitimately arrive between run creation and loop start.
 
         speak_text = ""       # final response text
 
         await emit("planning", f"Planning task: {task}", icon="🧠")
 
-        # ── Step 1: Plan ──────────────────────────────────────────────────
+        # ── Step 0: Clarification (ask once when genuinely unclear) ──────
+        # Like a good assistant, JARVIS asks a focused follow-up instead of
+        # guessing. One round only — an empty answer means best-effort run.
+        if not getattr(state, "clarification_done", False):
+            question = clarify.needs_clarification(task)
+            if question:
+                enriched = await self._ask_clarification(task, state, question, emit, event_queue)
+                if enriched is None:
+                    # Interrupted while asking — stop politely.
+                    state.completion_status = "interrupted"
+                    speak_text = f"Task interrupted, sir. {self._interrupt_reason}"
+                    return {"status": "interrupted", "task": task, "speak": speak_text,
+                            "completed_steps": state.completed_steps, "errors": state.errors,
+                            "interrupt_reason": self._interrupt_reason}
+                task = enriched
+                state.task = task
+
+        # ── Phase 2: explicit memory commands bypass planning ─────────────
+        # "Remember this" / "Forget that" / "What do you remember" /
+        # "Correct that memory" / "Show me relevant memories" act on real
+        # persistent memory and return directly — no plan, no tools.
         try:
-            actions = self.planner.plan_task(task, state)
+            _api = self.memory
+            _cmd = _api.handle_explicit_command(task) if _api is not None else None
+        except Exception:
+            _cmd = None
+        if _cmd is not None:
+            _speak = str(_cmd.get("speak") or "Done, sir.")
+            state.completion_status = "completed"
+            state.update_context("memory_command", _cmd.get("action", ""))
+            await emit("task_completed", _speak,
+                       {"status": "completed", "memory_action": _cmd.get("action", ""),
+                        "memory": _cmd}, icon="✓")
+            return {"status": "completed", "task": task, "speak": _speak,
+                    "plan": [], "completed_steps": [], "errors": [],
+                    "memory_action": _cmd}
+
+        # ── Phase 2: MEMORY RETRIEVAL (lexical, offline-safe) ─────────────
+        # Relevant memories land in state context for PLAN/ACT/OBSERVE/VERIFY.
+        try:
+            state.update_context("phase2_memory_context",
+                                 self.memory_context_for(task))
+        except Exception:
+            pass
+
+        # ── Step 1: Plan ──────────────────────────────────────────────────
+        # Planner does blocking network I/O (LLM via router/legacy, up to the
+        # router timeout). Run it in a worker thread so the server event loop
+        # stays responsive to health checks and the SSE stream stays alive.
+        try:
+            actions = await asyncio.to_thread(self.planner.plan_task, task, state)
         except Exception as e:
             await emit("error", f"Planning failed: {str(e)}", icon="✗")
             return {"status": "error", "task": task, "errors": [str(e)]}
@@ -306,7 +475,8 @@ class AgentCore:
 
         # Log the plan
         plan_desc = [a.description for a in actions]
-        await emit("plan_created", f"Plan created with {len(actions)} steps", {"steps": plan_desc}, icon="📋")
+        n_real = len([a for a in actions if a.type != "speak"])
+        await emit("plan_created", personality.acknowledge(task, n_real), {"steps": plan_desc}, icon="📋")
 
         # ── Step 2: Validate Plan ─────────────────────────────────────────
         plan = state.plan
@@ -350,7 +520,8 @@ class AgentCore:
 
             # Handle mid-task instruction if available
             if await self._handle_mid_task_instruction(state, event_queue):
-                # Replan happened - reset execution to new plan
+                # Plan was rebuilt from the merged task - restart from step one
+                task = state.task
                 actions = state.plan.actions
                 action_index = 0
                 completed_indices = set()
@@ -375,6 +546,13 @@ class AgentCore:
                     if action.parameters.get("use_last_finding")
                     else action.parameters.get("text", "")
                 )
+                # Plain completion messages should carry the actual evidence:
+                # terminal output, download paths, saved tables. Otherwise the
+                # user hears "done" without ever seeing the result.
+                if not action.parameters.get("use_last_finding"):
+                    evidence = self._collect_speak_evidence(state, action)
+                    if evidence:
+                        speak_text = f"{speak_text}\n\n{evidence}" if speak_text else evidence
                 state.completed_steps.append(action_index)
                 completed_indices.add(action_index)
                 action_index += 1
@@ -402,8 +580,8 @@ class AgentCore:
 
             state.current_step = action_index
             self._current_action_start_time = time.time()
-            await emit("step_started", f"Executing step {action_index + 1}/{len(actions)}: {desc}", 
-                      {"action": atype, "step": action_index + 1, "total": len(actions)}, icon="→")
+            await emit("step_started", personality.narrate_start(atype, desc, action_index, len(actions), action.parameters),
+                      {"action": atype, "step": action_index + 1, "total": len(actions), "description": desc}, icon="→")
 
             # Execute with interrupt checking
             await emit("tool_started", f"Starting tool: {atype}", {"action": atype, "parameters": action.parameters}, icon="⚙")
@@ -441,8 +619,8 @@ class AgentCore:
 
                 await emit(
                     "step_completed",
-                    f"✓ {desc}: {observation.get('message', '')}",
-                    {"action": atype, "verified": True, "observation": observation, "step": action_index + 1},
+                    f"✓ {personality.narrate_done(atype, observation)}",
+                    {"action": atype, "verified": True, "observation": observation, "step": action_index + 1, "description": desc},
                     icon="✓"
                 )
                 state.completed_steps.append(action_index)
@@ -481,6 +659,19 @@ class AgentCore:
                     "observation": observation
                 }
 
+                # Graceful degradation: an empty source page must not kill a
+                # research task that already banked usable sources. Skip the
+                # dead source and continue (dependencies treat it as done).
+                if atype == "browser_extract" and self._should_skip_empty_source(state, fail_msg):
+                    await emit("step_skipped", f"Source had no readable content — continuing with {len(state.extracted_sources)} source(s)",
+                              {"action": atype, "step": action_index + 1}, icon="⏭")
+                    state.completed_steps.append(action_index)
+                    completed_indices.add(action_index)
+                    state.observations.append(observation)
+                    state.retry_count = 0
+                    action_index += 1
+                    continue
+
                 # Handle based on failure classification
                 if requires_user:
                     # Human required - pause and wait
@@ -493,8 +684,10 @@ class AgentCore:
                         "observation": observation
                     }
                     state.waiting_for_user = True
-                    await emit("human_intervention_required", fail_msg, 
-                              {"action_index": action_index, "classification": classification}, icon="👤")
+                    kind = "login" if atype in ("browser_login", "browser_login_check") else (
+                        "captcha" if "captcha" in (fail_msg or "").lower() else "")
+                    await emit("human_intervention_required", personality.narrate_waiting_human(fail_msg, kind),
+                              {"action_index": action_index, "classification": classification, "kind": kind}, icon="👤")
                     # Don't advance - wait for human
                     continue
 
@@ -512,7 +705,7 @@ class AgentCore:
                         elif action.type == "open_app_wait":
                             await asyncio.sleep(2.0) # Wait longer for app to open
                     
-                    await emit("retrying", f"Retrying: {desc} (attempt {state.retry_count}/{max_retries})", 
+                    await emit("retrying", personality.narrate_retry(desc, state.retry_count),
                               {"action": atype, "attempt": state.retry_count}, icon="↺")
                     await asyncio.sleep(1.0 * state.retry_count)  # Exponential backoff
                     continue
@@ -532,7 +725,10 @@ class AgentCore:
                             "classification": classification
                         }
                         # Use state.task which may include mid-task instructions
-                        new_actions = self.planner.replan(state.task, state, failure_context)
+                        # (blocking I/O -> worker thread, same as plan_task).
+                        new_actions = await asyncio.to_thread(
+                            self.planner.replan, state.task, state, failure_context
+                        )
                         actions = new_actions
                         # Replanning replaces the authoritative plan. Final
                         # verification must evaluate the replacement, not the
@@ -559,7 +755,8 @@ class AgentCore:
                     # Fatal error or max retries exceeded
                     await emit("error", f"Fatal failure on step '{desc}': {fail_msg}. Task cannot continue.", icon="✗")
                     state.completion_status = "failed"
-                    speak_text = f"Task failed, sir. Critical step failed: {desc}. Error: {fail_msg}"
+                    speak_text = personality.serious(
+                        f"Task failed, sir. Critical step failed: {desc}. Error: {fail_msg}")
                     if self.executor._browser:
                         await self.executor.close_browser()
                     await emit(
@@ -664,6 +861,12 @@ class AgentCore:
             await emit("observation", "Closing browser", icon="✓")
             await self.executor.close_browser()
 
+        queued = list(getattr(state, "queued_tasks", []) or [])
+        if queued:
+            await emit("task_queued_summary",
+                       f"Finished, sir — and {len(queued)} task(s) are queued next: {queued[0][:80]}",
+                       {"queued": queued}, icon="⏳")
+
         await emit(
             "task_completed" if state.completion_status == "completed" else "task_partial",
             speak_text,
@@ -673,9 +876,14 @@ class AgentCore:
                 "total_steps": len([a for a in actions if a.type != "speak"]),
                 "errors": state.errors,
                 "final_verification": final_verification,
+                "queued": queued,
             },
             icon="✓" if state.completion_status == "completed" else "⚠"
         )
+
+        # ── Phase 2: MEMORY UPDATE — bank the verified outcome ────────────
+        self._memory_store_outcome(task, state.completion_status or "unknown",
+                                   speak_text)
 
         return {
             "status": state.completion_status,
@@ -686,6 +894,7 @@ class AgentCore:
             "errors": state.errors,
             "final_verification": final_verification,
             "action_outputs": state.action_outputs,
+            "queued": queued,
         }
 
     def _dependencies_satisfied(self, action: ActionSpec, completed_indices: Set[int], state: TaskState) -> bool:
@@ -694,6 +903,114 @@ class AgentCore:
             if dep_idx not in completed_indices:
                 return False
         return True
+
+    @staticmethod
+    def _should_skip_empty_source(state: TaskState, fail_msg: str) -> bool:
+        """Skip a dead source only when usable evidence is already banked.
+        Prevents one empty/JS-only/blocked page from failing a whole
+        research task. Never skips when nothing has been gathered yet."""
+        if "no meaningful content" not in (fail_msg or "").lower():
+            return False
+        banked = sum(len(s.get("text") or "") for s in (state.extracted_sources or []))
+        return banked > 200
+
+    @staticmethod
+    def _collect_speak_evidence(state: TaskState, action=None) -> str:
+        """Build the reply evidence for read-style actions (consume-once).
+
+        Agentic replies carry a SHORT SUMMARY, not a raw dump: terminal
+        output is analyzed (branch state, test counts, listings) and only
+        the conclusion reaches the chat. Download/table paths stay as-is.
+        Speak actions may request explicit evidence via
+        `parameters["evidence"]`: calc | search | screenshot | artifact |
+        folder | typed | sources. A user asking for "full output"/"verbose"
+        still gets the raw text (capped). Returns "" when nothing is banked.
+        """
+        parts: List[str] = []
+        requested = ""
+        try:
+            requested = (action.parameters.get("evidence", "") or "") if action else ""
+        except Exception:
+            requested = ""
+
+        def _take(key: str) -> str:
+            val = (state.get_context(key, "") or "")
+            if isinstance(val, list):
+                out = list(val)
+                state.update_context(key, [])
+                return out
+            val = str(val).strip()
+            state.update_context(key, "")
+            return val
+
+        if requested == "calc":
+            calc = str(state.get_context("last_calc_result", "") or "").strip()
+            if calc:
+                parts.append(f"Result: {calc}.")
+                state.update_context("last_calc_result", "")
+
+        if requested in ("typed",):
+            typed = str(state.get_context("last_typed_text", "") or "").strip()
+            if typed:
+                short = typed if len(typed) <= 100 else typed[:100].rstrip() + "…"
+                parts.append(f'Text entered: "{short}".')
+                state.update_context("last_typed_text", "")
+
+        if requested in ("folder",):
+            folder = str(state.get_context("last_folder_path", "") or "").strip()
+            if folder:
+                parts.append(f"Location: {folder}.")
+                state.update_context("last_folder_path", "")
+
+        if requested in ("screenshot",):
+            shot = str(state.get_context("last_screenshot_path", "") or "").strip()
+            if shot:
+                parts.append(f"Screenshot saved to: {shot}.")
+                state.update_context("last_screenshot_path", "")
+
+        if requested in ("artifact",):
+            paths = _take("artifact_paths")
+            if paths:
+                parts.append("Saved to: " + ", ".join(paths) + ".")
+
+        if requested in ("search", "sources"):
+            bank = state.extracted_sources if requested == "sources" else state.search_results
+            titles = [str((s.get("title") or s.get("url") or "")).strip()
+                      for s in (bank or [])][:3]
+            titles = [t[:80] for t in titles if t]
+            if titles:
+                parts.append(("Sources: " if requested == "sources" else "Top results: ")
+                             + "; ".join(titles) + ".")
+        # Auto evidence (no tag needed): terminal summaries, downloads, tables.
+        shell_out = (state.get_context("last_shell_output", "") or "").strip()
+        if shell_out:
+            task_l = (state.task or "").lower()
+            if re.search(r"\bfull\b.*\boutput\b|\bverbose\b|\bshow\s+all\b|\bcomplete\s+output\b", task_l):
+                raw = shell_out
+                if len(raw) > 1500:
+                    raw = raw[:1500].rstrip() + "\n…(truncated)"
+                parts.append(raw)
+            else:
+                from backend.tools.terminal import summarize_output
+                parts.append(summarize_output(
+                    state.get_context("last_shell_command", ""),
+                    shell_out,
+                    int(state.get_context("last_shell_exit", 0) or 0)))
+            state.update_context("last_shell_output", "")
+            state.update_context("last_shell_command", "")
+            state.update_context("last_shell_exit", "")
+        dl_path = (state.get_context("last_download_path", "") or "").strip()
+        if dl_path:
+            parts.append(f"Saved to: {dl_path}")
+            state.update_context("last_download_path", "")
+        table_path = (state.get_context("last_table_path", "") or "").strip()
+        if table_path:
+            rows = state.get_context("last_table_rows", "")
+            parts.append(f"Table saved to: {table_path}"
+                         + (f" ({rows} rows)" if rows != "" else ""))
+            state.update_context("last_table_path", "")
+            state.update_context("last_table_rows", "")
+        return "\n".join(parts).strip()
 
     async def _verify_final_outcome(self, state: TaskState, plan: Plan) -> Dict[str, Any]:
         """Verify the final outcome matches the user's requested goal."""
@@ -812,12 +1129,57 @@ class AgentCore:
             f.write(log_entry + '\n')
 
     async def resume_after_human(self, state: TaskState, resolution: Dict[str, Any]) -> Dict[str, Any]:
-        """Resume execution after human intervention."""
+        """Resume execution after human intervention.
+
+        Carries a clarification answer (if any) into state so the waiting
+        question loop can fold it back into the task."""
+        try:
+            answer = ((resolution or {}).get("answer", "") or "").strip()
+        except Exception:
+            answer = ""
+        if answer:
+            state.update_context("clarification_answer", answer)
         state.human_verification_resolved = True
         state.human_verification_required = False
         state.waiting_for_user = False
         # The main loop will continue from the paused action
         return {"status": "resumed", "resolution": resolution}
+
+    async def _ask_clarification(self, task: str, state: TaskState,
+                                 question: Dict[str, Any], emit,
+                                 event_queue=None) -> Optional[str]:
+        """Ask one follow-up question before planning; returns the enriched
+        task, or None when interrupted mid-question."""
+        state.human_verification_required = True
+        state.human_verification_message = question["question"]
+        state.human_verification_action_index = -1  # pre-plan marker
+        state.human_verification_context = {
+            "kind": "clarification",
+            "question": question["question"],
+            "options": question.get("options", []),
+            "hint": question.get("hint", ""),
+        }
+        state.waiting_for_user = True
+        await emit("clarification_required", question["question"],
+                   {"question": question["question"],
+                    "options": question.get("options", []),
+                    "kind": "clarification"},
+                   icon="❓")
+        while state.waiting_for_user and state.human_verification_action_index == -1:
+            if await self._check_interrupt(event_queue):
+                state.waiting_for_user = False
+                return None
+            await asyncio.sleep(0.5)
+        await emit("resuming", "Got it, sir — carrying on.",
+                   {"action_index": -1}, icon="▶")
+        state.waiting_for_user = False
+        state.human_verification_resolved = False
+        state.clarification_done = True
+        answer = (state.get_context("clarification_answer", "") or "").strip()
+        state.update_context("clarification_answer", "")
+        if not answer:
+            return task  # best effort with the original prompt
+        return clarify.apply_answer(task, answer)
 
     # ─────────────────────────────────────────────────────────────────────────
     # CodeCore Self-Debugging Integration

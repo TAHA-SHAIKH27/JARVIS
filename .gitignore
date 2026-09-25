@@ -46,3 +46,6 @@ config.json
 .backup/
 downloads/
 work_files/
+
+# Phase 2 persistent memory database (local runtime data, survives restarts)
+backend/data/jarvis_memory.db*
