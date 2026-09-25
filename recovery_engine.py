@@ -27,6 +27,7 @@ PROTECTED_FILES = {
 }
 
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".backup")
+WORKSPACE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Self-healing configuration (can be overridden by config.json)
 MAX_NEMOTRON_RETRIES = 3
@@ -439,6 +440,115 @@ def call_muse(prompt: str, system_prompt: str = "", model: str = None) -> str:
     raise RuntimeError(f"Muse failed after {max_retries} attempts. Last error: {last_error}")
 
 
+# Local repair via the OpenCode CLI (`opencode run`) — the model already
+# configured there (e.g. Muse Spark) fixes the bug inside the project.
+# Config: "repair_backend": "opencode" (default) or "nvidia" (legacy window
+# repair); "opencode_repair_timeout_s" (default 600).
+OPENCODE_TIMEOUT_DEFAULT = 600
+
+
+def _get_repair_backend() -> str:
+    try:
+        backend = str(load_config().get("repair_backend", "") or "").strip().lower()
+    except Exception:
+        backend = ""
+    return backend if backend in ("opencode", "nvidia") else "opencode"
+
+
+def _get_opencode_timeout() -> int:
+    try:
+        timeout = int(load_config().get("opencode_repair_timeout_s",
+                                        OPENCODE_TIMEOUT_DEFAULT))
+    except (ValueError, TypeError):
+        timeout = OPENCODE_TIMEOUT_DEFAULT
+    return max(60, min(timeout, 3600))
+
+
+def _repair_via_opencode(target_file: str, target_line: int,
+                         error_msg: str) -> tuple[bool, str]:
+    """Let the local `opencode run` session fix ONLY the culprit lines.
+
+    The model edits the file in place; this function validates the result.
+    Callers snapshot/restore the original when copy-only mode is required.
+    Returns (valid, message). Never raises — failures return (False, reason).
+    """
+    try:
+        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        try:
+            with open(target_file, "r", encoding="utf-16", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError as e:
+            return False, f"Could not read file: {e}"
+    total = len(lines)
+    if total == 0:
+        return False, "File is empty"
+    start = max(1, int(target_line or 1) - 10)
+    end = min(total, int(target_line or 1) + 10)
+    excerpt = "\n".join(f"Line {i}: {lines[i - 1][:220]}"
+                        for i in range(start, end + 1))
+
+    prompt = (
+        f"Crash repair task in file {os.path.basename(target_file)} "
+        f"(full path: {target_file}).\n"
+        f"Error at line {target_line}: {error_msg}\n\n"
+        f"Suspect lines:\n{excerpt}\n\n"
+        "Rules: fix ONLY these lines with the minimal change that resolves "
+        "the error. Do NOT modify any other file. Do NOT refactor, rename, "
+        "or reformat anything else. Do NOT ask questions — apply the fix "
+        "directly and reply with one line describing what you changed."
+    )
+    timeout = _get_opencode_timeout()
+    # Windows npm shims are .CMD/.PS1 files, not real executables, so
+    # resolve via shutil.which and route through the right interpreter.
+    import shutil as _shutil
+    exe = _shutil.which("opencode")
+    if not exe:
+        return False, "OpenCode CLI not found on PATH"
+    _lower = exe.lower()
+    if _lower.endswith((".cmd", ".bat")):
+        cmd = ["cmd", "/c", exe, "run", "--dir", WORKSPACE_ROOT, prompt]
+    elif _lower.endswith(".ps1"):
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", exe, "run", "--dir", WORKSPACE_ROOT, prompt]
+    else:
+        cmd = [exe, "run", "--dir", WORKSPACE_ROOT, prompt]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", timeout=timeout,
+                              cwd=WORKSPACE_ROOT)
+    except subprocess.TimeoutExpired:
+        return False, f"OpenCode repair timed out after {timeout}s"
+    except Exception as e:
+        return False, f"OpenCode launch failed: {e}"
+
+    tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip().splitlines()
+    tail_txt = " | ".join(tail[-3:])[:300] if tail else ""
+    # Audit trail: full prompt + transcript per attempt, next to the crash
+    # summaries, so the user can see exactly what the agent was told and did.
+    try:
+        crash_dir = os.path.join(WORKSPACE_ROOT, "STARTUP CRASH")
+        os.makedirs(crash_dir, exist_ok=True)
+        base = os.path.basename(target_file)
+        log_path = os.path.join(
+            crash_dir, f"opencode_repair_{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write(f"PROMPT SENT TO OPENCODE:\n{prompt}\n\n"
+                     f"EXIT CODE: {proc.returncode}\n\n"
+                     f"STDOUT:\n{proc.stdout or ''}\n\n"
+                     f"STDERR:\n{proc.stderr or ''}\n")
+    except OSError:
+        pass
+    if proc.returncode != 0:
+        return False, f"OpenCode exited with code {proc.returncode}: {tail_txt}"
+    is_valid, val_msg = validate_python_file(target_file)
+    note = f" {tail_txt}" if tail_txt else ""
+    if is_valid:
+        return True, f"OpenCode repaired and validated.{note}"
+    return False, f"OpenCode edit did not validate: {val_msg}{note}"
+
+
 def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, traceback_text: str) -> tuple[bool, str]:
     """Surgically repair a focused line window around target_line without rewriting the whole file."""
     with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -627,7 +737,35 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
         log_recovery_event("SURGICAL_REPAIR_ATTEMPT", f"Pass {p} on {os.path.basename(target_file)}: line {current_line}", {"line": current_line, "error": current_error})
 
         try:
-            is_valid, val_msg = _repair_window_attempt(work_file, current_line, current_error, traceback_text)
+            # Primary: local OpenCode session (config "repair_backend", default
+            # "opencode"). On any failure, fall back to NVIDIA window repair
+            # in the same pass — recovery never depends on one backend.
+            is_valid, val_msg = False, "not attempted"
+            if _get_repair_backend() == "opencode":
+                snap = None
+                if not in_place:
+                    try:
+                        with open(work_file, "rb") as _sf:
+                            snap = _sf.read()
+                    except OSError:
+                        snap = None
+                is_valid, val_msg = _repair_via_opencode(
+                    work_file, current_line, current_error)
+                if is_valid:
+                    print(f"[RECOVERY] OpenCode repair: {val_msg}")
+                else:
+                    print(f"[RECOVERY] OpenCode attempt failed ({val_msg}) — "
+                          f"falling back to NVIDIA window repair...")
+                    log_recovery_event("OPENCODE_FALLBACK", val_msg,
+                                       {"line": current_line})
+                    if snap is not None:
+                        try:
+                            with open(work_file, "wb") as _sf:
+                                _sf.write(snap)
+                        except OSError:
+                            pass
+            if not is_valid:
+                is_valid, val_msg = _repair_window_attempt(work_file, current_line, current_error, traceback_text)
             if is_valid:
                 # Check if there's any remaining syntax error on a different line
                 next_line, next_msg = _extract_syntax_error_line(work_file)

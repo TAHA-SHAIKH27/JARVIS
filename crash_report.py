@@ -137,8 +137,10 @@ Suspect lines (marked with >>>):
 4) WHAT HAPPENS NEXT (automatic)
 --------------------------------
 a) This summary was created here: {path}
-b) The watchdog sends ONLY the suspect lines above (not your whole project)
-   to the NVIDIA repair model.
+b) The watchdog writes a short error-focused prompt (file, exact lines,
+   what happened) into your local OpenCode session, which fixes it with
+   full project context. (If that fails, the NVIDIA window repair is tried
+   automatically as backup.)
 c) The model returns corrected lines; the watchdog repairs a COPY of the
    file with ONLY that chunk changed and checks the result compiles.
    Your ORIGINAL file in the project is never touched.
@@ -217,8 +219,8 @@ def pop_crash_console(summary_path: str, nice_name: str, error_text: str):
         f"  Failing file : {nice_name}",
         f"  Error        : {(error_text or '')[:100]}",
         "",
-        "  The watchdog will now send the suspect lines to the",
-        "  NVIDIA repair model and attempt an automatic fix.",
+        "  The watchdog will now write a short repair prompt into your",
+        "  local OpenCode session and attempt an automatic fix.",
         "  Your original project file will NOT be modified.",
         "",
     ]

@@ -123,6 +123,16 @@ comes from reading the integration and call paths.
   file: valid fix in 27.8s wall time. Honest limit: the validation gate is
   syntax-only, so a fixed-syntax/wrong-logic snippet can still pass — same as
   before, just faster now.
+- **Local OpenCode repair (your idea, 2026-09-26)**: crash repair now writes a
+  short error-focused prompt (file, exact lines, what happened, minimal-change
+  rules) into your local `opencode run` session instead of only the NVIDIA
+  window path; NVIDIA stays as automatic same-pass fallback
+  (`repair_backend` in config.json). Transcript of every attempt is saved to
+  `STARTUP CRASH/opencode_repair_*.log`. Live proof on a scratch file: local
+  Spark fixed BOTH the syntax error AND the loop-bound logic bug and
+  self-verified with test runs — deeper than Glimmer's syntax-only fix. Fixed
+  en route: npm-shim launch (.CMD via cmd /c) and cp1252 decode crashes.
+  Verified the agent touched nothing else in the repo.
 - **Race round 2 (2026-09-26)**: Glimmer re-run 7.1s VALID (unbeaten);
   gemma-3-4b-it / granite-8b-code / mistral-nemo-minitron-8b / kimi-k2.6 all
   404 (listed but not servable on this key), gpt-oss-20b 180s timeout.
