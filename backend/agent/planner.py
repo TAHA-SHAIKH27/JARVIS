@@ -1517,6 +1517,20 @@ class Planner:
         except Exception:
             pass
 
+        # Memory → Experience → Future Action: verified prior-task experience is
+        # guidance, never replay instructions. Injected here (not only via the
+        # legacy bridge) so BOTH the Model-Router path and the legacy
+        # Gemini/NVIDIA path plan with it. Bounded and failure-silent.
+        try:
+            from backend.agent.task_persistence import get_task_store
+            exp_ctx = get_task_store().experience_context(task, limit=6)
+            if exp_ctx and exp_ctx != "No relevant verified prior experience.":
+                enriched_task += ("\n\nPRIOR VERIFIED EXPERIENCE (guidance only — "
+                                  "re-observe and verify before repeating any action):\n"
+                                  + exp_ctx[:1500])
+        except Exception:
+            pass
+
         # URL-directed tasks need exact navigation semantics.  Prefer the
         # deterministic URL plan over an LLM paraphrasing the URL into a search.
         explicit_url_task = bool(re.search(r"https?://[^\s\]\[\),]+", task, re.I))

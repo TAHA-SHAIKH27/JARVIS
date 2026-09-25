@@ -37,12 +37,15 @@ keep what is correct, and correct/complete only the gaps.
   legitimate feature work — MUST be preserved, verified, then committed.
 
 ### Gaps found (partial/incorrect/missing — fix minimally)
-- [ ] G1. Experience reaches the LLM only via the `install_planner_context_bridge`
+- [x] G1. Experience reaches the LLM only via the `install_planner_context_bridge`
   monkey-patch on the legacy `_call_gemini_for_plan` path (installed from
   `state.initialize_phase1`). The Model-Router path (`_call_router_for_plan`)
   and direct `planner.plan_task` callers that never trigger the bridge get NO
-  prior-experience context. FIX: inject `experience_context()` directly in
-  `planner.plan_task` next to the existing `phase2_memory_context` block.
+  prior-experience context. FIXED 2026-09-25: `planner.plan_task` now injects
+  `experience_context()` directly next to the `phase2_memory_context` block, so
+  router + legacy paths both plan with it (bounded 1500 chars, failure-silent,
+  guidance-only wording). Verified: planner imports OK; seeded verified
+  checkpoint retrieved via `experience_context()`.
 - [ ] G2. Scheduler has NO `reschedule` operation and `handle_schedule_command`
   parses no reschedule phrasing ("move X to …", "reschedule X to …").
   FIX: add `reschedule_scheduled()` + command wiring. Duplicate-send protection
