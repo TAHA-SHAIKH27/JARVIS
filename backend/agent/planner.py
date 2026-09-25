@@ -331,6 +331,17 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
             except Exception:
                 continue
 
+    # 3. Optional local Ollama fallback. It is probed at runtime and is
+    # used only after configured remote providers fail. Gemini/NVIDIA defaults
+    # are never silently replaced.
+    try:
+        from backend.agent.local_model import generate_plan
+        local = generate_plan(task, system_prompt)
+        if isinstance(local, list):
+            return local
+    except Exception:
+        pass
+
     return None
 
 
