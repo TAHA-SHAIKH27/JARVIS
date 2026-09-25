@@ -55,10 +55,15 @@ keep what is correct, and correct/complete only the gaps.
   (new time shown)→cancel round-trip passes via both direct calls and
   `handle_schedule_command`. Duplicate-send protection kept (pending→
   sent/failed/cancelled transitions).
-- [ ] G3. Resume path records `action_started` but never READS
+- [x] G3. Resume path records `action_started` but never READS
   `latest_action_started` and never re-observes the environment before
-  continuing. FIX: on resume, query in-flight marker, emit a recovery event,
-  and take a fresh `observer.observe()` snapshot before executing.
+  continuing. FIXED 2026-09-25: on resume, `core.process()` now queries
+  `latest_action_started()` and emits a `recovery_check` event naming the
+  unverified in-flight step, then takes a fresh `observer.observe()` snapshot
+  (stored as `resume_observation`, `re_observed` event) before executing.
+  Verified steps still resume at `current_step` (never replayed); only the
+  unverified step is retried after re-observation. Verified: core imports OK;
+  in-flight marker round-trip + observer snapshot pass on an isolated store.
 - [ ] G4. Document pipeline extracts full text (+OCR) but has no provenance /
   section / retrieval record linking document knowledge to tasks. FIX (minimal):
   add stdlib provenance helper in `document_intel.py` (sections + chunk index

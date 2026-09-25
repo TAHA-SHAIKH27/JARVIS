@@ -539,6 +539,33 @@ class AgentCore:
                        f"Resuming from verified checkpoint {action_index}",
                        {"task_id": _resume_record["task_id"], "resume_step": action_index,
                         "completed_steps": list(state.completed_steps)}, icon="▶")
+            # Duplicate-action protection: an action_started marker without a
+            # later verified checkpoint means JARVIS may have crashed AFTER a
+            # real-world side effect but BEFORE verification. Surface it so the
+            # retry below re-observes instead of blindly repeating.
+            try:
+                _in_flight = _task_store.latest_action_started(
+                    _resume_record["task_id"])
+            except Exception:
+                _in_flight = None
+            if _in_flight is not None:
+                _payload = _in_flight.get("payload", {}) if isinstance(
+                    _in_flight, dict) else {}
+                await emit("recovery_check",
+                           "Found an unverified in-flight action from before the "
+                           "restart — re-observing before retrying, sir.",
+                           {"step_index": _in_flight.get("step_index"),
+                            "action": _payload.get("action", {})}, icon="🔍")
+            # Never assume the environment is unchanged: fresh snapshot before
+            # continuing from the checkpoint.
+            try:
+                _fresh = await self.observer.observe(state, focus="resume")
+                state.update_context("resume_observation", _fresh)
+                await emit("re_observed",
+                           "Environment re-observed after restart.",
+                           {"observation": _fresh}, icon="👁")
+            except Exception as _re_obs_error:
+                state.errors.append(f"Resume re-observation failed: {_re_obs_error}")
 
         while action_index < len(actions):
             # Check for interruption before each action
