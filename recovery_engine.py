@@ -404,10 +404,18 @@ def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, t
     return is_valid, val_msg
 
 
-def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
+def recover_from_crash(crash_log_path: str, max_retries: int = 3,
+                       in_place: bool = True) -> dict:
     """
     Analyze crash log, locate broken file, create backup, query NVIDIA NIM for a minimal fix,
     apply patch, validate, and retry up to max_retries. If all fail, auto-rollback.
+
+    in_place=True  (default, legacy): repair is written into the original file,
+                   with automatic rollback from backup on failure.
+    in_place=False (watchdog crash flow): the original file is NEVER written.
+                   Repair happens on a staging copy; on success the fixed copy
+                   is archived under "FIXED CRASH FILE/" and its path is
+                   returned as result["repaired_copy"].
     """
     if not os.path.exists(crash_log_path):
         return {"status": "error", "message": f"Crash log not found: {crash_log_path}"}
@@ -469,10 +477,47 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
     print(f"\n[RECOVERY] ========================================")
     print(f"[RECOVERY] Initiating autonomous recovery on: {os.path.basename(target_file)}")
     print(f"[RECOVERY] Error: {error_summary} (Line {target_line})")
+    print(f"[RECOVERY] Mode: {'in-place repair' if in_place else 'COPY-ONLY repair (original untouched)'}")
     print(f"[RECOVERY] ========================================")
 
-    # Create master backup before attempting any modifications
+    # Create master backup before attempting any modifications (read-only copy,
+    # kept as a safety record even in copy-only mode).
     backup_path = create_backup(target_file, tag="crash_recovery")
+
+    # Copy-only mode: all repair + validation happens on a staging copy inside
+    # "FIXED CRASH FILE/". The project original is never opened for writing.
+    work_file = target_file
+    staging_path = ""
+    if not in_place:
+        fixed_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FIXED CRASH FILE")
+        os.makedirs(fixed_dir, exist_ok=True)
+        stem, ext = os.path.splitext(os.path.basename(target_file))
+        staging_path = os.path.join(
+            fixed_dir, f"_repair_{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
+        with open(target_file, "rb") as src, open(staging_path, "wb") as out:
+            out.write(src.read())
+        work_file = staging_path
+
+    def _finalize_work_copy() -> str:
+        """Archive a validated staging copy as the deliverable fixed file."""
+        fixed_dir = os.path.dirname(staging_path)
+        stem, ext = os.path.splitext(os.path.basename(target_file))
+        dest = os.path.join(
+            fixed_dir, f"{stem}_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
+        with open(work_file, "rb") as src, open(dest, "wb") as out:
+            out.write(src.read())
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
+        return dest
+
+    def _discard_work_copy() -> None:
+        if staging_path:
+            try:
+                os.remove(staging_path)
+            except OSError:
+                pass
 
     with open(target_file, "r", encoding="utf-8", errors="replace") as f:
         original_content = f.read()
@@ -485,7 +530,7 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
     for p in range(1, max_surgical_passes + 1):
         # Determine exact error line if not known
         if not current_line or current_line <= 0:
-            syn_line, syn_msg = _extract_syntax_error_line(target_file)
+            syn_line, syn_msg = _extract_syntax_error_line(work_file)
             if syn_line > 0:
                 current_line = syn_line
                 current_error = syn_msg
@@ -494,20 +539,24 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
         log_recovery_event("SURGICAL_REPAIR_ATTEMPT", f"Pass {p} on {os.path.basename(target_file)}: line {current_line}", {"line": current_line, "error": current_error})
 
         try:
-            is_valid, val_msg = _repair_window_attempt(target_file, current_line, current_error, traceback_text)
+            is_valid, val_msg = _repair_window_attempt(work_file, current_line, current_error, traceback_text)
             if is_valid:
                 # Check if there's any remaining syntax error on a different line
-                next_line, next_msg = _extract_syntax_error_line(target_file)
+                next_line, next_msg = _extract_syntax_error_line(work_file)
                 if next_line == 0:
                     log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated in pass {p}")
                     print(f"[RECOVERY] SUCCESS: File {os.path.basename(target_file)} repaired and validated!")
-                    return {
+                    success = {
                         "status": "success",
                         "file": target_file,
                         "attempt": p,
                         "backup": backup_path,
                         "message": f"Successfully repaired {os.path.basename(target_file)} (surgical pass {p})."
                     }
+                    if not in_place:
+                        success["repaired_copy"] = _finalize_work_copy()
+                        success["message"] += " Original file was NOT modified; fixed copy archived."
+                    return success
                 else:
                     print(f"[RECOVERY] Pass {p} resolved line {current_line}, but found next error at line {next_line}: {next_msg}")
                     current_line = next_line
@@ -516,7 +565,7 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
             else:
                 print(f"[RECOVERY] Surgical pass {p} validation reported: {val_msg}")
                 # Check if the validation error pinpointed a new line
-                next_line, next_msg = _extract_syntax_error_line(target_file)
+                next_line, next_msg = _extract_syntax_error_line(work_file)
                 if next_line > 0:
                     current_line = next_line
                     current_error = next_msg
@@ -525,12 +574,17 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
         except RuntimeError as e:
             print(f"\n[RECOVERY] Nemotron self-healing engine unavailable: {e}")
             log_recovery_event("RECOVERY_NEMOTRON_UNAVAILABLE", str(e))
-            restore_backup(backup_path, target_file)
+            if in_place:
+                restore_backup(backup_path, target_file)
+                msg = "Nemotron self-healing engine unavailable after retries. Rolled back safely."
+            else:
+                _discard_work_copy()
+                msg = "Nemotron self-healing engine unavailable after retries. Original file was NOT modified."
             return {
                 "status": "nemotron_unavailable",
                 "file": target_file,
                 "backup": backup_path,
-                "message": f"Nemotron self-healing engine unavailable after retries. Rolled back safely."
+                "message": msg
             }
         except Exception as e:
             print(f"[RECOVERY] Surgical repair exception: {e}")
@@ -568,20 +622,24 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
                 time.sleep(1)
                 continue
 
-            with open(target_file, "w", encoding="utf-8") as f:
+            with open(work_file, "w", encoding="utf-8") as f:
                 f.write(fixed_code)
 
-            is_valid, val_msg = validate_python_file(target_file)
+            is_valid, val_msg = validate_python_file(work_file)
             if is_valid:
                 log_recovery_event("RECOVERY_SUCCESS", f"File {os.path.basename(target_file)} repaired and validated on fallback attempt {attempt}")
                 print(f"[RECOVERY] SUCCESS: File {os.path.basename(target_file)} repaired and validated!")
-                return {
+                success = {
                     "status": "success",
                     "file": target_file,
                     "attempt": attempt,
                     "backup": backup_path,
                     "message": f"Successfully repaired {os.path.basename(target_file)} on fallback attempt {attempt}."
                 }
+                if not in_place:
+                    success["repaired_copy"] = _finalize_work_copy()
+                    success["message"] += " Original file was NOT modified; fixed copy archived."
+                return success
             else:
                 print(f"[RECOVERY] Fallback attempt {attempt} validation failed: {val_msg}")
                 current_error = f"Validation py_compile error: {val_msg}"
@@ -592,16 +650,24 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3) -> dict:
             current_error = str(e)
             time.sleep(1)
 
-    # If all attempts failed, execute automatic rollback
-    print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Rolling back to original state...")
-    log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All repair attempts failed for {os.path.basename(target_file)}")
-    restore_backup(backup_path, target_file)
+    # If all attempts failed: in-place mode rolls back; copy-only mode simply
+    # discards the staging copy (the original was never touched).
+    if in_place:
+        print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Rolling back to original state...")
+        log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All repair attempts failed for {os.path.basename(target_file)}")
+        restore_backup(backup_path, target_file)
+        msg = f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts. Rolled back safely."
+    else:
+        print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Discarding work copy (original untouched)...")
+        log_recovery_event("RECOVERY_FAILED_DISCARDED", f"All repair attempts failed for {os.path.basename(target_file)}")
+        _discard_work_copy()
+        msg = f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts. Original file was NOT modified."
 
     return {
         "status": "failed_rolled_back",
         "file": target_file,
         "backup": backup_path,
-        "message": f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts. Rolled back safely."
+        "message": msg
     }
 
 
