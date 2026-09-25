@@ -11,7 +11,7 @@
 ### P2.1 Date / Time
 
 - **Phase 2 start:** 2026-09-25 (UTC)
-- **Last updated:** 2026-09-25 (UTC) — audit + baseline done, plan created
+- **Last updated:** 2026-09-25 (UTC) — Phase 2 COMPLETE, stopping
 
 ### P2.2 Phase 2 objective
 
@@ -92,20 +92,21 @@ without reranking (honest no-fit, optional path only).
 
 - [x] Audit + baseline 113 passed recorded
 - [x] This Phase 2 plan section created
-- [ ] Schema
-- [ ] SQLite storage + migration + restart persistence
-- [ ] Memory API (add/search/retrieve/update/delete/forget/list/explain)
-- [ ] Explicit remember/forget/correct/show on real store (no fake forget)
-- [ ] Provenance + confidence (explicit>verified>assumption, no silent overwrite)
-- [ ] Privacy blocklist + sensitivity
-- [ ] Retrieval pipeline (candidate→relevance→embed(opt)→rerank(opt)→
+- [x] Schema
+- [x] SQLite storage + migration + restart persistence
+- [x] Memory API (add/search/retrieve/update/delete/forget/list/explain)
+- [x] Explicit remember/forget/correct/show on real store (no fake forget)
+- [x] Provenance + confidence (explicit>verified>assumption, no silent overwrite)
+- [x] Privacy blocklist + sensitivity
+- [x] Retrieval pipeline (candidate→relevance→embed(opt)→rerank(opt)→
       confidence/importance/recency→project→select, context-limited)
-- [ ] Embeddings validated-only (embed-vl-1b-v2 + input_type; others rejected)
-- [ ] Rerank validated-only (unavailable → graceful off)
-- [ ] Explainable ranking (no semantic-drowning, no CoT leak)
-- [ ] Dedup + conflict + expiration + project memory
-- [ ] Agent integration (single-agent subsystem)
-- [ ] Phase 2 tests + full suite green + per-component commit/push verified
+- [x] Embeddings validated-only (embed-vl-1b-v2 + input_type; others rejected)
+- [x] Rerank validated-only (unavailable → graceful off)
+- [x] Explainable ranking (no semantic-drowning, no CoT leak)
+- [x] Dedup + conflict + expiration + project memory
+- [x] Agent integration (single-agent subsystem)
+- [x] Chat learning (preferences from conversation) + planner obeys memory
+- [x] Phase 2 tests + full suite green + per-component commit/push verified
 
 ### P2.6 Verification requirements (per logical change)
 
@@ -198,7 +199,38 @@ recorded below. Never claim commit/push without evidence.
   topics + learning + planner enrichment + agent integration).
   Verification: 50/50 new pass; FULL suite **163 passed** (113 baseline + 50
   new), zero regressions; test-run DB had 0 rows and was removed.
-  Commit/push: PENDING (checkpoint with this change).
+  Commit/push: DONE — commit `3ddb1b8`, push `866eaf8..3ddb1b8 main ->
+  main`, in sync verified 2026-09-25.
+
+### P2.9 Phase 2 completion state (final, verified 2026-09-25)
+
+- Persistent memory works across restarts: SQLite `backend/data/
+  jarvis_memory.db` (WAL); verified by two-instance test + smoke.
+- Structured types: working/user/project/episodic/semantic/procedural.
+- Retrieval works: candidates → relevance → optional embed → optional
+  rerank → confidence/importance/recency → project → budget-capped select.
+- Explicit remember/forget/correct/show work on the real store, including
+  inside `AgentCore.process()` (bypasses planning, no fake forget —
+  hard DELETE verified by re-search).
+- Provenance (5 sources) + confidence (HIGH/MEDIUM/LOW) on every record;
+  conflicts supersede with history (never silent), LOW never beats HIGH.
+- Dedup (fingerprint + near-duplicate consolidation), expiration
+  (per-record, auto-marked, purged; stable types never auto-expire).
+- Project memory: 16 curated facts, idempotent seed, USER/PROJECT scoping.
+- Embeddings: ONLY `nvidia/llama-nemotron-embed-vl-1b-v2` (registry-checked,
+  correct query/passage `input_type`); nemoretriever/nv-embed-v1/nv-embedcode
+  rejected as UNVERIFIED. No live embed call was made in Phase 2 work
+  (offline-safe; cosine path covered with fake vectors).
+- Rerank: `llama-nemotron-rerank-vl-1b-v2` UNVERIFIED → graceful off,
+  input order preserved (verified by test).
+- Chat learning: `learn_from_exchange` banks stable choices from ordinary
+  conversation as MEDIUM; planner LLM prompt carries bounded memory block;
+  rule path byte-identical (proven by test). Frequency weight makes
+  often-used memories surface more — use improves recall.
+- Tests: 50 new in `backend/agent/test_phase2_memory.py`; FULL suite 163
+  passed (113 baseline intact). Every logical change committed + pushed:
+  `4a1553c`, `1cbe579`, `6d8e179`, `75ac930`, `866eaf8`, `3ddb1b8`
+  (+ this final plan update next). No Phase 3 work started.
 
 ---
 
