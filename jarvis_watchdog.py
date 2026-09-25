@@ -222,6 +222,68 @@ class JarvisSupervisor:
             log("Watchdog shutdown requested by user.")
             return False
 
+    def _attempt_visible_repair(self, t_file: str, t_line: int, t_err: str,
+                                  summary_path: str) -> dict:
+        """Run the repair inside the popup cmd window and settle the result.
+
+        Snapshot the original, pop the interactive shell (it runs `opencode`
+        visibly and signals done_<token>.txt), wait, then validate + archive
+        the fixed COPY and restore the original. Any failure returns a
+        non-success dict so the caller falls back to headless recovery.
+        """
+        import time as _time
+        try:
+            import crash_report
+            with open(t_file, "rb") as f:
+                snapshot = f.read()
+        except OSError as e:
+            return {"status": "error",
+                    "message": f"Could not snapshot original: {e}"}
+        try:
+            backup_path = recovery_engine.create_backup(t_file, tag="crash_recovery")
+        except Exception:
+            backup_path = ""
+        try:
+            token, job = crash_report.pop_interactive_repair_console(
+                summary_path, t_file, t_line, t_err)
+        except Exception as e:
+            return {"status": "error", "message": f"Popup failed: {e}"}
+        self._crash_token = token
+        self._repair_job = job
+        if not token or not job.get("donefile"):
+            return {"status": "error",
+                    "message": "No interactive window (non-Windows or popup blocked)"}
+        log(f"Waiting for the visible repair session (token {token})...")
+        deadline = _time.time() + 1800
+        exit_code = None
+        while _time.time() < deadline:
+            if os.path.exists(job["donefile"]):
+                try:
+                    with open(job["donefile"], "r", encoding="utf-8",
+                              errors="replace") as f:
+                        exit_code = int((f.read() or "").strip() or 0)
+                except (OSError, ValueError):
+                    exit_code = -1
+                break
+            _time.sleep(5)
+        if exit_code is None:
+            return {"status": "error",
+                    "message": "Visible window closed or timed out waiting"}
+        if exit_code != 0:
+            return {"status": "error",
+                    "message": f"Visible opencode run exited with code {exit_code}"}
+        try:
+            settled = recovery_engine.validate_and_archive_visible_fix(
+                t_file, snapshot, backup_path)
+        except Exception as e:
+            return {"status": "error", "message": f"Settle failed: {e}"}
+        if not settled.get("valid"):
+            return {"status": "error", "message": settled.get("message", "")}
+        log(f"Repaired file archived: {settled['repaired_copy']}")
+        return {"status": "success", "file": t_file, "backup": backup_path,
+                "repaired_copy": settled["repaired_copy"],
+                "message": settled.get("message", "")}
+
     def handle_crash(self) -> bool:
         """Capture crash log, call recovery engine, and decide whether to restart."""
         self.recovery_count += 1
@@ -244,18 +306,18 @@ class JarvisSupervisor:
         print("!"*65 + "\n")
 
         # User-facing crash report: plain-language summary under
-        # "STARTUP CRASH/" + ONE cmd window that also waits for and shows
-        # the repair summary. Copy-only repair: the original is never written.
+        # "STARTUP CRASH/". Then the interactive repair shell (ONE cmd
+        # window: summary -> any key -> cd to project -> visible
+        # `opencode run` -> transcript -> fix summary in the SAME window).
+        # Copy-only throughout: the original is never written.
         self._crash_token = None
+        self._repair_job = {}
+        summary_path = ""
         try:
             import crash_report
             summary_path = crash_report.write_crash_summary(
                 crash_output, parsed, self.recovery_count)
             log(f"Crash summary written: {summary_path}")
-            self._crash_token = crash_report.pop_crash_console(
-                summary_path,
-                os.path.basename(t_file) if t_file else "unknown",
-                t_err or "")
         except Exception as e:
             log(f"Crash summary step failed (non-fatal): {e}")
 
@@ -263,6 +325,24 @@ class JarvisSupervisor:
             log(f"Max recovery limit ({MAX_CRASH_RECOVERIES}) reached. Halting auto-recovery to prevent infinite loops.")
             log("Please review watchdog_crash.log and fix errors manually.")
             return False
+
+        # ── Visible repair first (Windows + identified file only) ──────
+        if t_file and t_line and os.name == "nt":
+            visible = self._attempt_visible_repair(t_file, t_line, t_err or "",
+                                                   summary_path)
+            if visible.get("status") == "success":
+                try:
+                    import crash_report
+                    crash_report.show_fix_summary(
+                        visible["repaired_copy"],
+                        os.path.basename(t_file),
+                        visible["message"],
+                        token=self._crash_token)
+                except Exception as e:
+                    log(f"Fix-summary step failed (non-fatal): {e}")
+                return self.prompt_user_after_recovery(visible)
+            log(f"Visible repair unavailable/failed ({visible.get('message')}) — "
+                f"falling back to headless recovery.")
 
         log("Invoking Independent Guardian Recovery Engine...")
         result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,

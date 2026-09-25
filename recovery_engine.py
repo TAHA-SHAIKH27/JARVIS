@@ -464,13 +464,12 @@ def _get_opencode_timeout() -> int:
     return max(60, min(timeout, 3600))
 
 
-def _repair_via_opencode(target_file: str, target_line: int,
-                         error_msg: str) -> tuple[bool, str]:
-    """Let the local `opencode run` session fix ONLY the culprit lines.
+def build_opencode_prompt(target_file: str, target_line: int,
+                          error_msg: str) -> tuple[str, str]:
+    """Build the short error-focused repair prompt for the local session.
 
-    The model edits the file in place; this function validates the result.
-    Callers snapshot/restore the original when copy-only mode is required.
-    Returns (valid, message). Never raises — failures return (False, reason).
+    Returns (prompt, excerpt). Shared by the headless runner and the visible
+    cmd-shell flow so both send the identical instruction.
     """
     try:
         with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -479,16 +478,15 @@ def _repair_via_opencode(target_file: str, target_line: int,
         try:
             with open(target_file, "r", encoding="utf-16", errors="replace") as f:
                 lines = f.read().splitlines()
-        except OSError as e:
-            return False, f"Could not read file: {e}"
+        except OSError:
+            return "", ""
     total = len(lines)
     if total == 0:
-        return False, "File is empty"
+        return "", ""
     start = max(1, int(target_line or 1) - 10)
     end = min(total, int(target_line or 1) + 10)
     excerpt = "\n".join(f"Line {i}: {lines[i - 1][:220]}"
                         for i in range(start, end + 1))
-
     prompt = (
         f"Crash repair task in file {os.path.basename(target_file)} "
         f"(full path: {target_file}).\n"
@@ -499,6 +497,61 @@ def _repair_via_opencode(target_file: str, target_line: int,
         "or reformat anything else. Do NOT ask questions — apply the fix "
         "directly and reply with one line describing what you changed."
     )
+    return prompt, excerpt
+
+
+def validate_and_archive_visible_fix(target_file: str, snapshot: bytes,
+                                     backup_path: str) -> dict:
+    """Settle a repair performed by the visible cmd-shell session.
+
+    Validates the current file content; on success archives a fixed COPY
+    under FIXED CRASH FILE/ and ALWAYS restores the original bytes, so the
+    project file ends untouched either way.
+    """
+    try:
+        with open(target_file, "rb") as f:
+            current = f.read()
+    except OSError as e:
+        return {"valid": False, "repaired_copy": None,
+                "message": f"Could not read file after visible repair: {e}"}
+    is_valid, val_msg = validate_python_file(target_file)
+    # Restore the original no matter what — copy-only guarantee.
+    try:
+        with open(target_file, "wb") as f:
+            f.write(snapshot)
+    except OSError as e:
+        return {"valid": False, "repaired_copy": None,
+                "message": f"Original restore failed (manual check needed): {e}"}
+    if not is_valid:
+        return {"valid": False, "repaired_copy": None,
+                "message": f"Visible repair did not validate: {val_msg}"}
+    try:
+        fixed_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "FIXED CRASH FILE")
+        os.makedirs(fixed_dir, exist_ok=True)
+        stem, ext = os.path.splitext(os.path.basename(target_file))
+        dest = os.path.join(
+            fixed_dir, f"{stem}_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
+        with open(dest, "wb") as f:
+            f.write(current)
+    except OSError as e:
+        return {"valid": False, "repaired_copy": None,
+                "message": f"Validated but archive failed: {e}"}
+    return {"valid": True, "repaired_copy": dest,
+            "message": f"Visible session repaired and validated; copy archived. Original untouched."}
+
+
+def _repair_via_opencode(target_file: str, target_line: int,
+                         error_msg: str) -> tuple[bool, str]:
+    """Headless twin of the visible repair: run the local session, validate.
+
+    The model edits the file in place; this function validates the result.
+    Callers snapshot/restore the original when copy-only mode is required.
+    Returns (valid, message). Never raises — failures return (False, reason).
+    """
+    prompt, _excerpt = build_opencode_prompt(target_file, target_line, error_msg)
+    if not prompt:
+        return False, "Could not read file for prompt"
     timeout = _get_opencode_timeout()
     # Windows npm shims are .CMD/.PS1 files, not real executables, so
     # resolve via shutil.which and route through the right interpreter.

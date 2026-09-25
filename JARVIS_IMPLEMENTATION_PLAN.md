@@ -133,6 +133,15 @@ comes from reading the integration and call paths.
   self-verified with test runs — deeper than Glimmer's syntax-only fix. Fixed
   en route: npm-shim launch (.CMD via cmd /c) and cp1252 decode crashes.
   Verified the agent touched nothing else in the repo.
+- **Visible repair shell (your flow, 2026-09-26)**: the popup cmd window is now
+  the repair shell — summary, press any key, `cd` to the project root,
+  `opencode run` executes visibly with the prompt file attached (`-f`, no
+  quoting pain), transcript saved + tail shown, watchdog validates/archives
+  the fixed COPY, restores your untouched original, and the fix summary prints
+  in the SAME window. Unknown-file/non-Windows/closed-window/timeout cases
+  fall back to the headless path automatically. Verified: bat contains the
+  full chain; settle archives + restores byte-identical on success and
+  restores on invalid edits too; fallback refuses cleanly with no model call.
 - **Race round 2 (2026-09-26)**: Glimmer re-run 7.1s VALID (unbeaten);
   gemma-3-4b-it / granite-8b-code / mistral-nemo-minitron-8b / kimi-k2.6 all
   404 (listed but not servable on this key), gpt-oss-20b 180s timeout.
