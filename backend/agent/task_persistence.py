@@ -192,6 +192,33 @@ class TaskCheckpointStore:
                 (cutoff,)).fetchall()
             return [self._task_row(c, r) for r in rows]
 
+    def experience_context(self, query: str, limit: int = 6) -> str:
+        """Compact verified prior-task experience for future planning."""
+        q = (query or "").strip()
+        with self._lock, self._connect() as c:
+            rows = c.execute(
+                "SELECT * FROM task_history WHERE event_type IN "
+                "('checkpoint_verified','completed','partial','failed') "
+                "ORDER BY created_at DESC LIMIT 300").fetchall()
+        tokens = set(x.casefold() for x in q.split() if len(x) > 2)
+        scored = []
+        for row in rows:
+            payload = self._loads(row["payload_json"], {})
+            text = json.dumps(payload, ensure_ascii=False).casefold()
+            score = sum(1 for t in tokens if t in text)
+            if row["event_type"] == "checkpoint_verified":
+                score += 1
+            if score:
+                scored.append((score, row["created_at"], row["event_type"], row["step_index"], payload))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        lines = []
+        for score, _, event_type, step, payload in scored[:max(1, int(limit))]:
+            if event_type == "checkpoint_verified":
+                lines.append(f"- Verified prior step {step}: {str(payload.get('result') or payload.get('verification') or '')[:500]}")
+            else:
+                lines.append(f"- Prior task outcome [{event_type}]: {str(payload)[:500]}")
+        return "\n".join(lines) if lines else "No relevant verified prior experience."
+
     def search_history(self, query: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as c:
             if query.strip():
