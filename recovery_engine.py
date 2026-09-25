@@ -369,6 +369,76 @@ def _get_repair_model() -> str:
     return model or REPAIR_MODEL_DEFAULT
 
 
+# Muse Spark (Meta Model API) — optional surgical-repair contender.
+# Key: config.json "muse_api_key" or MODEL_API_KEY env. Absent key = clean
+# refusal (caller falls back to the NVIDIA path); never mandatory, no new deps.
+MUSE_API_URL = "https://api.meta.ai/v1/chat/completions"
+MUSE_MODEL_DEFAULT = "muse-spark-1.3"
+
+
+def _get_muse_config() -> tuple[str, str]:
+    """Return (api_key, model). Empty key means 'not configured'."""
+    config = load_config()
+    key = (str(config.get("muse_api_key", "") or "").strip()
+           or os.environ.get("MODEL_API_KEY", "").strip())
+    try:
+        model = str(config.get("muse_repair_model", "") or "").strip()
+    except Exception:
+        model = ""
+    return key, model or MUSE_MODEL_DEFAULT
+
+
+def call_muse(prompt: str, system_prompt: str = "", model: str = None) -> str:
+    """Query Muse Spark via Meta Model API (OpenAI-compatible, stdlib only).
+
+    Raises RuntimeError when no key is configured — callers treat that as
+    'not available' and fall back to the NVIDIA repair path.
+    """
+    api_key, default_model = _get_muse_config()
+    if not api_key:
+        raise RuntimeError("Muse (Meta Model API) key not configured. "
+                           "Add \"muse_api_key\" to config.json or set MODEL_API_KEY.")
+    model_name = model or default_model
+    max_retries, backoff = _get_retry_config()
+    timeout = _get_nemotron_timeout()
+
+    payload = {
+        "model": model_name,
+        "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else [])
+                    + [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": _get_nemotron_output_tokens(),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        MUSE_API_URL, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"})
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            log_recovery_event("MUSE_REQUEST", f"Attempt {attempt}/{max_retries}",
+                               {"model": model_name, "timeout_seconds": timeout})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            choices = body.get("choices") or []
+            content = ((choices[0] or {}).get("message") or {}).get("content", "") if choices else ""
+            if content and content.strip():
+                log_recovery_event("MUSE_SUCCESS", f"Muse responded on attempt {attempt}")
+                return content
+            raise RuntimeError("Empty response from Muse")
+        except Exception as e:
+            last_error = e
+            log_recovery_event("MUSE_ERROR", f"Attempt {attempt} failed: {str(e)}",
+                               {"attempt": attempt, "max_retries": max_retries})
+            if attempt < max_retries:
+                time.sleep(backoff * attempt)
+                continue
+
+    raise RuntimeError(f"Muse failed after {max_retries} attempts. Last error: {last_error}")
+
+
 def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, traceback_text: str) -> tuple[bool, str]:
     """Surgically repair a focused line window around target_line without rewriting the whole file."""
     with open(target_file, "r", encoding="utf-8", errors="replace") as f:
