@@ -124,8 +124,21 @@ recorded below. Never claim commit/push without evidence.
 
 - 2026-09-25 — Audit + baseline (113 passed) + created this Phase 2 section.
   Files changed: `IMPLEMENTATION_PLAN.md`. Verification: full pytest 113
-  passed; `python --version` 3.14.0, sqlite 3.50.4. Commit/push: PENDING
-  (first checkpoint next).
+  passed; `python --version` 3.14.0, sqlite 3.50.4. Commit/push: DONE —
+  commit `4a1553c` "Phase 2: add implementation plan (audit + 113-test
+  baseline)", `git push origin main` → `dacaec4..4a1553c main -> main`,
+  `git status -sb` shows `main...origin/main` in sync (verified 2026-09-25).
+- 2026-09-25 — Schema + SQLite storage (+ legacy migration).
+  Files created: `backend/agent/memory_schema.py` (6 types, 5 sources,
+  HIGH/MEDIUM/LOW, sensitivity, active/superseded/expired, validation,
+  corrupt-tolerant `from_dict`), `backend/agent/memory_store.py` (SQLite
+  `backend/data/jarvis_memory.db`, WAL, FTS5-or-LIKE candidates, indexes,
+  hard-delete forget, `record_access`, `mark_expired`, legacy JSON migrate).
+  Files modified: `IMPLEMENTATION_PLAN.md` (this log). Verification:
+  `py_compile` clean; smoke (tmp DB): add→get→list→candidates→restart
+  new-instance persist→delete all OK; existing `test_phase1_memory` +
+  `test_phase1_runtime` 11 passed; no stray DB in `backend/data`.
+  Commit/push: PENDING (checkpoint with this change).
 
 ---
 
