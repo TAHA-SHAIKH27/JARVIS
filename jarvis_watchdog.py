@@ -148,90 +148,19 @@ class JarvisSupervisor:
         log(f"Saved crash output to {CRASH_LOG}")
         return full_output
 
-    def prompt_user_after_recovery(self, result: dict) -> bool:
-        """
-        Ask user confirmation after recovery with smart options if rejected.
-        """
-        target_file = result.get("file", "unknown")
-        backup_path = result.get("backup", "")
-        basename = os.path.basename(target_file)
-
-        print("\n" + "="*65)
-        print(f" [GUARDIAN] AI Auto-Repair Succeeded for: {basename}")
-        if backup_path:
-            print(f" [GUARDIAN] Original Backup Preserved at: {backup_path}")
-        print("="*65)
-
-        try:
-            choice = input(f"\n[GUARDIAN] Start J.A.R.V.I.S. now? [Y/n] (Press Enter for Yes): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            choice = "y"
-
-        if choice in ["", "y", "yes"]:
-            log(f"User approved startup. Launching J.A.R.V.I.S. backend...")
-            return True
-
-        # User chose 'N' -> Provide smart action options
-        print("\n" + "-"*65)
-        print(" [GUARDIAN] What would you like to do?")
-        print("   [R] Rollback: Revert file to original backup copy")
-        print("   [M] Manual Edit: Pause supervisor so you can edit in your IDE")
-        print("   [Q] Quit: Shut down J.A.R.V.I.S. supervisor")
-        print("-"*65)
-
-        try:
-            sub_choice = input("[GUARDIAN] Select option (R / M / Q): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sub_choice = "q"
-
-        if sub_choice == "r":
-            if backup_path and os.path.exists(backup_path):
-                recovery_engine.restore_backup(backup_path, target_file)
-                log(f"Reverted {basename} back to backup state. Watchdog standing down.")
-            else:
-                log(f"No backup file available to revert.")
-            return False
-
-        elif sub_choice == "m":
-            print(f"\n[GUARDIAN] Supervisor paused. Edit '{basename}' in your IDE now.")
-            try:
-                input("[GUARDIAN] When you have saved your edits in your editor, press [ENTER] to resume: ")
-            except (EOFError, KeyboardInterrupt):
-                pass
-
-            is_valid, val_msg = recovery_engine.validate_python_file(target_file)
-            if is_valid:
-                log(f"Manual edits validated successfully ({val_msg}). Launching J.A.R.V.I.S. backend...")
-                return True
-            else:
-                print(f"[GUARDIAN] Validation Error in your edits: {val_msg}")
-                try:
-                    retry = input("[GUARDIAN] Try launching anyway? [y/N]: ").strip().lower()
-                    return retry in ["y", "yes"]
-                except (EOFError, KeyboardInterrupt):
-                    return False
-
-        else:
-            log("Watchdog shutdown requested by user.")
-            return False
-
-    def _attempt_visible_repair(self, t_file: str, t_line: int, t_err: str,
+    def _attempt_visible_repair(self, targets: list, t_err: str,
                                   summary_path: str) -> dict:
         """Run the repair inside the popup cmd window and settle the result.
 
-        The visible session edits the project file directly (in place); a
-        pre-repair backup is kept for rollback. On settle, a record copy is
-        archived. Any failure returns a non-success dict so the caller falls
-        back to headless recovery.
+        One prompt covers every implicated file. The visible session edits
+        the project files directly (in place, no .backup copies); on settle
+        a record copy per file is archived. Any failure returns a
+        non-success dict so the caller falls back to headless recovery.
         """
         import time as _time
         try:
-            backup_path = recovery_engine.create_backup(t_file, tag="crash_recovery")
-        except Exception:
-            backup_path = ""
-        try:
             token, job = crash_report.pop_interactive_repair_console(
-                summary_path, t_file, t_line, t_err)
+                summary_path, targets, t_err)
         except Exception as e:
             return {"status": "error", "message": f"Popup failed: {e}"}
         self._crash_token = token
@@ -259,14 +188,15 @@ class JarvisSupervisor:
             return {"status": "error",
                     "message": f"Visible opencode run exited with code {exit_code}"}
         try:
-            settled = recovery_engine.validate_and_archive_visible_fix(
-                t_file, backup_path)
+            settled = recovery_engine.settle_visible_repair(targets)
         except Exception as e:
             return {"status": "error", "message": f"Settle failed: {e}"}
         if not settled.get("valid"):
             return {"status": "error", "message": settled.get("message", "")}
-        log(f"Repaired file archived: {settled['repaired_copy']}")
-        return {"status": "success", "file": t_file, "backup": backup_path,
+        log(f"Repaired files archived: {settled['repaired_copy']}")
+        first = (targets or [{}])[0]
+        return {"status": "success", "file": first.get("file", ""),
+                "files": settled.get("repaired", []), "backup": "",
                 "repaired_copy": settled["repaired_copy"],
                 "message": settled.get("message", "")}
 
@@ -295,7 +225,8 @@ class JarvisSupervisor:
         # "STARTUP CRASH/". Then the interactive repair shell (ONE cmd
         # window: summary -> any key -> cd to project -> visible
         # `opencode run` -> transcript -> fix summary in the SAME window).
-        # Copy-only throughout: the original is never written.
+        # Repairs land in place; record copies under FIXED CRASH FILE/.
+        # Success auto-restarts the backend — no manual start needed.
         self._crash_token = None
         self._repair_job = {}
         summary_path = ""
@@ -312,33 +243,42 @@ class JarvisSupervisor:
             log("Please review watchdog_crash.log and fix errors manually.")
             return False
 
-        # ── Visible repair first (Windows + identified file only) ──────
-        if t_file and t_line and os.name == "nt":
-            visible = self._attempt_visible_repair(t_file, t_line, t_err or "",
+        # Every implicated file in ONE repair command.
+        try:
+            targets = recovery_engine.parse_traceback_all(crash_output)
+        except Exception:
+            targets = []
+        if not targets and t_file and os.path.exists(t_file):
+            targets = [{"file": t_file, "line": int(t_line or 0)}]
+
+        # ── Visible repair first (Windows + identified files only) ─────
+        if targets and os.name == "nt":
+            visible = self._attempt_visible_repair(targets, t_err or "",
                                                    summary_path)
             if visible.get("status") == "success":
                 try:
                     import crash_report
+                    names = ", ".join(os.path.basename(p)
+                                      for p in visible.get("files", [])) or "unknown"
                     crash_report.show_fix_summary(
-                        visible["repaired_copy"],
-                        os.path.basename(t_file),
+                        visible["repaired_copy"], names,
                         visible["message"],
                         token=self._crash_token)
                 except Exception as e:
                     log(f"Fix-summary step failed (non-fatal): {e}")
-                return self.prompt_user_after_recovery(visible)
+                log("Repair complete — auto-restarting J.A.R.V.I.S. backend.")
+                return True
             log(f"Visible repair unavailable/failed ({visible.get('message')}) — "
                 f"falling back to headless recovery.")
 
         log("Invoking Independent Guardian Recovery Engine...")
         result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
-                                                   in_place=True)
+                                                   in_place=True,
+                                                   make_backup=False)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
-            # The fixed COPY is already archived by the engine
-            # (result["repaired_copy"]); publish its summary into the SAME
-            # waiting cmd window. The project original was never modified.
+            # Publish the summary; then auto-restart (no manual start).
             try:
                 import crash_report
                 fixed_path = result.get("repaired_copy") or ""
@@ -352,7 +292,8 @@ class JarvisSupervisor:
                     token=getattr(self, "_crash_token", None))
             except Exception as e:
                 log(f"Fix-summary step failed (non-fatal): {e}")
-            return self.prompt_user_after_recovery(result)
+            log("Repair complete — auto-restarting J.A.R.V.I.S. backend.")
+            return True
         elif result.get("status") == "unhealthy_backend":
             # Backend became unhealthy (health check failures) but no code crash detected.
             # The backend just needs restarting, not code patching.
@@ -388,12 +329,13 @@ class JarvisSupervisor:
 
         log("Invoking Independent Recovery Engine for unhealthy backend...")
         result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
-                                                   in_place=True)
+                                                   in_place=True,
+                                                   make_backup=False)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
-            # Copy-only repair: publish the archived fixed copy's summary
-            # (no crash popup exists on this path, so token is None).
+            # Publish the summary, then auto-restart (no manual start).
+            # No crash popup exists on this path, so token is None.
             try:
                 import crash_report
                 fixed_path = result.get("repaired_copy") or ""
@@ -407,7 +349,8 @@ class JarvisSupervisor:
                     token=None)
             except Exception as e:
                 log(f"Fix-summary step failed (non-fatal): {e}")
-            return self.prompt_user_after_recovery(result)
+            log("Repair complete — auto-restarting J.A.R.V.I.S. backend.")
+            return True
         elif result.get("status") == "unhealthy_backend":
             # Backend became unhealthy (health check failures) but no code crash detected.
             # The backend just needs restarting, not code patching.

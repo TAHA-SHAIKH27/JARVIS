@@ -162,15 +162,16 @@ _WAIT_TIMEOUT_S = 1800
 _WAIT_POLL_S = 5
 
 
-def write_repair_prompt(token: str, target_file: str, target_line: int,
+def write_repair_prompt(token: str, targets: list,
                         error_text: str) -> str:
     """Write the exact repair prompt for the visible shell. Returns its path."""
-    from recovery_engine import build_opencode_prompt
-    prompt, _excerpt = build_opencode_prompt(target_file, target_line or 1,
-                                             error_text or "")
+    from recovery_engine import build_opencode_prompt_multi
+    prompt, _excerpts = build_opencode_prompt_multi(targets or [],
+                                                    error_text or "")
     if not prompt:
-        prompt = (f"Crash repair task in file {target_file}, "
-                  f"line {target_line}: {error_text}. Fix minimally.")
+        first = (targets or [{}])[0]
+        prompt = (f"Crash repair task in file {first.get('file', '')}, "
+                  f"line {first.get('line', '')}: {error_text}. Fix minimally.")
     os.makedirs(CRASH_DIR, exist_ok=True)
     path = os.path.join(CRASH_DIR, f"prompt_{token}.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -246,14 +247,18 @@ def _interactive_repair_bat(head_lines: list, token: str, prompt_path: str) -> d
             "fix_file": fix_file, "prompt": prompt_path, "token": token}
 
 
-def pop_interactive_repair_console(summary_path: str, target_file: str,
-                                   target_line: int, error_text: str):
+def pop_interactive_repair_console(summary_path: str, targets: list,
+                                   error_text: str):
     """Pop ONE cmd window that becomes the live repair shell (see above).
 
+    `targets` is [{"file","line"}] — one prompt covers them all.
     Returns (token, job_dict) on popup, else (None, {}). Console print
     happens in both cases.
     """
-    nice_name = os.path.basename(target_file) if target_file else "unknown"
+    first = (targets or [{}])[0]
+    nice_names = ", ".join(os.path.basename(t.get("file", ""))
+                           for t in (targets or []) if t.get("file")) or "unknown"
+    first_line = first.get("line", 0)
     lines = [
         "================================================================",
         "  J.A.R.V.I.S. STARTUP CRASH  -  summary created",
@@ -262,14 +267,14 @@ def pop_interactive_repair_console(summary_path: str, target_file: str,
         f"  Crash summary file:",
         f"  {summary_path}",
         "",
-        f"  Failing file : {nice_name}",
-        f"  Error line   : {target_line or '(unknown)'}",
+        f"  Failing file(s): {nice_names}",
+        f"  Error line   : {first_line or '(unknown)'}",
         f"  Error        : {(error_text or '')[:100]}",
         "",
         "  Press any key in the popup window: it will cd to the",
         "  project, run `opencode` with the repair prompt attached,",
         "  and show the repair summary in the SAME window.",
-        "  The file is fixed directly; a backup is kept for rollback.",
+        "  The file(s) are fixed directly; no backup copies.",
         "",
     ]
     for ln in lines:
@@ -278,8 +283,7 @@ def pop_interactive_repair_console(summary_path: str, target_file: str,
         return None, {}
     token = _stamp()
     try:
-        prompt_path = write_repair_prompt(token, target_file,
-                                          target_line or 1, error_text or "")
+        prompt_path = write_repair_prompt(token, targets or [], error_text or "")
         job = _interactive_repair_bat(lines, token, prompt_path)
         subprocess.Popen(["cmd", "/c", "start", "", job["bat"]],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -318,9 +322,9 @@ def show_fix_summary(archived_path: str, nice_name: str, detail: str,
         "",
         f"  Result : {(detail or 'repaired and validated')[:160]}",
         "",
-        "  Your file was fixed directly in the project.",
-        "  A record copy is saved under FIXED CRASH FILE, and the",
-        "  pre-repair backup under .backup lets you roll back.",
+        "  Your file(s) were fixed directly in the project.",
+        "  A record copy is saved under FIXED CRASH FILE.",
+        "  JARVIS is restarting now — no action needed.",
         "",
     ]
     for ln in lines:

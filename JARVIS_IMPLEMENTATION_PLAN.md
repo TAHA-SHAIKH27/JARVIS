@@ -133,7 +133,12 @@ comes from reading the integration and call paths.
   self-verified with test runs — deeper than Glimmer's syntax-only fix. Fixed
   en route: npm-shim launch (.CMD via cmd /c) and cp1252 decode crashes.
   Verified the agent touched nothing else in the repo.
-- **Visible repair shell (your flow, 2026-09-26)**: the popup cmd window is now
+- **Auto-restart + no backups + multi-file one-shot (2026-09-26)**: success
+  auto-restarts the backend (Y/n prompt removed); no `.backup` copies anywhere
+  in the crash flow (record copies are the artifact); one prompt covers every
+  traceback file. Verified: 2-file prompt/settle, headless `make_backup=False`
+  creates nothing, fallback clean.
+- **Visible repair shell (your flow, 2026-09-26)**: the popup cmd window is
   the repair shell — summary, press any key, `cd` to the project root,
   `opencode run` executes visibly with the prompt file attached (`-f`, no
   quoting pain), transcript saved + tail shown, watchdog validates/archives
