@@ -185,6 +185,13 @@ class JarvisSupervisor:
             sub_choice = "q"
 
         if sub_choice == "r":
+            if result.get("repaired_copy"):
+                # Copy-only repair: the project original was never modified,
+                # so there is nothing to revert — say so and stand down
+                # WITHOUT writing to the original file.
+                log(f"No rollback needed: original {basename} was never modified (copy-only repair).")
+                print(f"\n[GUARDIAN] Nothing to revert, sir — your original '{basename}' was never touched.")
+                return False
             if backup_path and os.path.exists(backup_path):
                 recovery_engine.restore_backup(backup_path, target_file)
                 log(f"Reverted {basename} back to backup state. Watchdog standing down.")
@@ -237,13 +244,15 @@ class JarvisSupervisor:
         print("!"*65 + "\n")
 
         # User-facing crash report: plain-language summary under
-        # "STARTUP CRASH/" + a NEW cmd window telling the user it exists.
+        # "STARTUP CRASH/" + ONE cmd window that also waits for and shows
+        # the repair summary. Copy-only repair: the original is never written.
+        self._crash_token = None
         try:
             import crash_report
             summary_path = crash_report.write_crash_summary(
                 crash_output, parsed, self.recovery_count)
             log(f"Crash summary written: {summary_path}")
-            crash_report.pop_crash_console(
+            self._crash_token = crash_report.pop_crash_console(
                 summary_path,
                 os.path.basename(t_file) if t_file else "unknown",
                 t_err or "")
@@ -256,20 +265,25 @@ class JarvisSupervisor:
             return False
 
         log("Invoking Independent Guardian Recovery Engine...")
-        result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3)
+        result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
+                                                   in_place=False)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
-            # Archive the repaired file under "FIXED CRASH FILE/" and show
-            # the user a repair summary in a cmd window.
+            # The fixed COPY is already archived by the engine
+            # (result["repaired_copy"]); publish its summary into the SAME
+            # waiting cmd window. The project original was never modified.
             try:
                 import crash_report
-                fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
+                fixed_path = result.get("repaired_copy") or ""
+                if not fixed_path:
+                    fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
                 log(f"Repaired file archived: {fixed_path}")
                 crash_report.show_fix_summary(
                     fixed_path,
                     os.path.basename(result.get("file", "") or "unknown"),
-                    result.get("message", ""))
+                    result.get("message", ""),
+                    token=getattr(self, "_crash_token", None))
             except Exception as e:
                 log(f"Fix-summary step failed (non-fatal): {e}")
             return self.prompt_user_after_recovery(result)
@@ -307,20 +321,24 @@ class JarvisSupervisor:
             return False
 
         log("Invoking Independent Recovery Engine for unhealthy backend...")
-        result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3)
+        result = recovery_engine.recover_from_crash(CRASH_LOG, max_retries=3,
+                                                   in_place=False)
         log(f"Recovery Engine Result: {result.get('status')} - {result.get('message')}")
 
         if result.get("status") == "success":
-            # Archive the repaired file under "FIXED CRASH FILE/" and show
-            # the user a repair summary in a cmd window.
+            # Copy-only repair: publish the archived fixed copy's summary
+            # (no crash popup exists on this path, so token is None).
             try:
                 import crash_report
-                fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
+                fixed_path = result.get("repaired_copy") or ""
+                if not fixed_path:
+                    fixed_path = crash_report.archive_fixed_file(result.get("file", ""))
                 log(f"Repaired file archived: {fixed_path}")
                 crash_report.show_fix_summary(
                     fixed_path,
                     os.path.basename(result.get("file", "") or "unknown"),
-                    result.get("message", ""))
+                    result.get("message", ""),
+                    token=None)
             except Exception as e:
                 log(f"Fix-summary step failed (non-fatal): {e}")
             return self.prompt_user_after_recovery(result)

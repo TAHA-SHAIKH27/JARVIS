@@ -111,6 +111,13 @@ comes from reading the integration and call paths.
   watchdog `--test-mode` + recovery `--check` pass. NOT live-tested: actual
   `start cmd` popup (no GUI in this container) and end-to-end Nemotron repair
    of a real crash — needs your Windows run.
+- **Single-window + copy-only repair (your correction)**: only ONE cmd popup
+  opens; it waits in place (polls up to 30 min) and prints the repair summary
+  in the SAME window. `recover_from_crash(..., in_place=False)` repairs a
+  staging copy — the project original is never written (verified
+  byte-identical after repair; legacy `in_place=True` default preserved for
+  the `--recover` CLI). Rollback prompt skips writes in copy-only mode; the
+  fixed copy is the deliverable and you copy it over yourself after review.
 
 ## 7. What needs your manual Windows/live testing
 1. `python -m pytest` full suite on the host (numpy there is healthy).
