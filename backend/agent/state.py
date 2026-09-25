@@ -221,6 +221,15 @@ class TaskState:
     task_started_at: str = ""
     phase1_initialized: bool = False
 
+    # Durable task continuity (checkpoint store is shared with Phase 2 SQLite).
+    checkpoint_schema_version: int = 1
+    checkpoint_version: int = 0
+    checkpoint_status: str = "new"
+    resume_requested: bool = False
+    resume_from_step: Optional[int] = None
+    last_checkpoint_kind: str = ""
+    last_checkpoint_verified: bool = False
+
     # Separated contexts
     conversation: ConversationContext = field(default_factory=ConversationContext)
     task_context: TaskContext = field(default_factory=TaskContext)
@@ -278,6 +287,31 @@ class TaskState:
         object.__setattr__(self, "memory_context", value)
         self.update_context("memory_context", value)
         return value
+
+    def checkpoint_snapshot(self) -> Dict[str, Any]:
+        """Return a bounded, persistence-safe snapshot for task continuity.
+
+        Raw tool payloads and secrets are deliberately excluded; detailed
+        execution history will be persisted by the universal history layer.
+        """
+        return {
+            "schema_version": self.checkpoint_schema_version,
+            "task_id": self.task_id,
+            "task": self.task[:2000],
+            "interpreted_goal": self.interpreted_goal[:1000],
+            "task_type": self.task_type.value if isinstance(self.task_type, TaskType) else str(self.task_type),
+            "current_step": int(self.current_step),
+            "completed_steps": sorted(int(x) for x in self.completed_steps),
+            "verified_steps": sorted(int(x) for x in self.verified_steps),
+            "failed_steps": {str(k): {"classification": str(v.get("classification", ""))}
+                             for k, v in self.failed_steps.items()},
+            "status": self.completion_status or self.checkpoint_status,
+            "checkpoint_version": int(self.checkpoint_version),
+            "last_checkpoint_kind": self.last_checkpoint_kind,
+            "last_checkpoint_verified": bool(self.last_checkpoint_verified),
+            "final_outcome_verified": bool(self.final_outcome_verified),
+            "task_started_at": self.task_started_at,
+        }
 
     def update_context(self, key: str, value: Any) -> None:
         self._context[key] = value
