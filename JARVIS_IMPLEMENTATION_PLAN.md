@@ -46,10 +46,15 @@ keep what is correct, and correct/complete only the gaps.
   router + legacy paths both plan with it (bounded 1500 chars, failure-silent,
   guidance-only wording). Verified: planner imports OK; seeded verified
   checkpoint retrieved via `experience_context()`.
-- [ ] G2. Scheduler has NO `reschedule` operation and `handle_schedule_command`
+- [x] G2. Scheduler has NO `reschedule` operation and `handle_schedule_command`
   parses no reschedule phrasing ("move X to …", "reschedule X to …").
-  FIX: add `reschedule_scheduled()` + command wiring. Duplicate-send protection
-  exists (status transitions pending→sent/failed/cancelled) — keep.
+  FIXED 2026-09-25: added `reschedule_scheduled()` (pending-only, future-time
+  guard, >1yr refusal; never touches sent/failed/cancelled so history is never
+  rewritten and delivery can't duplicate) + NL wiring for
+  reschedule/move/postpone/shift/change. Verified: schedule→reschedule→list
+  (new time shown)→cancel round-trip passes via both direct calls and
+  `handle_schedule_command`. Duplicate-send protection kept (pending→
+  sent/failed/cancelled transitions).
 - [ ] G3. Resume path records `action_started` but never READS
   `latest_action_started` and never re-observes the environment before
   continuing. FIX: on resume, query in-flight marker, emit a recovery event,

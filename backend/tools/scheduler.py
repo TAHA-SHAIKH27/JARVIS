@@ -349,6 +349,41 @@ def _mark_job(job_id: str, status: str, result: str = "") -> None:
     _save_jobs(jobs)
 
 
+def reschedule_scheduled(fragment: str, when: datetime) -> Dict[str, Any]:
+    """Move a pending job to a new future time. Survives restart (same store).
+
+    Never touches sent/failed/cancelled jobs, so execution history is never
+    rewritten and a delivered message can never be duplicated by rescheduling.
+    """
+    fragment = (fragment or "").strip().casefold()
+    if not fragment:
+        return {"status": "error",
+                "message": "Which scheduled message should I move, sir?"}
+    if when <= _now():
+        return {"status": "error",
+                "message": "That time has already passed, sir. Please pick a future time."}
+    if (when - _now()) > timedelta(days=366):
+        return {"status": "error", "message": "That is more than a year away, sir."}
+    jobs = _load_jobs()
+    matches = [j for j in jobs if j.get("status") == "pending" and
+               (fragment in str(j.get("contact") or "").casefold()
+                or fragment in str(j.get("message") or "").casefold()
+                or fragment == str(j.get("id") or "").casefold())]
+    if not matches:
+        return {"status": "error",
+                "message": "No pending scheduled message matches that, sir."}
+    if len(matches) > 1:
+        options = "; ".join(f"to {j.get('contact')}" for j in matches[:5])
+        return {"status": "error",
+                "message": f"Multiple match, sir: {options}. Please be more specific."}
+    matches[0]["send_at"] = when.isoformat()
+    _save_jobs(jobs)
+    return {"status": "success",
+            "message": f"Rescheduled, sir. WhatsApp to {matches[0].get('contact')} "
+                       f"now sends {describe_when(when)}.",
+            "job": matches[0]}
+
+
 def fire_due_whatsapp(send_fn: Callable[[str, str], Dict[str, Any]],
                       on_result: Callable[[Dict[str, Any], Dict[str, Any]], None]) -> int:
     """Send every due job via send_fn(contact, message). Returns fired count."""
@@ -502,6 +537,29 @@ def handle_schedule_command(text: str) -> Optional[Dict[str, Any]]:
         return _response(f"Reminder set for {when_s}, sir: {parsed['text'][:160]}.",
                          f"REMINDER SET: '{parsed['text'][:80]}' for {when_s}",
                          {"reminder": saved.get("reminder")})
+
+    # -- reschedule scheduled whatsapp ("reschedule/move/postpone X to <time>") --
+    if re.search(r"\b(reschedul\w*|move|postpone|shift|change)\b", lowered) and \
+            ("schedul" in lowered or "whatsapp" in lowered):
+        # Strip the leading verb FIRST so the time span offsets below refer
+        # to the same string they are applied to.
+        frag = re.sub(r"^\s*(?:please\s+)?(?:reschedule|move|postpone|shift|change)\b\s*",
+                      "", raw, flags=re.I).strip()
+        frag = re.sub(r"\b(?:the\s+)?scheduled(\s+whatsapp)?(\s+message)?\b\s*(to\s+)?",
+                      "", frag, flags=re.I).strip()
+        frag = re.sub(r"^whatsapp\s+(?:message\s+)?to\s+", "", frag, flags=re.I).strip()
+        parsed_when = parse_when(frag)
+        if not parsed_when.get("ok"):
+            return _response("When should I move it to, sir? Try 'at 6pm' or 'in 2 hours'.",
+                             "SCHEDULED WA reschedule: no time found")
+        # Fragment = text minus the time span.
+        span = parsed_when.get("span")
+        if span:
+            frag = _strip_span(frag, span).strip(" .,-:")
+        frag = re.sub(r"\s+to\s*$", "", frag, flags=re.I).strip()
+        result = reschedule_scheduled(frag, parsed_when["when"])
+        return _response(result.get("message", ""),
+                         f"SCHEDULED WA reschedule: {result.get('status')}", result)
 
     # -- new scheduled whatsapp --
     if "whatsapp" in lowered and re.search(r"\b(schedule|at\b|in\s+\d|tomorrow|today|tonight)\b", lowered):
