@@ -1,50 +1,77 @@
-# JARVIS Implementation Plan — 2026-09-25
+# JARVIS Implementation Plan — Final Audit, Correction & Completion
 
-## Objective
-Implement the requested upgrades directly in the existing JARVIS architecture while preserving the one-agent design, Gemini/Nemotron roles, free/local-first constraints, existing memory system, and regression safety.
+## Audit timestamp
+2026-09-25 (final audit pass, local workspace inspection — no blind rewrites).
 
-## Guardrails
-- One agent with many tools; no multi-agent rewrite.
-- Gemini remains primary reasoning; Nemotron remains coding/tooling.
-- Local fallback is optional and never silently replaces configured models.
-- No paid API/subscription requirement and no unnecessary dependencies.
-- Extend existing state/planner/executor/recovery/memory systems; do not create competing state systems.
-- A step becomes resumable only after verification.
-- Previous actions are never blindly replayed.
+## Audit objective
+Verify each required system against its ACTUAL implementation/integration/call path,
+keep what is correct, and correct/complete only the gaps.
 
-## Phase 1 — Reliability Core (CRITICAL)
-- [x] Added backend/agent/task_persistence.py with SQLite task state, checkpoints and universal task history.
-- [x] Integrated durable task creation/resume into AgentCore.process.
-- [x] Persisted an action_started marker before real-world execution.
-- [x] Persisted action observation/result/verification events.
-- [x] Persisted a checkpoint only after the existing verifier reports success.
-- [x] Resume starts after the highest verified checkpoint and restores verified completed steps.
-- [x] Added plan serialization/deserialization so resumable tasks can reuse their saved plan.
-- [x] Added verified prior-task experience retrieval.
-- [x] Connected prior verified experience to the existing planner context.
-- [ ] Add/execute dedicated checkpoint/restart regression tests locally.
-- [ ] Add stronger in-flight recovery verification for the narrow crash window after an external side effect but before observer persistence.
+## Requirements vs current status (verified by reading code, not filenames)
 
-## Phase 2 — Memory + Documents + WhatsApp
-- [x] Existing automatic memory extraction is preserved through learn_from_exchange with confidence, privacy, deduplication and conflict rules.
-- [x] Existing persistent memory remains the source of user/project facts.
-- [x] Added Memory → Experience → Future Action bridge through verified task history.
-- [x] Existing document_intel.py already supports PDF/DOCX/PPTX/TXT/MD and image/scanned-document OCR paths; existing research/document generation pipeline remains intact.
-- [x] Existing backend/tools/scheduler.py already contains persistent reminders and scheduled WhatsApp jobs with tests.
-- [ ] Further improve document semantic indexing/provenance and expose it more deeply to task planning.
-- [ ] Perform a live WhatsApp scheduled-send/reschedule/cancel verification on Windows.
+### Already correct — LEAVE ALONE
+- Durable task checkpoints + universal history (`backend/agent/task_persistence.py`,
+  SQLite, atomic writes): task/checkpoint/history tables, verified-only checkpoint,
+  `action_started` journaling, `latest_action_started`, `search_history`,
+  `history_for_task`, `recoverable_tasks`. Integrated in `core.py process()`
+  (create/resume, plan persist, observe persist, checkpoint only after verifier
+  success, resume after highest verified step, final `mark()`).
+- Plan serialization (`serialize_plan`/`deserialize_plan`) wired into resume path.
+- Local Ollama fallback (`backend/agent/local_model.py`, stdlib-only): availability
+  probe, model select, `generate_plan`; called in `planner._call_gemini_for_plan`
+  ONLY after Gemini/NVIDIA paths fail. Gemini primary + Nemotron coding roles kept.
+- Memory: explicit remember/forget/correct/show (`memory_api.JarvisMemory`),
+  privacy refusal, dedup, conflict/supersede authority rules, expiration,
+  project scope; auto-extraction via `learn_from_exchange` (MEDIUM/conversation,
+  never overwrites HIGH) called from `core._memory_store_outcome`. Phase 1
+  `phase1_memory` legacy path intact.
+- Observer/Verifier (`observer.py`/`verifier.py`): ACTION→OBSERVE→VERIFY with
+  filesystem/DOM/UIA checks, failure classification, bounded retry/replan,
+  human-in-the-loop for login/captcha.
+- WhatsApp: contact search inside WhatsApp itself (no `contact.json` — correct),
+  phone-number deep-link flow, ADB phone route, scheduler store
+  (`scheduled_whatsapp.json`, survives restart), list/cancel, 30s ticker firing
+  via `main.py`, success/failure status tracking.
+- Uncommitted local work (executor browser-pro actions, screenshot-dir mirroring,
+  verifier fatal fast-path, computer/browser/system_ops improvements) is
+  legitimate feature work — MUST be preserved, verified, then committed.
 
-## Phase 3 — Local Fallback + Hardening
-- [x] Added stdlib-only backend/agent/local_model.py for optional Ollama availability detection and planning.
-- [x] Added local fallback after configured remote planner providers fail.
-- [x] Existing Gemini/NVIDIA routes remain ahead of local fallback.
-- [ ] Add local-model integration tests with a mocked Ollama endpoint.
-- [ ] Run the complete local regression suite and fix any regressions.
-- [ ] Add stronger task-history UI/API access if required by the frontend.
-- [ ] Final architecture/documentation cleanup.
+### Gaps found (partial/incorrect/missing — fix minimally)
+- [ ] G1. Experience reaches the LLM only via the `install_planner_context_bridge`
+  monkey-patch on the legacy `_call_gemini_for_plan` path (installed from
+  `state.initialize_phase1`). The Model-Router path (`_call_router_for_plan`)
+  and direct `planner.plan_task` callers that never trigger the bridge get NO
+  prior-experience context. FIX: inject `experience_context()` directly in
+  `planner.plan_task` next to the existing `phase2_memory_context` block.
+- [ ] G2. Scheduler has NO `reschedule` operation and `handle_schedule_command`
+  parses no reschedule phrasing ("move X to …", "reschedule X to …").
+  FIX: add `reschedule_scheduled()` + command wiring. Duplicate-send protection
+  exists (status transitions pending→sent/failed/cancelled) — keep.
+- [ ] G3. Resume path records `action_started` but never READS
+  `latest_action_started` and never re-observes the environment before
+  continuing. FIX: on resume, query in-flight marker, emit a recovery event,
+  and take a fresh `observer.observe()` snapshot before executing.
+- [ ] G4. Document pipeline extracts full text (+OCR) but has no provenance /
+  section / retrieval record linking document knowledge to tasks. FIX (minimal):
+  add stdlib provenance helper in `document_intel.py` (sections + chunk index
+  + source record) without touching the existing extract/generate pipeline.
+- [ ] G5. `JARVIS_TASK_DB` default (`jarvis_tasks.db` at repo root) and scheduler
+  JSON stores are untracked runtime artifacts — verify `.gitignore` covers them
+  so commits stay clean.
+- [ ] G6. Full pytest suite cannot run in THIS environment: Python 3.14 +
+  installed numpy crashes the interpreter at import (access violation in
+  `numpy/_core/multiarray`). Verification here uses targeted stdlib-only checks
+  (task_persistence, local_model, scheduler, planner imports); full regression
+  must run on the Windows JARVIS machine.
 
-## Git workflow completed so far
-Each implemented code step was committed directly to the GitHub main branch: plan update, durable task persistence, plan serialization, core checkpoint/resume integration, in-flight action markers, verified experience retrieval, planner-context experience bridge, and local Ollama fallback.
+## Planned corrections (one edit → verify → plan → commit → push each)
+1. Planner experience injection (G1).
+2. Scheduler reschedule + command wiring (G2).
+3. Core resume re-observation + in-flight check (G3).
+4. Document provenance helper (G4).
+5. Commit preserved local work + full-report rewrite of this file.
 
 ## Verification status
-GitHub commits were successfully created for every implemented step. The connected GitHub environment does not expose a runnable local Windows test environment for this repository, and no workflow run was available for the latest commits. Therefore no claim is being made that the full test suite has passed yet. The next verification step must be performed on the Windows JARVIS machine before treating the reliability changes as production-ready.
+- Targeted imports OK: task_persistence, local_model, scheduler (2026-09-25).
+- Full suite: NOT yet run (blocked by numpy/Py3.14 crash in this container;
+  must run on Windows host). No "all tests pass" claim is made.
