@@ -464,67 +464,152 @@ def _get_opencode_timeout() -> int:
     return max(60, min(timeout, 3600))
 
 
+def parse_traceback_all(traceback_text: str, limit: int = 5) -> list:
+    """Collect EVERY workspace file/line frame from a traceback (innermost
+    last in the text, returned most-recent-first), deduplicated. Lets one
+    repair prompt cover multi-file crashes. Returns
+    [{"file": str, "line": int}]. Stdlib only, never raises."""
+    found = []
+    seen = set()
+    workspace_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        lines = (traceback_text or "").strip().splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        try:
+            match = re.search(r'File "([^"]+)", line (\d+)', line)
+        except Exception:
+            continue
+        if not match:
+            continue
+        raw_path = match.group(1)
+        try:
+            lineno = int(match.group(2))
+        except (ValueError, TypeError):
+            continue
+        f_path = raw_path if os.path.isabs(raw_path) else os.path.join(workspace_dir, raw_path)
+        try:
+            ok = os.path.exists(f_path) and not is_protected(f_path)
+        except Exception:
+            ok = False
+        if not ok:
+            continue
+        key = (os.path.normcase(f_path), lineno)
+        if key not in seen:
+            seen.add(key)
+            found.append({"file": f_path, "line": lineno})
+        if len(found) >= max(1, limit):
+            break
+    # Most recent call last in text = deepest frame last; repair prompt
+    # reads best with the culprit (deepest) first.
+    found.reverse()
+    return found
+
+
 def build_opencode_prompt(target_file: str, target_line: int,
                           error_msg: str) -> tuple[str, str]:
-    """Build the short error-focused repair prompt for the local session.
+    """Single-target wrapper around the multi-target builder below."""
+    prompt, excerpts = build_opencode_prompt_multi(
+        [{"file": target_file, "line": target_line}], error_msg)
+    return prompt, excerpts[0] if excerpts else ""
 
-    Returns (prompt, excerpt). Shared by the headless runner and the visible
-    cmd-shell flow so both send the identical instruction.
+
+def build_opencode_prompt_multi(targets: list, error_msg: str) -> tuple[str, list]:
+    """Build ONE repair prompt covering every implicated file.
+
+    Returns (prompt, [excerpt_per_target]). Shared by the headless runner
+    and the visible cmd-shell flow so both send the identical instruction.
     """
-    try:
-        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
-    except OSError:
+    sections = []
+    excerpts = []
+    others = []  # files beyond the excerpted ones (still named, still in scope)
+    for pos, target in enumerate(list(targets or [])):
+        path = (target or {}).get("file", "")
+        lineno = int((target or {}).get("line", 0) or 0)
         try:
-            with open(target_file, "r", encoding="utf-16", errors="replace") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
         except OSError:
-            return "", ""
-    total = len(lines)
-    if total == 0:
-        return "", ""
-    start = max(1, int(target_line or 1) - 10)
-    end = min(total, int(target_line or 1) + 10)
-    excerpt = "\n".join(f"Line {i}: {lines[i - 1][:220]}"
-                        for i in range(start, end + 1))
-    prompt = (
-        f"Crash repair task in file {os.path.basename(target_file)} "
-        f"(full path: {target_file}).\n"
-        f"Error at line {target_line}: {error_msg}\n\n"
-        f"Suspect lines:\n{excerpt}\n\n"
-        "Rules: fix ONLY these lines with the minimal change that resolves "
-        "the error. Do NOT modify any other file. Do NOT refactor, rename, "
-        "or reformat anything else. Do NOT ask questions — apply the fix "
-        "directly and reply with one line describing what you changed."
-    )
-    return prompt, excerpt
+            try:
+                with open(path, "r", encoding="utf-16", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+        total = len(lines)
+        if total == 0:
+            continue
+        if pos < 5:
+            start = max(1, lineno - 10)
+            end = min(total, (lineno or 1) + 10)
+            excerpt = "\n".join(f"Line {i}: {lines[i - 1][:220]}"
+                                for i in range(start, end + 1))
+            excerpts.append(excerpt)
+            sections.append(
+                f"FILE {pos + 1}: {os.path.basename(path)} (full path: {path})\n"
+                f"Error line: {lineno}\n"
+                f"Suspect lines:\n{excerpt}")
+        else:
+            others.append(f"- {os.path.basename(path)} line {lineno} ({path})")
+    if not sections:
+        return "", []
+    head = (f"Crash repair task. The startup crash involves {len(sections)} "
+            f"file(s); the reported error is: {error_msg}\n\n"
+            + "\n\n".join(sections))
+    if others:
+        head += ("\n\nAlso implicated (same crash, inspect if needed):\n"
+                 + "\n".join(others))
+    head += ("\n\nRules: fix ONLY the suspect lines above with the minimal "
+             "change that resolves the error. You may touch ONLY the files "
+             "listed here — no other file. Do NOT refactor, rename, or "
+             "reformat anything else. Do NOT ask questions — apply the fix "
+             "directly and reply with one line per file describing what you "
+             "changed.")
+    return head, excerpts
 
 
-def validate_and_archive_visible_fix(target_file: str, backup_path: str) -> dict:
+def settle_visible_repair(targets: list) -> dict:
     """Settle a repair performed by the visible cmd-shell session.
 
-    The session edits the project file directly (in place). This validates
-    the result and stores a record COPY under FIXED CRASH FILE/. The
-    pre-repair backup remains the rollback path.
+    The session edits the project files directly (in place). Every listed
+    file must validate; each gets a record COPY under FIXED CRASH FILE/.
+    No .backup copies — the record copies are the only artifacts.
+    Returns {"valid": bool, "repaired": [paths...], "repaired_copy": first,
+             "message": str}.
     """
-    is_valid, val_msg = validate_python_file(target_file)
-    if not is_valid:
-        return {"valid": False, "repaired_copy": None,
-                "message": f"Visible repair did not validate: {val_msg}"}
-    try:
-        fixed_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "FIXED CRASH FILE")
-        os.makedirs(fixed_dir, exist_ok=True)
-        stem, ext = os.path.splitext(os.path.basename(target_file))
-        dest = os.path.join(
-            fixed_dir, f"{stem}_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
-        with open(target_file, "rb") as src, open(dest, "wb") as out:
-            out.write(src.read())
-    except OSError as e:
-        return {"valid": False, "repaired_copy": None,
-                "message": f"Validated but archive failed: {e}"}
-    return {"valid": True, "repaired_copy": dest,
-            "message": f"Visible session repaired and validated in place; record copy archived."}
+    fixed_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "FIXED CRASH FILE")
+    repaired = []
+    copies = []
+    problems = []
+    for target in list(targets or []):
+        path = (target or {}).get("file", "")
+        if not path:
+            continue
+        is_valid, val_msg = validate_python_file(path)
+        if not is_valid:
+            problems.append(f"{os.path.basename(path)}: {val_msg}")
+            continue
+        try:
+            os.makedirs(fixed_dir, exist_ok=True)
+            stem, ext = os.path.splitext(os.path.basename(path))
+            dest = os.path.join(
+                fixed_dir, f"{stem}_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext or '.py'}")
+            with open(path, "rb") as src, open(dest, "wb") as out:
+                out.write(src.read())
+            repaired.append(path)
+            copies.append(dest)
+        except OSError as e:
+            problems.append(f"{os.path.basename(path)}: archive failed: {e}")
+    if problems or not repaired:
+        detail = "; ".join(problems)[:300] if problems else "no files repaired"
+        return {"valid": False, "repaired": repaired,
+                "repaired_copy": copies[0] if copies else None,
+                "message": f"Visible repair incomplete: {detail}"}
+    names = ", ".join(os.path.basename(p) for p in repaired)
+    return {"valid": True, "repaired": repaired,
+            "repaired_copy": copies[0],
+            "message": f"Visible session repaired {names} in place; record copies archived."}
 
 
 def _repair_via_opencode(target_file: str, target_line: int,
@@ -642,7 +727,7 @@ def _repair_window_attempt(target_file: str, target_line: int, error_msg: str, t
 
 
 def recover_from_crash(crash_log_path: str, max_retries: int = 3,
-                       in_place: bool = True) -> dict:
+                       in_place: bool = True, make_backup: bool = True) -> dict:
     """
     Analyze crash log, locate broken file, create backup, query NVIDIA NIM for a minimal fix,
     apply patch, validate, and retry up to max_retries. If all fail, auto-rollback.
@@ -655,6 +740,9 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
                    result["repaired_copy"]; the original is never written.
                    Kept for API compatibility; the watchdog now repairs
                    in place (in_place=True).
+    make_backup=False: skip .backup copies entirely (watchdog crash flow —
+                   record copies under FIXED CRASH FILE/ are the artifact).
+                   Rollback is then unavailable by design.
     """
     if not os.path.exists(crash_log_path):
         return {"status": "error", "message": f"Crash log not found: {crash_log_path}"}
@@ -719,9 +807,9 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
     print(f"[RECOVERY] Mode: {'in-place repair' if in_place else 'COPY-ONLY repair (original untouched)'}")
     print(f"[RECOVERY] ========================================")
 
-    # Create master backup before attempting any modifications (read-only copy,
-    # kept as a safety record even in copy-only mode).
-    backup_path = create_backup(target_file, tag="crash_recovery")
+    # Master backup unless the caller opted out (watchdog crash flow keeps
+    # only FIXED CRASH FILE/ record copies).
+    backup_path = create_backup(target_file, tag="crash_recovery") if make_backup else ""
 
     # Copy-only mode: all repair + validation happens on a staging copy inside
     # "FIXED CRASH FILE/". The project original is never opened for writing.
@@ -841,9 +929,11 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
         except RuntimeError as e:
             print(f"\n[RECOVERY] Nemotron self-healing engine unavailable: {e}")
             log_recovery_event("RECOVERY_NEMOTRON_UNAVAILABLE", str(e))
-            if in_place:
+            if in_place and backup_path:
                 restore_backup(backup_path, target_file)
                 msg = "Nemotron self-healing engine unavailable after retries. Rolled back safely."
+            elif in_place:
+                msg = "Nemotron self-healing engine unavailable after retries. No backup was kept (make_backup=False)."
             else:
                 _discard_work_copy()
                 msg = "Nemotron self-healing engine unavailable after retries. Original file was NOT modified."
@@ -917,13 +1007,17 @@ def recover_from_crash(crash_log_path: str, max_retries: int = 3,
             current_error = str(e)
             time.sleep(1)
 
-    # If all attempts failed: in-place mode rolls back; copy-only mode simply
-    # discards the staging copy (the original was never touched).
-    if in_place:
+    # If all attempts failed: in-place mode rolls back when a backup exists;
+    # copy-only mode simply discards the staging copy.
+    if in_place and backup_path:
         print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Rolling back to original state...")
         log_recovery_event("RECOVERY_FAILED_ROLLED_BACK", f"All repair attempts failed for {os.path.basename(target_file)}")
         restore_backup(backup_path, target_file)
         msg = f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts. Rolled back safely."
+    elif in_place:
+        print(f"\n[RECOVERY] FAILED: All recovery attempts failed. No backup was kept (make_backup=False).")
+        log_recovery_event("RECOVERY_FAILED", f"All repair attempts failed for {os.path.basename(target_file)}")
+        msg = f"Could not safely repair {os.path.basename(target_file)} after surgical and fallback attempts."
     else:
         print(f"\n[RECOVERY] FAILED: All recovery attempts failed. Discarding work copy (original untouched)...")
         log_recovery_event("RECOVERY_FAILED_DISCARDED", f"All repair attempts failed for {os.path.basename(target_file)}")
