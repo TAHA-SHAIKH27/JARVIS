@@ -759,3 +759,148 @@ usdcode, usdvalidate.
 - [x] `IMPLEMENTATION_PLAN.md` updated (this file only)
 
 STOPPING here. Phase 2 not started.
+
+# NEXT ROADMAP — TASK CONTINUITY + EXPERIENCE INTELLIGENCE + PRODUCTIVITY
+
+## N1. Date / Time
+- **Created:** 2026-09-25 UTC
+- **Status:** PLANNED — implementation must proceed one logical step at a time.
+- **Rule:** Do not claim a feature is complete until code, focused tests, relevant regression tests, and (where required) live Windows verification prove it.
+
+## N2. User-approved scope
+1. **Task Resume / Checkpointing — VERY VERY VERY IMPORTANT**
+2. **Automatic Memory Extraction**
+3. **Memory → Experience → Future Action**
+4. **Universal Task History**
+5. **Better Document Intelligence**
+6. **WhatsApp Scheduling**
+7. **Local Model Fallback**
+
+## N3. Architecture constraints
+- Keep **one agent with many tools**; do not introduce a multi-agent architecture.
+- Keep Gemini as the primary reasoning path and Nemotron as the coding/tooling path where configured; local models are fallback, never silent replacement.
+- Keep FastAPI + React.
+- Keep local-first/free/no mandatory paid API keys.
+- Do not reintroduce ADB/phone/watchdog work.
+- Do not duplicate the existing memory database, reminder store, scheduler, or task state; extend them.
+- Checkpoint state must be durable, atomic, versioned, validated, and safe against duplicate side effects.
+- A checkpoint is **not complete** until the corresponding step has passed verification.
+- Resumption must re-observe the environment before replaying any action whose side effect may already have occurred.
+- Secrets/tokens must never be written into task history, checkpoints, or experience records.
+
+## N4. Execution protocol
+For EVERY logical step:
+**INSPECT → DESIGN → EDIT/CREATE → IMPORT/SMOKE VERIFY → FOCUSED TESTS → REGRESSION TESTS → REVIEW DIFF → UPDATE THIS FILE → COMMIT → PUSH → VERIFY PUSH → NEXT.**
+
+Never batch unrelated changes into one unverified step. If verification fails, stop and fix before proceeding.
+
+## N5. Phase A — Task continuity (highest priority)
+### A1. Checkpoint schema/store
+- Add durable task-run/checkpoint records using the existing persistence architecture.
+- Store task id, plan version, current step, completed verified steps, pending steps, status, timestamps, tool/action metadata, observation summary, verification result, retry/recovery state, and schema version.
+- Atomic writes + corruption tolerance + migration/versioning.
+- No secrets or raw sensitive payloads.
+- Tests: restart persistence, malformed record, concurrent-safe update, idempotent save.
+
+### A2. Checkpoint-aware AgentCore
+- Persist state at safe boundaries: task start, before side-effectful action, after action, after observation, after verification, and on failure/pause.
+- Resume only from the latest valid checkpoint.
+- Reconcile state with the current environment before continuing.
+- Prevent already-completed side effects from being repeated.
+- Preserve existing interruption/recovery behavior.
+
+### A3. Pause / Resume / Continue / Cancel
+- Natural-language and API support.
+- Explicit task status.
+- Resume by task id or unambiguous recent task.
+- Clear behavior for completed/failed/cancelled/expired checkpoints.
+
+### A4. Crash/restart test matrix
+- Process restart.
+- Backend restart.
+- Interrupted tool call.
+- Failure after side effect but before verification.
+- Failure after verification but before checkpoint persistence.
+- Corrupt checkpoint.
+- Duplicate resume request.
+- Multiple resume attempts.
+- Full regression suite.
+
+## N6. Phase B — Universal task history
+- Persist a searchable event/task history linked to checkpoint/task ids.
+- Record plan, action, observation, verification, recovery, result, artifact/file references, tests, and commit references where available.
+- Add natural-language recall/search.
+- Keep history separate from long-term memory semantics while allowing verified outcomes to feed experience memory.
+- Redact secrets and sensitive data.
+- Tests for ordering, persistence, search, redaction, and restart.
+
+## N7. Phase C — Automatic memory extraction
+- Extract only useful durable facts/preferences/constraints from conversation and completed tasks.
+- Classify user/project/semantic/procedural/episodic information.
+- Use confidence and provenance already present in Phase 2.
+- Never let low-confidence extraction silently overwrite explicit high-confidence memory.
+- Do not store transient chatter, secrets, unnecessary PII, or raw full conversations.
+- Add dedup/conflict/forget/correction tests.
+
+## N8. Phase D — Memory → Experience → Future Action
+- Create a first-class experience/procedure representation on top of existing episodic/procedural memory.
+- Capture successful approach, relevant preconditions, tools used, failure/recovery lessons, verification evidence, and outcome.
+- Retrieve relevant experiences during planning.
+- Experiences are advisory evidence, not blind macros.
+- Re-observe current state and verify every reused procedure.
+- After successful completion, update experience confidence/outcome statistics.
+- After failure, record the failure lesson without treating it as truth until verified.
+- Add tests proving a prior verified experience changes the planner context for a later related task.
+
+## N9. Phase E — Better document intelligence
+- Extend existing Office/research pipeline instead of creating a parallel document subsystem.
+- PDF/DOCX/PPTX ingestion and structured extraction.
+- Tables, headings, metadata, OCR fallback where currently supported.
+- Chunk/index documents with provenance.
+- Semantic retrieval tied to project/task memory.
+- Document comparison and source-aware answers.
+- Research → cited Word/PPT generation remains intact.
+- Tests for extraction, provenance, retrieval, malformed documents, and artifact verification.
+
+## N10. Phase F — WhatsApp scheduling
+- Extend existing scheduler and WhatsApp operations.
+- Natural-language schedule/list/cancel/reschedule.
+- Saved-contact resolution.
+- Persistent jobs survive restart.
+- Explicit job states: pending/running/sent/failed/cancelled.
+- Idempotent execution and duplicate-send protection.
+- Verification/reporting based only on actual execution evidence.
+- Live Windows/WhatsApp verification required before declaring delivery complete.
+
+## N11. Phase G — Local model fallback
+- Extend the existing Model Router.
+- Keep Gemini/Nemotron preferences intact.
+- Add optional local Ollama-compatible provider only when detected/configured.
+- Capability-based routing, health checks, timeout, graceful fallback.
+- No mandatory downloads, paid keys, or silent cloud-to-local model substitution.
+- Tests with mocked local provider + unavailable-local path.
+- Live local-model verification only if a model is actually installed by the user.
+
+## N12. Definition of done
+A feature is complete only when:
+- implementation exists and is integrated;
+- focused tests pass;
+- relevant existing tests pass;
+- no secrets/artifacts are accidentally committed;
+- the implementation plan records exact verification evidence;
+- the logical change has its own focused Git commit;
+- push is verified against origin/main;
+- live Windows verification is recorded for behavior that cannot be proven by unit tests.
+
+## N13. Current work status
+- [ ] A1 Checkpoint schema/store
+- [ ] A2 AgentCore checkpoint integration
+- [ ] A3 Pause/resume/cancel
+- [ ] A4 Restart/crash matrix
+- [ ] B Universal task history
+- [ ] C Automatic memory extraction
+- [ ] D Memory → Experience → Future Action
+- [ ] E Better document intelligence
+- [ ] F WhatsApp scheduling hardening/live verification
+- [ ] G Local model fallback
+
