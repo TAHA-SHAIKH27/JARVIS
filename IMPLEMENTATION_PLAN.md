@@ -154,7 +154,21 @@ recorded below. Never claim commit/push without evidence.
   Verification: registry resolves embed id with zero network calls;
   rerank None/False (matches Phase 1 UNVERIFIED verdict); lexical smoke
   ranks "favorite color: blue" above "favorite food: pizza"; 11 Phase 1
-  tests still pass. Commit/push: PENDING (checkpoint with this change).
+  tests still pass. Commit/push: DONE — commit `6d8e179`, push
+  `1cbe579..6d8e179 main -> main`, in sync verified 2026-09-25.
+- 2026-09-25 — Memory API + explicit controls + privacy + dedup/conflict/expiry.
+  Files created: `backend/agent/memory_api.py` (`JarvisMemory`: add/search/
+  retrieve/update/delete/forget/list/explain + remember + purge_expired +
+  memory_context + `handle_explicit_command` for Remember/Don't-remember/
+  What-remember/Forget/Correct/Show; secret blocklist refusal; PII→sensitive;
+  fingerprint+overlap dedup; topic-key conflicts with supersede-history and
+  low-authority refusal; per-read `mark_expired`; hard-delete forget;
+  project-scoped ranking with graceful embed/rerank). Verification:
+  `py_compile` clean; smoke (tmp DB): dedup, supersede (active=1/history=2),
+  LOW-vs-HIGH refusal, 2 secret refusals, search/retrieve/explain, update,
+  5 explicit commands incl. real forget (dog count 0), expiry, context
+  budget all OK; 11 Phase 1 tests pass; no stray DB. Commit/push: PENDING
+  (checkpoint with this change).
 
 ---
 
