@@ -392,16 +392,33 @@ class AgentCore:
                 }
                 await event_queue.put(event)
 
-        # ── Initialise state ──────────────────────────────────────────────
+        # ── Initialise/resume durable task state ─────────────────────────
+        # A resumable task is loaded before volatile fields are reset. The
+        # persisted checkpoint is authoritative only for VERIFIED steps.
+        from backend.agent.task_persistence import get_task_store, serialize_plan, deserialize_plan
+        _task_store = get_task_store()
+        _resume_record = _task_store.start_or_resume(task, task_id=getattr(state, "task_id", "") or None)
+        _resume_mode = bool(_resume_record.get("checkpoints")) and _resume_record.get("status") not in ("completed",)
+        _resume_step = int(_resume_record.get("current_step", 0) or 0) if _resume_mode else 0
         state.task = task
-        state.errors = []
-        state.completed_steps = []
-        state.current_step = 0
-        state.retry_count = 0
-        state.completion_status = None
-        state.observations = []
-        state.action_outputs = {}
-        state.failed_steps = {}
+        if not _resume_mode:
+            state.errors = []
+            state.completed_steps = []
+            state.current_step = 0
+            state.retry_count = 0
+            state.completion_status = None
+            state.observations = []
+            state.action_outputs = {}
+            state.failed_steps = {}
+        else:
+            state.current_step = _resume_step
+            state.completed_steps = [int(x["step_index"]) for x in _resume_record.get("checkpoints", [])
+                                     if x.get("status") == "verified"]
+            state.observations = [x.get("observation", {}) for x in _resume_record.get("checkpoints", [])
+                                  if x.get("status") == "verified"]
+            state.action_outputs = {int(x["step_index"]): x.get("result", {})
+                                    for x in _resume_record.get("checkpoints", [])
+                                    if x.get("status") == "verified"}
         state.human_verification_required = False
         state.human_verification_message = ""
         state.human_verification_resolved = False
@@ -471,7 +488,18 @@ class AgentCore:
         # router timeout). Run it in a worker thread so the server event loop
         # stays responsive to health checks and the SSE stream stays alive.
         try:
-            actions = await asyncio.to_thread(self.planner.plan_task, task, state)
+            if _resume_mode and _resume_record.get("plan", {}).get("actions"):
+                state.plan = deserialize_plan(_resume_record["plan"])
+                actions = state.plan.actions
+            else:
+                actions = await asyncio.to_thread(self.planner.plan_task, task, state)
+                _task_store.save_state(
+                    _resume_record["task_id"], "running", 0,
+                    plan=serialize_plan(state.plan),
+                    state={"task": task},
+                    event_type="plan_created",
+                    payload={"steps": len(actions)},
+                )
         except Exception as e:
             await emit("error", f"Planning failed: {str(e)}", icon="✗")
             return {"status": "error", "task": task, "errors": [str(e)]}
@@ -633,6 +661,22 @@ class AgentCore:
                 state.completed_steps.append(action_index)
                 completed_indices.add(action_index)
                 state.observations.append(observation)
+
+                # Durable checkpoint: ONLY verified steps become resumable.
+                try:
+                    _task_store.checkpoint(
+                        _resume_record["task_id"], action_index,
+                        action.to_dict() if hasattr(action, "to_dict") else {
+                            "type": action.type, "description": action.description,
+                            "parameters": action.parameters,
+                        },
+                        observation or {}, result or {}, verification or {},
+                        state={"task": task, "status": "running"},
+                    )
+                except Exception as _checkpoint_error:
+                    # Persistence failure is recorded but never masquerades as
+                    # a successful checkpoint.
+                    state.errors.append(f"Checkpoint persistence error: {_checkpoint_error}")
 
                 # Store structured output for data flow
                 if result:
@@ -891,6 +935,15 @@ class AgentCore:
         # ── Phase 2: MEMORY UPDATE — bank the verified outcome ────────────
         self._memory_store_outcome(task, state.completion_status or "unknown",
                                    speak_text)
+        try:
+            _task_store.mark(
+                _resume_record["task_id"], state.completion_status or "failed",
+                getattr(state, "current_step", 0),
+                {"speak": speak_text, "errors": state.errors,
+                 "final_verification": final_verification},
+            )
+        except Exception:
+            pass
 
         return {
             "status": state.completion_status,
