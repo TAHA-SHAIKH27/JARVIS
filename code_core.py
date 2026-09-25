@@ -374,25 +374,70 @@ def _byte_compile_python(filepath: str) -> None:
         py_compile.compile(filepath, cfile=cfile, doraise=True)
 
 
+# Directories never scanned (dependencies, build output, runtime/user data).
+_AUDIT_SKIP_DIRS = {
+    ".git", "__pycache__", ".pytest_cache", "node_modules", "dist", "build",
+    "out", ".next", "work_files", "downloads", ".backup", "whisper.cpp",
+    "ws-scrcpy", "venv", "env", ".venv",
+}
+
+# File types the startup audit understands.
+_AUDIT_PY_EXTS = (".py",)
+_AUDIT_JS_EXTS = (".jsx", ".js", ".mjs", ".cjs")
+
+
+def _discover_audit_files() -> tuple[list, list]:
+    """Walk the workspace and return (python_files, js_files) as workspace-
+    relative paths. Skips dependency/build/runtime dirs so a 800MB
+    node_modules can never stall startup. Stdlib only, never raises."""
+    py_files: list = []
+    js_files: list = []
+    try:
+        for root, dirs, files in os.walk(WORKSPACE_ROOT):
+            # Prune skipped dirs in-place so os.walk never descends into them.
+            dirs[:] = [d for d in dirs if d not in _AUDIT_SKIP_DIRS
+                       and not d.startswith(".pytest_cache")]
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                try:
+                    rel = os.path.relpath(full, WORKSPACE_ROOT)
+                except ValueError:
+                    continue
+                if rel.startswith(".."):
+                    continue
+                lower = name.lower()
+                if lower.endswith(_AUDIT_PY_EXTS):
+                    py_files.append(rel)
+                elif lower.endswith(_AUDIT_JS_EXTS):
+                    js_files.append(rel)
+    except Exception:
+        pass
+    # Fall back to the original core list if discovery yields nothing.
+    if not py_files and not js_files:
+        py_files = [
+            "main.py", "agent.py", "system_ops.py", "code_core.py",
+            "recovery_engine.py", "jarvis_watchdog.py", "phone_control.py",
+        ]
+        js_files = [
+            os.path.join("src", "App.jsx"),
+            os.path.join("src", "Header.jsx"),
+            os.path.join("src", "Telemetry.jsx"),
+            os.path.join("src", "CommandGrid.jsx"),
+            os.path.join("src", "CoreSphere.jsx"),
+        ]
+    return py_files, js_files
+
+
 def audit_codebase() -> dict:
     """
     Perform a complete read-only self-audit of JARVIS's source code.
-    Scans Python and JavaScript files for syntax errors, unhandled exceptions, and warnings.
+    Discovers every workspace .py / .jsx / .js / .mjs / .cjs file (skipping
+    dependencies, build output and runtime data dirs) and checks Python
+    syntax via AST + py_compile and JS modules for duplicate exports.
     NEVER modifies any files.
     """
     issues = []
-    py_files = [
-        "main.py", "agent.py", "system_ops.py", "code_core.py",
-        "recovery_engine.py", "jarvis_watchdog.py", "phone_control.py"
-    ]
-    
-    js_files = [
-        os.path.join("src", "App.jsx"),
-        os.path.join("src", "Header.jsx"),
-        os.path.join("src", "Telemetry.jsx"),
-        os.path.join("src", "CommandGrid.jsx"),
-        os.path.join("src", "CoreSphere.jsx"),
-    ]
+    py_files, js_files = _discover_audit_files()
 
     total_checked = 0
 
@@ -403,10 +448,28 @@ def audit_codebase() -> dict:
             continue
         total_checked += 1
 
+        # Read source encoding-aware (UTF-8 first, UTF-16 BOM fallback —
+        # a stale UTF-16 duplicate must not fail the whole audit).
+        try:
+            with open(full_path, "rb") as f:
+                raw = f.read()
+            if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+                source = raw.decode("utf-16", errors="replace")
+            else:
+                source = raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            issues.append({
+                "file": rel_path,
+                "line": 0,
+                "line_range": [0, 0],
+                "severity": "critical_syntax_error",
+                "message": f"Read failure: {str(e)}",
+                "snippet": ""
+            })
+            continue
+
         # Syntax check via AST
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                source = f.read()
             ast.parse(source, filename=rel_path)
         except SyntaxError as se:
             start_line = int(se.lineno or 0)
@@ -436,6 +499,23 @@ def audit_codebase() -> dict:
         try:
             _byte_compile_python(full_path)
         except py_compile.PyCompileError as pe:
+            # py_compile reads raw bytes: a valid UTF-16 file trips its
+            # "null bytes" guard. Re-validate from the decoded source instead.
+            if "null bytes" in str(pe):
+                try:
+                    compile(source, rel_path, "exec")
+                    continue
+                except SyntaxError as se2:
+                    start_line = int(se2.lineno or 0)
+                    issues.append({
+                        "file": rel_path,
+                        "line": start_line,
+                        "line_range": [start_line, int(getattr(se2, "end_lineno", None) or start_line)],
+                        "severity": "compilation_error",
+                        "message": f"Compile error: {se2.msg}",
+                        "snippet": ""
+                    })
+                    continue
             issues.append({
                 "file": rel_path,
                 "line": 0,
