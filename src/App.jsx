@@ -477,6 +477,18 @@ export default function App() {
     }
   }, [])
 
+  const refreshGmailStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/gmail/status')
+      if (res.ok) {
+        const data = await res.json()
+        setGmailLinked(!!data.linked)
+      } else setGmailLinked(false)
+    } catch {
+      setGmailLinked(false)
+    }
+  }, [])
+
   useEffect(() => { refreshOAuthStatus() }, [refreshOAuthStatus])
   useEffect(() => { if (settingsOpen) refreshOAuthStatus() }, [settingsOpen, refreshOAuthStatus])
   useEffect(() => { refreshGmailStatus() }, [refreshGmailStatus])
@@ -968,18 +980,6 @@ export default function App() {
       setTimeout(() => setOauthMsg(''), 3500)
     }
   }
-
-  const refreshGmailStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/gmail/status')
-      if (res.ok) {
-        const data = await res.json()
-        setGmailLinked(!!data.linked)
-      } else setGmailLinked(false)
-    } catch {
-      setGmailLinked(false)
-    }
-  }, [])
 
   async function linkGmail() {
     setGmailBusy(true)

@@ -147,6 +147,54 @@ def _start_startup_code_audit():
     except Exception as e:
         print(f"[startup-audit] Could not start audit thread: {e}", file=sys.stderr)
 
+
+def _is_proactor_reset_noise(context: dict) -> bool:
+    """True only for the known Windows proactor wart: an abrupt browser /
+    health-poll disconnect surfacing as ConnectionResetError inside
+    _call_connection_lost. Harmless — the server keeps serving."""
+    try:
+        exc = context.get("exception")
+        if not isinstance(exc, ConnectionResetError):
+            return False
+        blob = f"{context.get('callback', '')} {context.get('message', '')}"
+        return "_call_connection_lost" in blob or "connection_lost" in blob
+    except Exception:
+        return False
+
+
+@app.on_event("startup")
+def _quiet_proactor_disconnects():
+    """Swallow exactly the proactor-reset noise; every other asyncio error
+    still goes to the default handler untouched."""
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        prev = loop.get_exception_handler()
+    except Exception:
+        prev = None
+
+    def _handler(loop, context):
+        try:
+            if _is_proactor_reset_noise(context):
+                return
+        except Exception:
+            pass
+        try:
+            if prev is not None:
+                prev(loop, context)
+            else:
+                loop.default_exception_handler(context)
+        except Exception:
+            pass
+
+    try:
+        loop.set_exception_handler(_handler)
+    except Exception:
+        pass
+
 # Configuration persistence
 CONFIG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "config.json"))
 

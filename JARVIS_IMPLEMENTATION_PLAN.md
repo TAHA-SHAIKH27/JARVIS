@@ -133,6 +133,16 @@ comes from reading the integration and call paths.
   self-verified with test runs — deeper than Glimmer's syntax-only fix. Fixed
   en route: npm-shim launch (.CMD via cmd /c) and cp1252 decode crashes.
   Verified the agent touched nothing else in the repo.
+- **Blank-screen fix (2026-09-26, from your live log)**: `refreshGmailStatus`
+  was used in effects at App.jsx:482 before its `const` declaration at :972
+  (TDZ ReferenceError → blank page). Hoisted the callback next to
+  `refreshOAuthStatus`; verified single declaration + all uses after it, and
+  scanned sibling callbacks (one `refreshFiles` hit was a false positive —
+  inside a hoisted function body). Also silenced the harmless Windows
+  proactor `ConnectionResetError` noise in `main.py` via a targeted asyncio
+  handler (exact-match filter, unit-tested; all other errors untouched).
+  Honest note: the startup audit can't catch JS TDZ — it checks syntax +
+  duplicate exports only.
 - **Auto-restart + no backups + multi-file one-shot (2026-09-26)**: success
   auto-restarts the backend (Y/n prompt removed); no `.backup` copies anywhere
   in the crash flow (record copies are the artifact); one prompt covers every
