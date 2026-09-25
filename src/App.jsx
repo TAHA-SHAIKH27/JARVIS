@@ -184,6 +184,15 @@ export default function App() {
 
   const [oauthMsg, setOauthMsg] = useState('')
 
+  const [notices, setNotices] = useState([])
+  const knownNoticeIds = useRef(new Set())
+
+  const [gmailLinked, setGmailLinked] = useState(null)
+
+  const [gmailBusy, setGmailBusy] = useState(false)
+
+  const [gmailMsg, setGmailMsg] = useState('')
+
   const [logs, setLogs] = useState([])
 
   const [chatMode, setChatMode] = useState(false)
@@ -200,6 +209,8 @@ export default function App() {
   const [agentEvents, setAgentEvents] = useState([])
   const [agentRunId, setAgentRunId] = useState('')
   const [agentWaitingForHuman, setAgentWaitingForHuman] = useState(false)
+  const [agentQuestion, setAgentQuestion] = useState(null)
+  const [queuedTasks, setQueuedTasks] = useState([])
   const [voiceEnabled, setVoiceEnabled] = useState(true)
   const [clarificationPending, setClarificationPending] = useState(null)
 
@@ -382,6 +393,32 @@ export default function App() {
     }
   }, [])
 
+  const refreshNotices = useCallback(async () => {
+    try {
+      const res = await fetch('/api/notifications')
+      if (!res.ok) return
+      const data = await res.json()
+      const items = data.notifications || []
+      const fresh = items.filter(n => !knownNoticeIds.current.has(n.id))
+      if (fresh.length) {
+        fresh.forEach(n => knownNoticeIds.current.add(n.id))
+        playBeep()
+      }
+      setNotices(items.slice(0, 5))
+    } catch { }
+  }, [])
+
+  async function dismissNotice(id) {
+    setNotices(prev => prev.filter(n => n.id !== id))
+    try {
+      await fetch('/api/notifications/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(id ? { id } : { all: true })
+      })
+    } catch { }
+  }
+
   const refreshStats = useCallback(async () => {
     try {
       const res = await fetch('/api/stats')
@@ -403,10 +440,11 @@ export default function App() {
     refreshStatus()
     refreshStats()
     refreshFiles()
-    const statusTimer = setInterval(refreshStatus, 8000)
+    refreshNotices()
+    const statusTimer = setInterval(() => { refreshStatus(); refreshNotices() }, 8000)
     const statsTimer = setInterval(refreshStats, 4000)
     return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
-  }, [refreshStatus, refreshStats, refreshFiles])
+  }, [refreshStatus, refreshStats, refreshFiles, refreshNotices])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -441,6 +479,8 @@ export default function App() {
 
   useEffect(() => { refreshOAuthStatus() }, [refreshOAuthStatus])
   useEffect(() => { if (settingsOpen) refreshOAuthStatus() }, [settingsOpen, refreshOAuthStatus])
+  useEffect(() => { refreshGmailStatus() }, [refreshGmailStatus])
+  useEffect(() => { if (settingsOpen) refreshGmailStatus() }, [settingsOpen, refreshGmailStatus])
 
   useEffect(() => { runCommandRef.current = chatMode ? runStreamingChat : runCommand })
 
@@ -562,6 +602,8 @@ export default function App() {
     setAgentEvents([])
     setAgentRunId('')
     setAgentWaitingForHuman(false)
+    setAgentQuestion(null)
+    setQueuedTasks([])
     setAgentStatus('planning')
 
     try {
@@ -603,12 +645,18 @@ export default function App() {
 
             if (type === 'run_started' && event.data?.run_id) setAgentRunId(event.data.run_id)
             if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentWaitingForHuman(true)
+            if (type === 'clarification_required') {
+              const q = event.data?.question || message
+              setAgentWaitingForHuman(true)
+              setAgentQuestion(q)
+              speak(q)
+            }
 
             // Update agent status
             if (type === 'planning' || type === 'plan_created' || type === 'plan_validated') setAgentStatus('planning')
             else if (type === 'step_started' || type === 'tool_started' || type === 'retrying' || type === 'replanning') setAgentStatus('executing')
             else if (type === 'observing' || type === 'verification_started') setAgentStatus('observing')
-            else if (type === 'human_intervention_required' || type === 'waiting_for_user') setAgentStatus('blocked')
+            else if (type === 'human_intervention_required' || type === 'waiting_for_user' || type === 'clarification_required') setAgentStatus('blocked')
             else if (type === 'step_failed' || type === 'verification_failed' || type === 'task_failed' || type === 'error') setAgentStatus('error')
             else if (type === 'task_completed' || type === 'task_partial' || type === 'done') setAgentStatus('completed')
 
@@ -625,7 +673,12 @@ export default function App() {
             if (type === 'task_completed' || type === 'task_partial' || type === 'task_failed') {
               finalSpeak = message
               setAgentWaitingForHuman(false)
+              setAgentQuestion(null)
+              if (Array.isArray(event.data?.queued)) setQueuedTasks(event.data.queued)
             }
+            if (type === 'done') setAgentQuestion(null)
+            if (type === 'task_queued' && Array.isArray(event.data?.queue)) setQueuedTasks(event.data.queue)
+            if (type === 'task_queued_summary' && Array.isArray(event.data?.queued)) setQueuedTasks(event.data.queued)
           } catch { /* ignore parse errors */ }
         }
       }
@@ -641,6 +694,50 @@ export default function App() {
       setAgentStatus('error')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function sendInstruct(text) {
+    // New command while a run is active: merge related changes, queue the rest.
+    setMessages(m => [...m, { role: 'user', text }])
+    setPrompt('')
+    try {
+      const res = await fetch('/api/agent/instruct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: agentRunId, text })
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setAgentEvents(ev => [...ev, { text: `✕ Instruction rejected: ${data.detail || 'run finished'}`, type: 'step_failed' }])
+        return
+      }
+      setAgentEvents(ev => [...ev, { text: `→ ${data.speak || 'Noted, sir.'}`, type: data.status === 'queued' ? 'task_queued' : 'plan_restarted' }])
+      if (Array.isArray(data.queued)) setQueuedTasks(data.queued)
+      if (data.speak) speak(data.speak)
+    } catch {
+      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent instruct endpoint.', type: 'step_failed' }])
+    }
+  }
+
+  async function answerAgentQuestion(answer) {
+    try {
+      const res = await fetch('/api/agent/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: agentRunId, resolution: { answer } })
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setAgentEvents(ev => [...ev, { text: `✕ Could not send answer: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
+        return
+      }
+      setAgentQuestion(null)
+      setAgentWaitingForHuman(false)
+      setAgentStatus('executing')
+      setAgentEvents(ev => [...ev, { text: '▶ Answer received — carrying on.', type: 'resuming' }])
+    } catch {
+      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent resume endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -770,6 +867,20 @@ export default function App() {
   }
 
   function handleSend() {
+    // Answering a live agent question: reply into the paused run, no new task.
+    if (agentWaitingForHuman && agentQuestion && agentRunId) {
+      const answer = prompt.trim()
+      if (!answer) return
+      setMessages(m => [...m, { role: 'user', text: answer }])
+      setPrompt('')
+      answerAgentQuestion(answer)
+      return
+    }
+    // Agent is mid-run: new commands merge into the plan or queue up.
+    if (busy && agentRunId && agentMode && prompt.trim()) {
+      sendInstruct(prompt.trim())
+      return
+    }
     if (pendingImage) { runImageAnalysis(prompt, pendingImage); return }
     if (pendingDocument) { runDocumentAnalysis(prompt, pendingDocument); return }
     if (clarificationPending) {
@@ -858,6 +969,49 @@ export default function App() {
     }
   }
 
+  const refreshGmailStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/gmail/status')
+      if (res.ok) {
+        const data = await res.json()
+        setGmailLinked(!!data.linked)
+      } else setGmailLinked(false)
+    } catch {
+      setGmailLinked(false)
+    }
+  }, [])
+
+  async function linkGmail() {
+    setGmailBusy(true)
+    setGmailMsg('Opening browser to link Gmail (read-only)…')
+    try {
+      const res = await fetch('/api/gmail/login', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) { setGmailMsg(data.message || 'Gmail linked.'); setGmailLinked(true) }
+      else setGmailMsg(data.detail || 'Failed to link Gmail.')
+    } catch {
+      setGmailMsg('Could not reach the core service.')
+    } finally {
+      setGmailBusy(false)
+      setTimeout(() => setGmailMsg(''), 5000)
+    }
+  }
+
+  async function unlinkGmail() {
+    setGmailBusy(true)
+    try {
+      const res = await fetch('/api/gmail/logout', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      setGmailMsg(data.message || 'Gmail unlinked.')
+      setGmailLinked(false)
+    } catch {
+      setGmailMsg('Could not reach the core service.')
+    } finally {
+      setGmailBusy(false)
+      setTimeout(() => setGmailMsg(''), 3500)
+    }
+  }
+
   async function deleteFile(path) {
     try {
       const res = await fetch(`/api/files/delete?filename=${encodeURIComponent(path)}`, { method: 'DELETE' })
@@ -903,6 +1057,23 @@ export default function App() {
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
       <StartupAuditBanner onOpenCode={() => setActiveView('code')} />
+      {/* ── Proactive notifications (Gmail watcher) ── */}
+      {notices.length > 0 && (
+        <div style={{ position: 'fixed', top: 64, right: 16, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360 }}>
+          {notices.map(n => (
+            <div key={n.id} className="modal-box" style={{ padding: '10px 12px', borderLeft: '3px solid var(--cyan)', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+              <MessageSquare size={16} style={{ flexShrink: 0, marginTop: 2, color: 'var(--cyan)' }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{n.title}</div>
+                {n.body && <div style={{ fontSize: 12, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis' }}>{n.body}</div>}
+              </div>
+              <button className="icon-btn" onClick={() => dismissNotice(n.id)} aria-label="Dismiss">
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {/* ── Full-page overlays (Phone / Gallery) ── */}
       {activeView === 'phone' && (
         <PhoneMirrorPage
@@ -1047,10 +1218,10 @@ export default function App() {
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-                placeholder={clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
-                disabled={busy}
+                placeholder={agentQuestion ? `Answer: "${agentQuestion}"` : (busy && agentRunId) ? 'JARVIS is working — instruct or queue…' : clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
+                disabled={busy && !agentRunId && !(agentWaitingForHuman && agentQuestion)}
               />
-              <button className="send-btn" onClick={handleSend} disabled={busy || (!prompt.trim() && !pendingImage && !pendingDocument && !clarificationPending)}>
+              <button className="send-btn" onClick={handleSend} disabled={(busy && !agentRunId && !(agentWaitingForHuman && agentQuestion)) || (!prompt.trim() && !pendingImage && !pendingDocument && !clarificationPending)}>
                 {busy ? '…' : 'SEND'}
               </button>
             </div>
@@ -1109,6 +1280,13 @@ export default function App() {
                   <button className="btn-secondary" onClick={resumeAgentAfterHuman}>RESUME AGENT</button>
                 </div>
               )}
+              {queuedTasks.length > 0 && (
+                <div className="line exec">
+                  ⏳ Queued ({queuedTasks.length}): {queuedTasks[0].slice(0, 70)}{' '}
+                  <button className="btn-secondary" onClick={() => { const [next, ...rest] = queuedTasks; setQueuedTasks(rest); runAgentMode(next) }}>RUN NEXT</button>{' '}
+                  <button className="btn-secondary" onClick={() => setQueuedTasks([])}>CLEAR</button>
+                </div>
+              )}
               {[...agentEvents].reverse().map((ev, i) => (
                 <div key={i} className={`line ${ev.type === 'step_completed' ? 'result' : ev.type === 'step_failed' ? 'exec' : ev.type === 'planning' ? 'exec' : ''}`}>
                   {ev.text}
@@ -1163,6 +1341,23 @@ export default function App() {
               </div>
               {oauthMsg && <div className="save-note" style={{ color: 'var(--cyan)' }}>{oauthMsg}</div>}
               <p className="oauth-hint">Linking lets Jarvis use your Google account for Gemini without an API key.</p>
+            </div>
+
+            {/* Gmail watcher (proactive important-mail announcements) */}
+            <div className="field">
+              <label>Gmail Watcher (important-mail announcements)</label>
+              <div className="oauth-row">
+                <div className="oauth-status">
+                  <span className={`oauth-dot ${gmailLinked === null ? 'checking' : gmailLinked ? 'linked' : ''}`} />
+                  {gmailLinked === null ? 'Checking…' : gmailLinked ? 'Gmail linked' : 'Not linked'}
+                </div>
+                {gmailLinked
+                  ? <button className="btn-secondary" onClick={unlinkGmail} disabled={gmailBusy}>Unlink</button>
+                  : <button className="btn-secondary" onClick={linkGmail} disabled={gmailBusy}>Link Gmail</button>
+                }
+              </div>
+              {gmailMsg && <div className="save-note" style={{ color: 'var(--cyan)' }}>{gmailMsg}</div>}
+              <p className="oauth-hint">Read-only. Jarvis checks on restart + every 30 min and speaks + toasts VIP/urgent mail. VIP senders list: backend/data/gmail_watch.json</p>
             </div>
 
             <div className="field">

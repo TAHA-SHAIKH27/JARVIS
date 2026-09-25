@@ -251,7 +251,14 @@ restart + every 30 min. Important-only: VIP senders or urgent keywords.
   dismiss; `/api/status` shape unchanged), `.gitignore` (gmail
   watch/seen/token). Verification: 10/10 monitor tests; endpoint smoke
   (status/check/notifications/dismiss, unlinked graceful). Commit/push:
-  PENDING (checkpoint with this change).
+  DONE — commit `0f70806`, push `4e226ee..0f70806 main -> main`, in sync
+  verified 2026-09-25.
+- 2026-09-25 — Frontend toast + Gmail settings. Files modified: `src/
+  App.jsx` (notice stack top-right with beep + dismiss, `/api/notifications`
+  on the 8s poll, Gmail link/unlink section in Settings reusing OAuth
+  styles). Verification: `vite build` clean (1516 modules); FULL suite
+  **173 passed** (163 + 10 gmail), zero regressions. Commit/push: PENDING
+  (checkpoint with this change).
 
 ---
 
