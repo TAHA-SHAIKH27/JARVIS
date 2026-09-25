@@ -257,8 +257,9 @@ restart + every 30 min. Important-only: VIP senders or urgent keywords.
   App.jsx` (notice stack top-right with beep + dismiss, `/api/notifications`
   on the 8s poll, Gmail link/unlink section in Settings reusing OAuth
   styles). Verification: `vite build` clean (1516 modules); FULL suite
-  **173 passed** (163 + 10 gmail), zero regressions. Commit/push: PENDING
-  (checkpoint with this change).
+  **173 passed** (163 + 10 gmail), zero regressions. Commit/push: DONE —
+  commit `66ee08d`, push `0f70806..66ee08d main -> main`, in sync verified
+  2026-09-25. Phase 3 Gmail watcher COMPLETE (WhatsApp deferred per user).
 
 ---
 
