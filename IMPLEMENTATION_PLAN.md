@@ -272,8 +272,9 @@ restart + every 30 min. Important-only: VIP senders or urgent keywords.
   scheduled send via existing desktop sender with spoken success/failure),
   `.gitignore` (scheduler/reminder private data). Verification: 12/12 new;
   live `/api/command` smoke (set→list→cancel both features, no LLM);
-  FULL suite **185 passed**, zero regressions. Commit/push: PENDING
-  (checkpoint with this change).
+  FULL suite **185 passed**, zero regressions. Commit/push: DONE — commit
+  `058f5f2`, push `40020ec..058f5f2 main -> main`, in sync verified
+  2026-09-25.
 
 ---
 
