@@ -91,6 +91,18 @@ AVAILABLE ACTION TYPES AND THEIR PARAMETERS:
 {"type": "run_tests", "target": "", "description": "Run the pytest suite", "expected_outcome": "Test results are reported", "required_context_keys": [], "goal": "Verify codebase health", "tool": "terminal.pytest", "expected_state": "Pass/fail summary available", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
 {"type": "git_op", "operation": "status", "description": "Show git status", "expected_outcome": "Working-tree state is reported", "required_context_keys": [], "goal": "Inspect repository state", "tool": "terminal.git", "expected_state": "Git output available", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
 
+// WhatsApp immediate sends (sent NOW via desktop automation)
+{"type": "send_whatsapp", "contact": "Mom or +919876543210", "message": "hello", "description": "Send WhatsApp now", "expected_outcome": "Message is sent immediately", "required_context_keys": [], "goal": "Send WhatsApp message now", "tool": "whatsapp.send", "expected_state": "Message delivered via WhatsApp", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
+
+// Scheduled WhatsApp (stored, sent LATER by the background ticker — use whenever the task
+// mentions schedule/at/in/tomorrow/today/tonight/a weekday, e.g. "schedule a message at 11am
+// to +919876543210 as HELLO" or "send whatsapp to Mom at 6pm saying happy birthday").
+// "schedule/send a message ..." (no explicit 'whatsapp') is the same channel.
+{"type": "schedule_whatsapp", "contact": "Mom or +919876543210", "message": "hello", "send_at": "2026-09-26T18:00:00+05:30", "description": "Schedule WhatsApp for later", "expected_outcome": "Message is stored and will send at send_at", "required_context_keys": [], "goal": "Schedule WhatsApp message", "tool": "scheduler.schedule", "expected_state": "Pending job stored in scheduled_whatsapp.json", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
+{"type": "list_scheduled_whatsapp", "description": "List pending scheduled WhatsApp messages", "expected_outcome": "Pending scheduled messages are listed", "required_context_keys": [], "goal": "List scheduled messages", "tool": "scheduler.list", "expected_state": "Pending jobs listed", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
+{"type": "cancel_scheduled_whatsapp", "fragment": "Mom", "description": "Cancel a scheduled WhatsApp", "expected_outcome": "Matching pending job is cancelled", "required_context_keys": [], "goal": "Cancel scheduled message", "tool": "scheduler.cancel", "expected_state": "Job marked cancelled", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
+{"type": "reschedule_scheduled_whatsapp", "fragment": "Mom", "send_at": "2026-09-26T19:00:00+05:30", "description": "Move a scheduled WhatsApp to a new time", "expected_outcome": "Pending job has a new send_at", "required_context_keys": [], "goal": "Reschedule message", "tool": "scheduler.reschedule", "expected_state": "Job send_at updated", "verification_method": "process_check", "fallback": "retry", "max_attempts": 2}
+
 // Final response
 {"type": "speak", "text": "Done, sir. Here are the results...", "description": "Final response", "expected_outcome": "Response is spoken to the user", "required_context_keys": []}
 
@@ -103,6 +115,7 @@ IMPORTANT NOTES:
 - Keep "description" short — it shows in the UI live feed.
 - NEVER use vague descriptions like "open the requested application" — always specify exact app_name and window_title.
 - The executor will automatically populate state.search_results from browser_search, and state.extracted_sources from browser_extract.
+- MESSAGING — immediate vs scheduled: if the task has NO time expression ("send whatsapp to Mom saying hi") use send_whatsapp; if it HAS one ("at 6pm", "in 2 hours", "tomorrow", "schedule ...") use schedule_whatsapp with contact/message/send_at (ISO 8601 with timezone). "schedule/send a message ..." means schedule_whatsapp. Message separators include 'saying' and 'as'. For list/cancel/reschedule use the matching scheduler actions.
 """
 
 
@@ -219,8 +232,55 @@ def _clean_json_response(text: str) -> Optional[Any]:
     return None
 
 
-def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Optional[List[Dict[str, Any]]]:
-    """Call LLM (Gemini, NVIDIA NIM, Groq, or OpenAI) to get a structured action plan."""
+_GEMINI_LIVE_MODELS_CACHE = {"models": None, "ts": 0.0}
+_GEMINI_LIVE_MODELS_TTL = 3600  # re-check the live model list once an hour
+
+
+def _fetch_live_gemini_models(api_key: str) -> list:
+    """Live generateContent-capable Gemini models, flash models first.
+
+    Google deprecates dated model names (gemini-1.5-flash etc. now 404), so
+    hardcoded chains rot. A cached ListModels lookup (hourly) keeps planning
+    on working names. Falls back to a static chain when offline/lookup fails.
+    """
+    import time as _time
+    now = _time.time()
+    if _GEMINI_LIVE_MODELS_CACHE["models"] and (now - _GEMINI_LIVE_MODELS_CACHE["ts"] < _GEMINI_LIVE_MODELS_TTL):
+        return _GEMINI_LIVE_MODELS_CACHE["models"]
+    fallback = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-flash-latest"]
+    if not (api_key or "").strip():
+        return fallback
+    try:
+        import urllib.request
+        url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + api_key.strip()
+        req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        names = []
+        for m in data.get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            name = m["name"].replace("models/", "")
+            if any(x in name for x in ("embedding", "aqa", "vision", "tts", "image-generation", "transcribe")):
+                continue
+            names.append(name)
+        names.sort(key=lambda n: "flash" not in n)
+        if names:
+            _GEMINI_LIVE_MODELS_CACHE.update({"models": names, "ts": now})
+            return names
+    except Exception:
+        pass
+    return fallback
+
+
+def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str,
+                        accept_dict: bool = False,
+                        max_output_tokens: int = 4096) -> Optional[List[Dict[str, Any]]]:
+    """Call LLM (Gemini, NVIDIA NIM, Groq, or OpenAI) to get a structured action plan.
+
+    accept_dict=True also returns a bare JSON object (goal-understanding
+    shape) instead of discarding it — without this, a successful goal
+    response falls through to the slow router for nothing."""
     import urllib.request
     import urllib.error
     import google_oauth
@@ -237,8 +297,12 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
         if not access_token:
             use_oauth = False
 
-    if use_oauth or (api_key and not api_key.startswith("AQ.")):
-        models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    # Both legacy "AIzaSy..." keys and the newer project-scoped "AQ...." keys
+    # work with ?key= (mirrors agent.py). Model names come from a live
+    # ListModels lookup — hardcoded dated names (1.5-flash etc.) now 404.
+    if use_oauth or (api_key and (api_key.startswith("AIzaSy") or api_key.startswith("AQ."))):
+        models = _fetch_live_gemini_models(api_key) if not use_oauth else \
+            ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-flash-latest"]
         base_url = "https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:generateContent"
 
         payload = {
@@ -246,7 +310,7 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
             "contents": [{"role": "user", "parts": [{"text": f"Task: {task}"}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": max_output_tokens,
             }
         }
 
@@ -265,7 +329,7 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
                     data=json.dumps(payload).encode("utf-8"),
                     headers=headers
                 )
-                with urllib.request.urlopen(req, timeout=3) as resp:
+                with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
 
                 text = (
@@ -279,6 +343,8 @@ def _call_gemini_for_plan(task: str, api_key: str, system_prompt: str) -> Option
                     return parsed
                 elif isinstance(parsed, dict) and "plan" in parsed:
                     return parsed["plan"]
+                elif isinstance(parsed, dict) and accept_dict:
+                    return parsed
             except Exception:
                 continue
 
@@ -353,6 +419,10 @@ def _call_router_for_plan(task: str, system_prompt: str, timeout_s: int = 0) -> 
     identical to before until a model is runtime-validated.
     timeout_s: per-request budget (0 = config default). Planning calls pass
     a short budget so a queued tier falls back to rules fast.
+
+    Single-shot: only the single best-routed candidate is tried. The full
+    4-model fallback chain is for long-running research, not planning —
+    at 12s+ per queued free-tier model it stalled plans for minutes.
     """
     try:
         from backend.agent import model_factory
@@ -364,16 +434,32 @@ def _call_router_for_plan(task: str, system_prompt: str, timeout_s: int = 0) -> 
         config = model_factory.load_llm_config()
         if not timeout_s:
             timeout_s = max(10, min(int(config.get("router_timeout_s", 90)), 300))
-        resp = router.generate_with_fallback(
-            profile_for("general"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Task: {task}"},
-            ],
-            temperature=0.1,
-            max_tokens=4096,
-            timeout_s=timeout_s,
-        )
+        from backend.agent.model_interface import FailureCategory as _FailureCategory
+        try:
+            record, provider = router.route(profile_for("general"))
+        except Exception:
+            return None
+        try:
+            resp = provider.generate(
+                record.model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Task: {task}"},
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+                timeout_s=timeout_s,
+            )
+        except Exception:
+            try:
+                registry.record_failure(record.model_id, _FailureCategory.TIMEOUT.value)
+            except Exception:
+                pass
+            return None
+        try:
+            registry.record_success(record.model_id, 0.0)
+        except Exception:
+            pass
         return _clean_json_response(resp.text)
     except Exception:
         return None
@@ -381,7 +467,34 @@ def _call_router_for_plan(task: str, system_prompt: str, timeout_s: int = 0) -> 
 
 # Short budget for planning LLM calls: a queued free tier must yield to the
 # instant rule-based planner instead of stalling small tasks for minutes.
-PLAN_LLM_TIMEOUT_S = 30
+# Direct Gemini answers in seconds; the router is capped so one slow
+# free-tier model can never stall planning for minutes.
+PLAN_LLM_TIMEOUT_S = 12
+
+
+def _llm_plan_fast(task: str, system_prompt: str, api_key: str,
+                   accept_dict: bool = False,
+                   max_output_tokens: int = 4096) -> Optional[Any]:
+    """Fastest-first LLM planning for the agent Planner.
+
+    Order: direct Gemini API (the configured user key — typically answers in
+    seconds) first, then the Model Router with a short budget, else None so
+    the caller falls back to the instant rule-based planner. The router fans
+    out over free-tier endpoints that can queue 30s+ per model, so it must
+    never go first when a Gemini key is available.
+    """
+    try:
+        direct = _call_gemini_for_plan(task, api_key, system_prompt,
+                                       accept_dict=accept_dict,
+                                       max_output_tokens=max_output_tokens)
+        if direct:
+            return direct
+    except Exception:
+        pass
+    try:
+        return _call_router_for_plan(task, system_prompt, PLAN_LLM_TIMEOUT_S)
+    except Exception:
+        return None
 
 
 def _is_simple_task(task: str) -> bool:
@@ -432,6 +545,11 @@ def _is_simple_task(task: str) -> bool:
     if re.search(r"\bgit\s+(status|diff|log|branch|stash|show|remote|blame|ls-files|rev-parse)\b", tl):
         return True
     if re.match(r"\s*(run|execute)\s+\S+", t, re.I):
+        return True
+    # Scheduled WhatsApp: deterministic rule planner (no LLM needed).
+    if re.search(r"\bschedul\w*\b", tl) and ("whatsapp" in tl or "message" in tl):
+        return True
+    if "whatsapp" in tl and re.search(r"\b(at\b|in\s+\d|tomorrow|today|tonight)\b", tl):
         return True
     return False
 
@@ -623,12 +741,108 @@ def _extract_research_parameters(task: str) -> Dict[str, Any]:
     }
 
 
+def _rule_based_schedule(task: str) -> List[Dict[str, Any]]:
+    """Deterministic plans for scheduled WhatsApp (same parser as normal mode).
+
+    Returns [] when the task is not a scheduling task. Uses
+    backend.tools.scheduler so normal mode and agentic mode share one parser:
+    'schedule a message at 11am to +91... as HELLO' and
+    'send whatsapp to Mom at 6pm saying hi' both plan schedule_whatsapp.
+    """
+    tl = (task or "").lower()
+    if "schedul" not in tl and "whatsapp" not in tl and "message" not in tl:
+        return []
+    try:
+        from backend.tools import scheduler as _sched
+    except Exception:
+        return []
+
+    # -- list scheduled messages --
+    if re.match(r"^\s*(?:please\s+)?(?:list|show)\s+(?:all\s+)?(?:my\s+)?scheduled(\s+whatsapp)?(\s+messages?)?\s*$", task, re.I):
+        return [
+            {"type": "list_scheduled_whatsapp", "description": "List scheduled WhatsApp messages"},
+            {"type": "speak", "text": "Listing your scheduled messages, sir.", "description": "Done", "evidence": "scheduled"},
+        ]
+
+    # -- cancel scheduled message --
+    cancel_m = re.match(
+        r"^\s*(?:please\s+)?(?:cancel|delete|remove)\s+(?:the\s+)?scheduled(\s+whatsapp)?(\s+message)?\s*(.*)$",
+        task, re.I)
+    if cancel_m and ("schedul" in tl or "whatsapp" in tl or "message" in tl):
+        fragment = re.sub(r"^(?:to|for)\s+", "", (cancel_m.group(3) or "").strip(), flags=re.I)
+        params: Dict[str, Any] = {"description": "Cancel scheduled WhatsApp"}
+        if fragment:
+            params["fragment"] = fragment
+        return [
+            {"type": "cancel_scheduled_whatsapp", **params},
+            {"type": "speak", "text": "Cancelling that scheduled message, sir.", "description": "Done"},
+        ]
+
+    # -- reschedule ("reschedule/move/postpone X to <time>") --
+    if re.search(r"\b(reschedul\w*|move|postpone|shift|change)\b", tl) and \
+            ("schedul" in tl or "whatsapp" in tl or "message" in tl):
+        frag = re.sub(r"^\s*(?:please\s+)?(?:reschedule|move|postpone|shift|change)\b\s*",
+                      "", task, flags=re.I).strip()
+        frag = re.sub(r"\b(?:the\s+)?scheduled(\s+whatsapp)?(\s+message)?\b\s*(to\s+)?",
+                      "", frag, flags=re.I).strip()
+        frag = re.sub(r"^whatsapp\s+(?:message\s+)?to\s+", "", frag, flags=re.I).strip()
+        try:
+            parsed_when = _sched.parse_when(frag)
+        except Exception:
+            parsed_when = {"ok": False}
+        if not parsed_when.get("ok"):
+            return [
+                {"type": "speak", "text": "When should I move it to, sir? Try 'at 6pm' or 'in 2 hours'.",
+                 "description": "Need new time"},
+            ]
+        span = parsed_when.get("span")
+        if span:
+            frag = _sched._strip_span(frag, span).strip(" .,-:")
+        frag = re.sub(r"\s+to\s*$", "", frag, flags=re.I).strip()
+        params = {"description": "Reschedule WhatsApp message",
+                  "send_at": parsed_when["when"].isoformat()}
+        if frag:
+            params["fragment"] = frag
+        return [
+            {"type": "reschedule_scheduled_whatsapp", **params},
+            {"type": "speak", "text": "Moving that scheduled message, sir.", "description": "Done"},
+        ]
+
+    # -- new scheduled message (needs a time cue, else not our business) --
+    if not re.search(r"\b(schedule|at\b|in\s+\d|tomorrow|today|tonight)\b", tl):
+        return []
+    try:
+        parsed = _sched.parse_scheduled_whatsapp(task)
+    except Exception:
+        return []
+    if parsed is None:
+        return []  # immediate send or unrelated → not a scheduling task
+    if "error" in parsed:
+        return [
+            {"type": "speak", "text": parsed["error"], "description": "Need scheduling details"},
+        ]
+    when_s = _sched.describe_when(parsed["when"])
+    return [
+        {"type": "schedule_whatsapp", "contact": parsed["contact"],
+         "message": parsed["message"], "send_at": parsed["when"].isoformat(),
+         "description": f"Schedule WhatsApp to {parsed['contact']} {when_s}"},
+        {"type": "speak", "text": f"Scheduled, sir. WhatsApp to {parsed['contact']} {when_s}.",
+         "description": "Done", "evidence": "scheduled"},
+    ]
+
+
 def _rule_based_plan(task: str) -> List[Dict[str, Any]]:
     """Deterministic, robust fallback plan generator."""
     task_lower = task.lower().strip()
     actions = []
     from system_ops import get_desktop_path
     desktop = get_desktop_path()
+
+    # Scheduled WhatsApp first: same parser as normal mode, so both modes
+    # understand 'schedule a message at 11am to +91... as HELLO'.
+    sched_actions = _rule_based_schedule(task)
+    if sched_actions:
+        return sched_actions
 
     # Browser Pro: 2+ explicit URLs fan out over parallel tabs (no search).
     multi_urls = [u.rstrip(".,;:)") for u in
@@ -1076,6 +1290,12 @@ def _parse_llm_actions_to_specs(actions: List[Dict[str, Any]], state: TaskState)
                 if specs[j].type in ("browser_navigate", "browser_search", "browser_parallel_research"):
                     depends_on.append(j)
                     break
+        elif atype == "schedule_whatsapp":
+            produces = ["scheduled_job"]
+        elif atype == "list_scheduled_whatsapp":
+            produces = ["scheduled_jobs"]
+        elif atype in ("cancel_scheduled_whatsapp", "reschedule_scheduled_whatsapp"):
+            produces = ["scheduler_receipt"]
         
         # Extract parameters (exclude type and description etc)
         params = {k: v for k, v in action.items() if k not in ("type", "description", "expected_outcome", "required_context_keys", "goal", "tool", "expected_state", "verification_method", "fallback", "max_attempts", "confidence_threshold")}
@@ -1137,6 +1357,11 @@ def _action_type_to_tool(action_type: str) -> str:
         "run_shell": "terminal.run",
         "run_tests": "terminal.pytest",
         "git_op": "terminal.git",
+        "schedule_whatsapp": "scheduler.schedule",
+        "list_scheduled_whatsapp": "scheduler.list",
+        "cancel_scheduled_whatsapp": "scheduler.cancel",
+        "reschedule_scheduled_whatsapp": "scheduler.reschedule",
+        "send_whatsapp": "whatsapp.send",
         "report_page_finding": "browser.report_finding",
         "speak": "speech.speak",
     }
@@ -1154,7 +1379,10 @@ def _default_verification_method(action_type: str) -> str:
                           "browser_download", "browser_extract_table"):
         return VerificationMethod.FILE_SYSTEM.value
     elif action_type in ("calculator_compute", "press_key",
-                          "run_shell", "run_tests", "git_op"):
+                          "run_shell", "run_tests", "git_op",
+                          "schedule_whatsapp", "list_scheduled_whatsapp",
+                          "cancel_scheduled_whatsapp",
+                          "reschedule_scheduled_whatsapp", "send_whatsapp"):
         return VerificationMethod.PROCESS_CHECK.value
     elif action_type == "screenshot_ui":
         return VerificationMethod.SCREENSHOT_VISION.value
@@ -1175,6 +1403,10 @@ def _default_fallback(action_type: str) -> str:
         "run_shell": "retry",
         "run_tests": "retry",
         "git_op": "retry",
+        "schedule_whatsapp": "retry",
+        "list_scheduled_whatsapp": "retry",
+        "cancel_scheduled_whatsapp": "retry",
+        "reschedule_scheduled_whatsapp": "retry",
         "create_docx": "simplified_document",
         "create_pptx": "simplified_presentation",
     }
@@ -1265,6 +1497,11 @@ def _validate_plan(plan: Plan, state: TaskState) -> Plan:
         "run_shell": ["command"],
         "run_tests": [],
         "git_op": ["operation"],
+        "schedule_whatsapp": ["contact", "message"],
+        "list_scheduled_whatsapp": [],
+        "cancel_scheduled_whatsapp": [],
+        "reschedule_scheduled_whatsapp": [],
+        "send_whatsapp": ["contact", "message"],
         "browser_extract": [],
         "browser_get_title": [],
         "browser_click": ["selector"],
@@ -1320,12 +1557,11 @@ class Planner:
         # Load API key
         api_key = _load_config_gemini_api_key()
 
-        # Try LLM for goal understanding (Phase 1 router first, then legacy path)
-        goal_analysis = _call_router_for_plan(task, GOAL_UNDERSTANDING_PROMPT, PLAN_LLM_TIMEOUT_S)
-        if isinstance(goal_analysis, list) and len(goal_analysis) > 0:
-            goal_analysis = goal_analysis[0] if isinstance(goal_analysis[0], dict) else {}
-        if not goal_analysis:
-            goal_analysis = _call_gemini_for_plan(task, api_key, GOAL_UNDERSTANDING_PROMPT)
+        # Try LLM for goal understanding (direct Gemini first for speed,
+        # then the router on a short budget — see _llm_plan_fast).
+        # Goal objects are small: cap output tokens and accept a bare dict.
+        goal_analysis = _llm_plan_fast(task, GOAL_UNDERSTANDING_PROMPT, api_key,
+                                       accept_dict=True, max_output_tokens=1024)
         if goal_analysis and isinstance(goal_analysis, list) and len(goal_analysis) > 0:
             goal_analysis = goal_analysis[0] if isinstance(goal_analysis[0], dict) else {}
         elif not goal_analysis:
@@ -1396,10 +1632,23 @@ class Planner:
                 "constraints": {"min_sources": num_sources, "output_format": out_fmt, "output_location": "documents"},
                 "dependencies": deps
             }
+        elif (re.search(r"\bschedul\w*\b", task_lower) and ("whatsapp" in task_lower or "message" in task_lower)) or \
+                ("whatsapp" in task_lower and re.search(r"\b(at\b|in\s+\d|tomorrow|today|tonight)\b", task_lower)):
+            return {
+                "primary_goal": f"Schedule a WhatsApp message for later: {task[:100]}",
+                "information": [],
+                "intermediate_operations": ["parse_schedule", "store_job"],
+                "final_deliverables": ["Scheduled WhatsApp job (sent later by ticker)"],
+                "tool_instructions": ["scheduler"],
+                "task_type": "simple",
+                "constraints": {},
+                "dependencies": [
+                    {"step": "store_job", "depends_on": []}
+                ]
+            }
         elif "calculator" in task_lower or "calc" in task_lower:
             return {
-                "primary_goal": "Calculate mathematical expression and provide result",
-                "information": [],
+                "primary_goal": "Calculate mathematical expression and provide result",                "information": [],
                 "intermediate_operations": ["open_calculator", "compute"],
                 "final_deliverables": ["Calculation result"],
                 "tool_instructions": ["calculator"],
@@ -1536,16 +1785,13 @@ class Planner:
         explicit_url_task = bool(re.search(r"https?://[^\s\]\[\),]+", task, re.I))
         actions = None
         if not explicit_url_task and not _is_simple_task(task):
-            # Phase 1: Model Router first (only active with ENABLED models),
-            # then the legacy Gemini/NVIDIA-inline path. Short budget so a
-            # queued tier yields to rules instead of stalling the task.
-            router_parsed = _call_router_for_plan(enriched_task, PLANNER_SYSTEM_PROMPT, PLAN_LLM_TIMEOUT_S)
+            # Fastest first: direct Gemini API, then the router on a short
+            # budget (_llm_plan_fast). Rules remain the final fallback below.
+            router_parsed = _llm_plan_fast(enriched_task, PLANNER_SYSTEM_PROMPT, api_key)
             if isinstance(router_parsed, list):
                 actions = router_parsed
             elif isinstance(router_parsed, dict) and "plan" in router_parsed:
                 actions = router_parsed["plan"]
-            if actions is None:
-                actions = _call_gemini_for_plan(enriched_task, api_key, PLANNER_SYSTEM_PROMPT)
         if actions:
             # Resolve any placeholder desktop paths
             for action in actions:
@@ -1672,12 +1918,11 @@ Adjust the plan to:
 
         actions = None
         if not _is_simple_task(task):
-            actions = _call_router_for_plan(replan_task, replan_prompt, PLAN_LLM_TIMEOUT_S)
+            # Fastest first (direct Gemini, then short-budget router).
+            actions = _llm_plan_fast(replan_task, replan_prompt, api_key)
         if isinstance(actions, dict) and "plan" in actions:
             actions = actions["plan"]
         if not actions or not isinstance(actions, list):
-            actions = _call_gemini_for_plan(replan_task, api_key, replan_prompt)
-        if not actions:
             actions = _rule_based_plan(task)
         
         # Resolve paths

@@ -361,10 +361,10 @@ def install_planner_context_bridge() -> None:
             _PLANNER_BRIDGE_INSTALLED = True
             return
 
-        def contextual_call(task: str, api_key: str, system_prompt: str):
+        def contextual_call(task: str, api_key: str, system_prompt: str, *args, **kwargs):
             context = runtime.model_context(task)
             enriched_task = f"{task}\n\nIMPORTANT JARVIS CONTEXT:\n{context}\n\nUse the context only when relevant to the user's request. Do not expose internal context unless the user asks for it."
-            return original(enriched_task, api_key, system_prompt)
+            return original(enriched_task, api_key, system_prompt, *args, **kwargs)
 
         contextual_call._phase1_context_bridge = True
         planner._call_gemini_for_plan = contextual_call

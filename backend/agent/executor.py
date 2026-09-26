@@ -221,12 +221,19 @@ class Executor:
             )
 
         elif atype == "screenshot_ui":
-            return await self._computer().screenshot(state)
+            res = await self._computer().screenshot(state)
+            shot_path = res.get("path", "") or res.get("screenshot_path", "")
+            if res.get("status") == "success" and shot_path:
+                state.update_context("last_screenshot_path", shot_path)
+            return res
 
         # ── File system ──────────────────────────────────────────────────────
 
         elif atype == "create_folder_verified":
-            return self._create_folder(params)
+            res = self._create_folder(params)
+            if res.get("status") == "success" and res.get("path"):
+                state.update_context("last_folder_path", res["path"])
+            return res
 
         elif atype == "write_file_verified":
             return self._write_file(params)
@@ -268,6 +275,30 @@ class Executor:
 
         elif atype == "browser_extract_search_results":
             return await self._browser_extract_search_results()
+
+        elif atype == "browser_download":
+            return await self._browser_download(params, state)
+
+        elif atype == "browser_login":
+            return await self._browser_login(params, state)
+
+        elif atype == "browser_login_check":
+            return await self._browser_login_check(params, state)
+
+        elif atype == "browser_parallel_research":
+            return await self._browser_parallel_research(params, state)
+
+        elif atype == "browser_extract_table":
+            return await self._browser_extract_table(params, state)
+
+        elif atype == "run_shell":
+            return await self._run_shell(params, state)
+
+        elif atype == "run_tests":
+            return await self._run_tests(params, state)
+
+        elif atype == "git_op":
+            return await self._git_op(params, state)
 
         elif atype == "report_page_finding":
             return self._report_page_finding(params, state)
@@ -500,6 +531,59 @@ class Executor:
             from whatsapp_ops import add_contact
             return add_contact(params.get("name", ""), params.get("phone", ""))
 
+        elif atype == "schedule_whatsapp":
+            return self._schedule_whatsapp(params, state)
+
+        elif atype == "list_scheduled_whatsapp":
+            try:
+                from backend.tools import scheduler as _sched
+                jobs = _sched.list_scheduled()
+                if not jobs:
+                    return {"status": "success", "message": "No scheduled WhatsApp messages, sir.", "jobs": []}
+                lines = []
+                for job in jobs[:10]:
+                    try:
+                        from datetime import datetime as _dt
+                        when_s = _sched.describe_when(_dt.fromisoformat(str(job.get("send_at", ""))))
+                    except Exception:
+                        when_s = "unscheduled"
+                    lines.append(f"to {job.get('contact')} {when_s}: '{str(job.get('message', ''))[:60]}'")
+                return {"status": "success",
+                        "message": f"{len(jobs)} scheduled, sir: " + "; ".join(lines) + ".",
+                        "jobs": jobs}
+            except Exception as e:
+                return {"status": "error", "message": f"Could not list scheduled messages: {e}"}
+
+        elif atype == "cancel_scheduled_whatsapp":
+            try:
+                from backend.tools import scheduler as _sched
+                return _sched.cancel_scheduled(str(params.get("fragment", "")))
+            except Exception as e:
+                return {"status": "error", "message": f"Could not cancel scheduled message: {e}"}
+
+        elif atype == "reschedule_scheduled_whatsapp":
+            try:
+                from backend.tools import scheduler as _sched
+                from datetime import datetime as _dt
+                fragment = str(params.get("fragment", ""))
+                send_at = str(params.get("send_at", "") or params.get("when_text", "") or params.get("time_text", "")).strip()
+                when = None
+                if send_at:
+                    try:
+                        when = _dt.fromisoformat(send_at)
+                    except Exception:
+                        when = None
+                    if when is None:
+                        parsed = _sched.parse_when(send_at)
+                        if parsed.get("ok"):
+                            when = parsed["when"]
+                if when is None:
+                    return {"status": "error",
+                            "message": "When should I move it to, sir? Give send_at (ISO) or a time like 'at 6pm'."}
+                return _sched.reschedule_scheduled(fragment, when)
+            except Exception as e:
+                return {"status": "error", "message": f"Could not reschedule message: {e}"}
+
         elif atype == "clear_history":
             import agent
             agent.clear_history()
@@ -658,6 +742,7 @@ class Executor:
             pyautogui.FAILSAFE = False
             await asyncio.sleep(0.2)
             pyautogui.write(text, interval=0.03)
+            state.update_context("last_typed_text", text[:200])
             return {"status": "success", "message": f"Typed {len(text)} characters into {window_title}"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to type text: {str(e)}"}
@@ -677,6 +762,68 @@ class Executor:
             return {"status": "success", "message": f"Pressed key: {key}"}
         except Exception as e:
             return {"status": "error", "message": f"Failed to press key {key}: {str(e)}"}
+
+    def _schedule_whatsapp(self, params: Dict[str, Any], state: TaskState) -> Dict[str, Any]:
+        """Store a WhatsApp message for later delivery (same store as normal mode).
+
+        Accepts contact/message plus send_at (ISO 8601) or time_text
+        ('at 6pm', 'in 2 hours'). Falls back to parsing the description.
+        """
+        from datetime import datetime as _dt
+        try:
+            from backend.tools import scheduler as _sched
+        except Exception as e:
+            return {"status": "error", "message": f"Scheduler unavailable: {e}"}
+        contact = str(params.get("contact", "")).strip()
+        message = str(params.get("message", "")).strip()
+        send_at_raw = str(params.get("send_at", "") or params.get("when_text", "") or params.get("time_text", "") or params.get("when", "")).strip()
+        when = None
+        if send_at_raw:
+            try:
+                when = _dt.fromisoformat(send_at_raw)
+            except Exception:
+                when = None
+            if when is None:
+                try:
+                    parsed = _sched.parse_when(send_at_raw)
+                    when = parsed["when"] if parsed.get("ok") else None
+                except Exception:
+                    when = None
+        if (not contact or not message or when is None) and params.get("description"):
+            try:
+                fallback = _sched.parse_scheduled_whatsapp(
+                    f"{params.get('description', '')} {contact} {message} {send_at_raw}")
+                if fallback and "error" not in fallback:
+                    contact = contact or fallback.get("contact", "")
+                    message = message or fallback.get("message", "")
+                    when = when or fallback.get("when")
+            except Exception:
+                pass
+        if not contact:
+            return {"status": "error", "message": "Who should I send the WhatsApp to, sir?"}
+        if not message:
+            return {"status": "error", "message": "What should the message say, sir?"}
+        if when is None:
+            return {"status": "error",
+                    "message": "I need a time, sir. Try 'at 6pm' or 'in 2 hours'."}
+        try:
+            saved = _sched.schedule_whatsapp(contact, message, when)
+        except Exception as e:
+            return {"status": "error", "message": f"Could not schedule message: {e}"}
+        if saved.get("status") != "success":
+            return {"status": "error", "message": saved.get("message", "Could not schedule, sir.")}
+        job = saved.get("job", {})
+        try:
+            when_s = _sched.describe_when(when)
+        except Exception:
+            when_s = when.isoformat()
+        try:
+            state.update_context("scheduled_job", job)
+        except Exception:
+            pass
+        return {"status": "success",
+                "message": f"Scheduled, sir. WhatsApp to {contact} {when_s}: {message[:160]}.",
+                "job": job}
 
     async def _calculator_compute(self, action: Dict, state: TaskState) -> Dict[str, Any]:
         """Open Calculator, type the expression, and verify the result."""
@@ -751,6 +898,8 @@ class Executor:
 
         state.active_app = "Calculator"
         msg = f"Calculator computed: {expression} = {display_value}"
+        if display_value:
+            state.update_context("last_calc_result", f"{expression} = {display_value}")
         if expected and expected in display_value.replace(",", ""):
             return {"status": "success", "message": msg, "result": display_value, "verified_result": True}
         elif display_value:
@@ -792,10 +941,12 @@ class Executor:
             return {"status": "error", "message": f"Failed to write file: {str(e)}"}
 
     def _verify_file(self, action: Dict) -> Dict[str, Any]:
-        """Check that a file exists."""
+        """Check that a file OR folder exists (verify_file covers both)."""
         path = action.get("path", "")
         if os.path.isfile(path):
             return {"status": "success", "message": f"File confirmed: {path}", "path": path}
+        if os.path.isdir(path):
+            return {"status": "success", "message": f"Folder confirmed: {path}", "path": path}
         return {"status": "error", "message": f"File NOT found: {path}"}
 
     async def _create_docx(self, action: Dict, state: TaskState) -> Dict[str, Any]:
@@ -806,10 +957,9 @@ class Executor:
         headings = action.get("headings", [])
 
         if not path:
-            from system_ops import get_desktop_path
-            desktop = get_desktop_path()
+            from system_ops import get_documents_dir
             safe_title = re.sub(r'[^\w\-_]', '_', title)
-            path = os.path.join(desktop, f"{safe_title}.docx")
+            path = os.path.join(get_documents_dir(), f"{safe_title}.docx")
 
         if not path.endswith(".docx"):
             path += ".docx"
@@ -882,6 +1032,7 @@ class Executor:
                 )
                 if result.get("status") == "success":
                     self._archive_document(path)
+                    self._bank_artifact(state, result.get("path", path) or path)
                 state.final_outcome_verified = True
                 state.final_outcome_data = {"path": path, "title": title, "report": structured_report}
                 return result
@@ -901,6 +1052,7 @@ class Executor:
             )
             if result.get("status") == "success":
                 self._archive_document(path)
+                self._bank_artifact(state, result.get("path", path) or path)
             state.final_outcome_verified = True
             state.final_outcome_data = {"path": path, "title": title}
             return result
@@ -938,6 +1090,7 @@ class Executor:
             result = await Office.create_pptx(title=title, slides=slides, save_path=path)
             if result.get("status") == "success":
                 self._archive_document(path)
+                self._bank_artifact(state, result.get("path", path) or path)
             state.final_outcome_verified = True
             state.final_outcome_data = {"path": path, "title": title, "slide_count": len(slides)}
             return result
@@ -1137,6 +1290,17 @@ class Executor:
             pass
         return ""
 
+    @staticmethod
+    def _bank_artifact(state: TaskState, path: str) -> None:
+        """Append a created artifact path for the final reply evidence."""
+        try:
+            paths = state.get_context("artifact_paths", []) or []
+            if path and path not in paths:
+                paths.append(path)
+            state.update_context("artifact_paths", paths)
+        except Exception:
+            pass
+
     def _archive_document(self, path: str) -> None:
         """Ensure documents/PPTs saved outside work_files are mirrored into
         work_files/documents so the FILES/GALLERY view shows them."""
@@ -1186,6 +1350,11 @@ class Executor:
 
         if not url:
             return {"status": "error", "message": "No URL available for navigation"}
+
+        # Skip redirect wrappers (Scholar/Google/Bing/DuckDuckGo): navigate
+        # straight to the destination so verification can match the URL.
+        from backend.tools.browser import unwrap_search_url
+        url = unwrap_search_url(url)
 
         res = await browser.open(url)
         if res.get("status") == "success":
@@ -1250,16 +1419,217 @@ class Executor:
         state.update_context("last_finding", answer)
         return {"status": "success", "message": "Page finding verified", "answer": answer, "source_url": source.get("url", "")}
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Dev Terminal helpers (safe shell / git / tests)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _store_terminal_result(res: Dict[str, Any], state: TaskState) -> Dict[str, Any]:
+        """Bank truncated output in state for findings/replans; the final
+        reply carries a short summary (core.py), not the raw dump."""
+        if res.get("stdout"):
+            state.update_context("last_shell_output", res["stdout"][-2000:])
+            state.update_context("last_shell_command", res.get("command", ""))
+            state.update_context("last_shell_exit", res.get("exit_code", -1))
+        if res.get("status") == "success":
+            state.final_outcome_data = {"command": res.get("command", ""),
+                                        "exit_code": res.get("exit_code", 0)}
+        return res
+
+    async def _run_shell(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Run a policy-gated shell command (terminal.py enforces safety)."""
+        import asyncio as _asyncio
+        from backend.tools import terminal as _term
+        command = (action.get("command") or "").strip()
+        if not command:
+            return {"status": "error", "message": "run_shell needs 'command'"}
+        workdir = (action.get("workdir") or "").strip()
+        timeout_s = int(action.get("timeout_s") or _term.DEFAULT_TIMEOUT_S)
+        try:
+            res = await _asyncio.to_thread(
+                _term.run, command, workdir,
+                max(5, min(timeout_s, 600)))
+        except Exception as e:
+            return {"status": "error", "message": f"Terminal error: {e}"}
+        return self._store_terminal_result(res, state)
+
+    async def _run_tests(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Run the pytest suite (longer timeout; still bounded)."""
+        import asyncio as _asyncio
+        from backend.tools import terminal as _term
+        target = (action.get("target") or "").strip()
+        extra = (action.get("args") or "").strip()
+        timeout_s = int(action.get("timeout_s") or _term.TEST_TIMEOUT_S)
+        try:
+            res = await _asyncio.to_thread(
+                _term.run_tests, target, extra,
+                max(30, min(timeout_s, 600)))
+        except Exception as e:
+            return {"status": "error", "message": f"Test run error: {e}"}
+        return self._store_terminal_result(res, state)
+
+    async def _git_op(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Read-only git inspection (status/diff/log/branch/...)."""
+        import asyncio as _asyncio
+        from backend.tools import terminal as _term
+        operation = (action.get("operation") or "status").strip().lower()
+        args = (action.get("args") or "").strip()
+        try:
+            res = await _asyncio.to_thread(_term.git_op, operation, args)
+        except Exception as e:
+            return {"status": "error", "message": f"Git error: {e}"}
+        return self._store_terminal_result(res, state)
+
     async def _browser_get_title(self) -> Dict[str, Any]:
         """Get the current browser page title."""
         browser = await self._get_browser()
         return await browser.get_page_title()
-
     async def _browser_extract_search_results(self) -> Dict[str, Any]:
         """Extract clickable search result links from the current Google SERP."""
         browser = await self._get_browser()
         results = await browser.extract_search_results()
         return {"status": "success", "message": f"Found {len(results)} search results", "results": results}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Browser Pro helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _download_dir(params: Dict[str, Any]) -> str:
+        """Resolve the download folder: explicit dir > Desktop > work downloads."""
+        from system_ops import get_desktop_path
+        explicit = (params.get("save_dir") or params.get("path") or "").strip()
+        if explicit and os.path.isdir(explicit):
+            return explicit
+        if explicit:
+            try:
+                os.makedirs(explicit, exist_ok=True)
+                return explicit
+            except Exception:
+                pass
+        try:
+            desktop = get_desktop_path()
+            if desktop and os.path.isdir(desktop):
+                return desktop
+        except Exception:
+            pass
+        fallback = os.path.abspath(os.path.join(os.getcwd(), "downloads"))
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+    async def _browser_download(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Download a file via direct URL or via a click-triggered download."""
+        browser = await self._get_browser()
+        save_dir = self._download_dir(action)
+        url = (action.get("url") or "").strip()
+        selector = (action.get("selector") or "").strip()
+        if url:
+            res = await browser.download_file(url, save_dir)
+        elif selector:
+            res = await browser.download_via_click(selector, save_dir)
+        else:
+            return {"status": "error",
+                    "message": "browser_download needs 'url' or 'selector'"}
+        if res.get("status") == "success" and res.get("path"):
+            state.update_context("last_download_path", res["path"])
+            state.final_outcome_data = {"path": res["path"]}
+        return res
+
+    async def _browser_login(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Assisted login: navigate, fill username, then hand to the human.
+
+        Passwords are never filled by the agent. After the username step the
+        action reports `human_verification_required` so core pauses and the
+        user completes password/2FA/CAPTCHA in the visible browser. On resume
+        the follow-up `browser_login_check` verifies the login.
+        """
+        browser = await self._get_browser()
+        url = (action.get("url") or "").strip()
+        if url:
+            nav = await browser.open(url)
+            if nav.get("status") != "success":
+                return nav
+            state.current_page_url = url
+        username = action.get("username", "")
+        selector = action.get("username_selector", "")
+        if username and selector:
+            fill = await browser.fill_login_username(selector, str(username))
+            if fill.get("status") != "success":
+                return fill
+        return {"status": "human_verification_required",
+                "message": ("Opened the login page"
+                            + (" and entered the username" if username and selector else "")
+                            + ". Please complete the password / 2FA / CAPTCHA in the "
+                              "browser window, then resume, sir."),
+                "page_state": "login",
+                "details": {"url": state.current_page_url}}
+
+    async def _browser_login_check(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Verify a human-completed login (called after resume)."""
+        browser = await self._get_browser()
+        return await browser.check_logged_in()
+
+    async def _browser_parallel_research(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Fan out over explicit URLs: one tab each, extract all, bank sources."""
+        browser = await self._get_browser()
+        urls = action.get("urls") or []
+        if isinstance(urls, str):
+            urls = [urls]
+        # Also resolve source_index entries against prior search results.
+        indices = action.get("source_indices") or []
+        for i in indices:
+            try:
+                if state.search_results and 0 <= int(i) < len(state.search_results):
+                    urls.append(state.search_results[int(i)].get("url", ""))
+            except Exception:
+                pass
+        urls = [u for u in urls if u and u.startswith(("http://", "https://"))]
+        if not urls:
+            return {"status": "error",
+                    "message": "browser_parallel_research needs 'urls' (http(s))"}
+        res = await browser.extract_parallel(urls[:5])
+        if res.get("status") == "success":
+            existing = {s.get("url", "").lower() for s in state.extracted_sources if s.get("url")}
+            for src in res.get("sources", []):
+                if src.get("url", "").lower() not in existing:
+                    state.extracted_sources.append({
+                        "url": src.get("url", ""),
+                        "title": src.get("title", ""),
+                        "text": src.get("text", ""),
+                    })
+        return res
+
+    async def _browser_extract_table(self, action: Dict, state: TaskState) -> Dict[str, Any]:
+        """Extract page tables and save the largest one as CSV."""
+        import csv
+        browser = await self._get_browser()
+        res = await browser.extract_tables()
+        if res.get("status") != "success" or not res.get("tables"):
+            return res
+        tables = res["tables"]
+        best = max(tables, key=lambda t: len(t.get("rows", [])))
+        filename = (action.get("filename") or "table.csv").strip() or "table.csv"
+        if not filename.lower().endswith(".csv"):
+            filename += ".csv"
+        save_dir = self._download_dir(action)
+        path = os.path.join(save_dir, re.sub(r'[<>:"/\\|?*]', "_", filename))
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                if best.get("caption"):
+                    writer.writerow([best["caption"]])
+                if best.get("headers"):
+                    writer.writerow(best["headers"])
+                writer.writerows(best.get("rows", []))
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to save CSV: {str(e)}"}
+        state.update_context("last_table_path", path)
+        state.update_context("last_table_rows", len(best.get("rows", [])))
+        state.final_outcome_data = {"path": path,
+                                    "rows": len(best.get("rows", []))}
+        return {"status": "success",
+                "message": f"Saved {len(best.get('rows', []))} table rows to {path}",
+                "path": path, "tables_found": len(tables)}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Sequence executor

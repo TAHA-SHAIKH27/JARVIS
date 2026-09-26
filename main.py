@@ -55,6 +55,7 @@ import google_oauth
 import phone_control
 import whatsapp_ops
 import code_core
+from backend.startup_engine import get_startup_engine
 
 from backend.agent.core import AgentCore
 from backend.agent.state import TaskState
@@ -115,19 +116,16 @@ def _audit_report_path() -> str:
 
 
 def _run_startup_audit_worker():
-    """Wait for the frontend to attach, then run a read-only audit and persist it."""
+    """Run real codebase audit promptly upon boot and persist the report."""
     global _startup_audit_report
-    time.sleep(_STARTUP_AUDIT_WAIT_SECONDS)
+    time.sleep(1.0)
     with _STARTUP_AUDIT_LOCK:
         try:
+            engine = get_startup_engine()
+            audit_res = engine.run_real_audit()
+            # Also fetch full code_core report for backwards compatibility
             report = code_core.audit_codebase()
             _startup_audit_report = report
-            try:
-                os.makedirs(os.path.dirname(_audit_report_path()), exist_ok=True)
-                with open(_audit_report_path(), "w", encoding="utf-8") as f:
-                    json.dump(report, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
             print(
                 f"[startup-audit] Codebase scan finished: health {report['health_score']}%, "
                 f"{report['total_files_checked']} files checked, {report['issues_count']} issue(s) "
@@ -395,6 +393,40 @@ def code_download(filename: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path, filename=filename)
+
+
+# ── Cinematic Startup & Real Initialization Endpoints ──────────────────────
+
+@app.get("/api/startup/stream")
+async def startup_stream():
+    """Stream real-time startup events (SSE) as initialization progresses."""
+    engine = get_startup_engine()
+    return StreamingResponse(
+        engine.stream_startup_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+@app.post("/api/startup/init")
+async def startup_init():
+    """Execute full verified startup initialization and return state."""
+    engine = get_startup_engine()
+    return engine.initialize_full_system()
+
+
+@app.get("/api/startup/status")
+async def startup_status():
+    """Get current startup status without triggering another full scan unless uninitialized."""
+    engine = get_startup_engine()
+    if not engine._initialized:
+        return engine.initialize_full_system()
+    return engine._last_state
+
 
 
 # ===== Google OAuth (alternative to the raw Gemini API key) =====

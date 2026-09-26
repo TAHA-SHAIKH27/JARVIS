@@ -388,12 +388,18 @@ class VoiceCommandProcessor:
                 self.agent_core.request_interrupt("Voice interruption: " + text)
             return {"status": "interrupted", "message": "Speech interrupted"}
         
-        # Check for mid-task instruction
-        if self._is_mid_task_instruction(text) and task_state and task_state.task:
+        # New command while a task runs: merge related changes, queue the rest.
+        if task_state and (getattr(task_state, "task", "") or "").strip():
+            from backend.agent.clarify import classify_instruction
+            verdict = classify_instruction(task_state.task, text)
             if self.agent_core:
                 self.agent_core.inject_mid_task_instruction(text)
-            return {"status": "mid_task_instruction", "message": f"Injected instruction: {text}"}
-        
+            if verdict["related"]:
+                return {"status": "mid_task_instruction",
+                        "message": f"Merged into current task ({verdict['reason']})"}
+            return {"status": "task_queued",
+                    "message": "Queued to run after the current task, sir."}
+
         # Otherwise, treat as new command
         return {"status": "new_command", "text": text}
     

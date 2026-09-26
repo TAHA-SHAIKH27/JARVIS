@@ -208,15 +208,17 @@ def delete_file(filename: str) -> dict:
         }
 
 def take_screenshot() -> dict:
-    """Take a screenshot of the main screen and return its status."""
+    """Take a screenshot of the main screen and return its status.
+
+    Saves into the laptop's main Screenshots folder and mirrors a copy
+    into work_files/screenshots so the JARVIS album shows it."""
     try:
-        img_dir = os.path.join(WORK_DIR, "screenshots")
-        if not os.path.exists(img_dir):
-            os.makedirs(img_dir)
+        img_dir = get_screenshots_dir()
         filename = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         path = os.path.join(img_dir, filename)
         pyautogui.screenshot(path)
-        return {"status": "success", "message": f"Screenshot saved: screenshots/{filename}", "path": f"screenshots/{filename}"}
+        mirror_into_gallery(path)
+        return {"status": "success", "message": f"Screenshot saved: {path}", "path": path}
     except Exception as e:
         return {"status": "error", "message": f"Failed to take screenshot: {str(e)}"}
 
@@ -230,6 +232,60 @@ def get_desktop_path():
     if os.path.exists(regular_desktop):
         return regular_desktop
     return user_profile
+
+def get_screenshots_dir():
+    """The laptop's main Screenshots folder (Pictures\\Screenshots).
+
+    Every screenshot JARVIS takes lands here so it sits alongside the
+    user's own captures. Falls back to work_files/screenshots when the
+    Pictures folder is unavailable. Always returns an existing directory."""
+    user_profile = os.environ.get("USERPROFILE", "")
+    candidates = []
+    if user_profile:
+        candidates.append(os.path.join(user_profile, "Pictures", "Screenshots"))
+        candidates.append(os.path.join(user_profile, "OneDrive", "Pictures", "Screenshots"))
+    for cand in candidates:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if os.path.isdir(cand):
+                return cand
+        except Exception:
+            pass
+    fallback = os.path.join(WORK_DIR, "screenshots")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+def get_documents_dir():
+    """JARVIS work documents folder (Word/PPT/PDF artifacts live here)."""
+    doc_dir = os.path.join(WORK_DIR, "documents")
+    os.makedirs(doc_dir, exist_ok=True)
+    return doc_dir
+
+def mirror_into_gallery(src_path: str) -> str:
+    """Copy a laptop-side screenshot into work_files/screenshots so the
+    JARVIS album (/api/gallery → pc_screenshot) shows it too.
+    Returns the gallery copy path, or '' when the copy was impossible
+    (e.g. source already inside work_files). Never raises."""
+    try:
+        if not src_path or not os.path.isfile(src_path):
+            return ""
+        norm_src = os.path.abspath(src_path)
+        norm_work = os.path.abspath(WORK_DIR)
+        if norm_src.startswith(norm_work + os.sep):
+            return ""
+        dest_dir = os.path.join(WORK_DIR, "screenshots")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(norm_src))
+        base, ext = os.path.splitext(dest)
+        i = 1
+        while os.path.exists(dest):
+            i += 1
+            dest = f"{base}_{i}{ext}"
+        import shutil
+        shutil.copy2(norm_src, dest)
+        return dest
+    except Exception:
+        return ""
 
 def create_folder(folder_name: str) -> dict:
     """Create a folder relative to workspace, or on desktop if specified."""
@@ -411,7 +467,7 @@ def create_word_document(filename: str, content: str, charts: list = None) -> di
         path = os.path.join(get_desktop_path(), clean_name)
     else:
         filename = os.path.basename(filename)
-        path = os.path.join(WORK_DIR, filename)
+        path = os.path.join(get_documents_dir(), filename)
 
     clean_content, embedded_charts = _parse_document_blocks(content)
     all_charts = list(charts or []) + embedded_charts

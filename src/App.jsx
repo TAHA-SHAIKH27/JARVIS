@@ -21,7 +21,8 @@ import Telemetry from './Telemetry';
 import CommandGrid from './CommandGrid';
 
 import CoreSphere from './CoreSphere';
-
+import Jarvis3DCore from './components/Jarvis3DCore';
+import StartupController from './components/StartupController';
 import PhonePanel from './PhonePanel';
 
 import PhoneMirrorPage from './PhoneMirrorPage';
@@ -112,7 +113,7 @@ function TimerWidget({ timerData, onCancel }) {
 
     <div className="timer-strip">
 
-      <div className="timer-icon">{done ? '✓' : '⏳'}</div>
+      <div className="timer-icon">{done ? 'âœ“' : 'â³'}</div>
 
       <div className="timer-info">
 
@@ -132,7 +133,7 @@ function TimerWidget({ timerData, onCancel }) {
 
       </div>
 
-      <button className="timer-cancel-btn" onClick={onCancel}>✕ Cancel</button>
+      <button className="timer-cancel-btn" onClick={onCancel}>âœ• Cancel</button>
 
     </div>
 
@@ -203,6 +204,7 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [timerData, setTimerData] = useState(null)
   const [booting, setBooting] = useState(true)
+  const [assembling, setAssembling] = useState(false) // true briefly after startup to play entry animations
   const [activeView, setActiveView] = useState('core')
   const [agentMode, setAgentMode] = useState(false)
   const [agentStatus, setAgentStatus] = useState('ready')
@@ -214,81 +216,29 @@ export default function App() {
   const [voiceEnabled, setVoiceEnabled] = useState(true)
   const [clarificationPending, setClarificationPending] = useState(null)
 
-  useEffect(() => {
-    const timer = setTimeout(() => setBooting(false), 4000)
-    return () => clearTimeout(timer)
+  const [startupPayload, setStartupPayload] = useState(null)
+
+  const handleStartupComplete = useCallback((payload) => {
+    setBooting(false)
+    setAssembling(true) // trigger panel entry animations
+    if (payload) {
+      setStartupPayload(payload)
+    }
+    // Clear assembling after animations complete (~1.5s)
+    setTimeout(() => setAssembling(false), 1500)
   }, [])
 
-  useEffect(() => {
-    if (!booting) return
-    const AudioCtx = window.AudioContext || window.webkitAudioContext
-    if (!AudioCtx) return
-
-    const ctx = new AudioCtx()
-    const timers = []
-    const at = (delay, sound) => timers.push(window.setTimeout(sound, delay))
-    const tone = (when, frequency, duration, volume, type = 'sine', endFrequency = frequency) => {
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      const filter = ctx.createBiquadFilter()
-      const start = ctx.currentTime
-      osc.type = type
-      osc.frequency.setValueAtTime(frequency, start)
-      osc.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration)
-      filter.type = 'lowpass'
-      filter.frequency.setValueAtTime(2600, start)
-      gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(volume, start + Math.min(0.04, duration * 0.2))
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-      osc.connect(filter)
-      filter.connect(gain)
-      gain.connect(ctx.destination)
-      osc.start(start)
-      osc.stop(start + duration + 0.02)
+  const handleBriefingReady = useCallback((briefingText) => {
+    if (briefingText) {
+      setMessages((m) => [...m, { role: 'jarvis', text: briefingText }])
+      speak(briefingText)
     }
-    const noise = (when, duration, volume) => {
-      const buffer = ctx.createBuffer(1, ctx.sampleRate * duration, ctx.sampleRate)
-      const data = buffer.getChannelData(0)
-      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length)
-      const source = ctx.createBufferSource()
-      const filter = ctx.createBiquadFilter()
-      const gain = ctx.createGain()
-      const start = ctx.currentTime
-      source.buffer = buffer
-      filter.type = 'bandpass'
-      filter.frequency.setValueAtTime(1500, start)
-      filter.frequency.exponentialRampToValueAtTime(4200, start + duration)
-      gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(volume, start + 0.015)
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-      source.connect(filter)
-      filter.connect(gain)
-      gain.connect(ctx.destination)
-      source.start(start)
-      source.stop(start + duration)
-    }
-
-    at(620, () => tone(0, 58, 0.32, 0.018, 'sine', 72))
-    at(700, () => noise(0, 0.32, 0.035))
-    at(700, () => tone(0, 180, 0.28, 0.025, 'triangle', 90))
-    at(1280, () => tone(0, 1100, 0.045, 0.035, 'square', 760))
-    at(1400, () => tone(0, 62, 0.36, 0.12, 'sine', 38))
-    at(1420, () => tone(0, 240, 0.42, 0.045, 'sawtooth', 1180))
-    at(1650, () => tone(0, 82, 0.3, 0.055, 'sine', 58))
-    at(1950, () => tone(0, 780, 0.3, 0.035, 'sine', 1320))
-    at(2100, () => tone(0, 1046, 0.42, 0.024, 'sine', 1318))
-
-    void ctx.resume().catch(() => {})
-    return () => {
-      timers.forEach(window.clearTimeout)
-      window.setTimeout(() => { void ctx.close() }, 2400)
-    }
-  }, [booting])
+  }, [voiceEnabled])
 
   // New voice system
   const voiceHook = useVoice({
     onTranscript: (event) => {
-      // onTranscript only adds the user bubble — actual command execution
+      // onTranscript only adds the user bubble â€” actual command execution
       // happens via runVoiceCommand (set on _setExecuteCommand below)
       if (event.type === 'final') {
         setMessages(m => [...m, { role: 'user', text: event.text }]);
@@ -358,7 +308,7 @@ export default function App() {
   async function togglePushToTalk() {
     if (isPushToTalkActive) {
       // stopPushToTalk fires onTranscript (user bubble) + executeCommandRef (JARVIS reply)
-      // We just stop it — execution is handled inside the hook via executeCommandRef
+      // We just stop it â€” execution is handled inside the hook via executeCommandRef
       await stopPushToTalk();
     } else {
       await startPushToTalk();
@@ -674,7 +624,7 @@ export default function App() {
 
             // Accumulate event log
             if (type !== 'done') {
-              const prefix = icon || (type === 'action_done' ? '✓' : type === 'action_error' ? '✗' : '→')
+              const prefix = icon || (type === 'action_done' ? 'âœ“' : type === 'action_error' ? 'âœ—' : 'â†’')
               setAgentEvents(ev => [
                 ...ev,
                 { text: `${prefix} ${message}`, type }
@@ -721,14 +671,14 @@ export default function App() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        setAgentEvents(ev => [...ev, { text: `✕ Instruction rejected: ${data.detail || 'run finished'}`, type: 'step_failed' }])
+        setAgentEvents(ev => [...ev, { text: `âœ• Instruction rejected: ${data.detail || 'run finished'}`, type: 'step_failed' }])
         return
       }
-      setAgentEvents(ev => [...ev, { text: `→ ${data.speak || 'Noted, sir.'}`, type: data.status === 'queued' ? 'task_queued' : 'plan_restarted' }])
+      setAgentEvents(ev => [...ev, { text: `â†’ ${data.speak || 'Noted, sir.'}`, type: data.status === 'queued' ? 'task_queued' : 'plan_restarted' }])
       if (Array.isArray(data.queued)) setQueuedTasks(data.queued)
       if (data.speak) speak(data.speak)
     } catch {
-      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent instruct endpoint.', type: 'step_failed' }])
+      setAgentEvents(ev => [...ev, { text: 'âœ• Could not reach the agent instruct endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -741,15 +691,15 @@ export default function App() {
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        setAgentEvents(ev => [...ev, { text: `✕ Could not send answer: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
+        setAgentEvents(ev => [...ev, { text: `âœ• Could not send answer: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
         return
       }
       setAgentQuestion(null)
       setAgentWaitingForHuman(false)
       setAgentStatus('executing')
-      setAgentEvents(ev => [...ev, { text: '▶ Answer received — carrying on.', type: 'resuming' }])
+      setAgentEvents(ev => [...ev, { text: 'â–¶ Answer received â€” carrying on.', type: 'resuming' }])
     } catch {
-      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent resume endpoint.', type: 'step_failed' }])
+      setAgentEvents(ev => [...ev, { text: 'âœ• Could not reach the agent resume endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -763,14 +713,14 @@ export default function App() {
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        setAgentEvents(ev => [...ev, { text: `✕ Could not resume: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
+        setAgentEvents(ev => [...ev, { text: `âœ• Could not resume: ${err.detail || 'unknown error'}`, type: 'step_failed' }])
         return
       }
       setAgentWaitingForHuman(false)
       setAgentStatus('executing')
-      setAgentEvents(ev => [...ev, { text: '▶ Human verification acknowledged; resuming agent.', type: 'resuming' }])
+      setAgentEvents(ev => [...ev, { text: 'â–¶ Human verification acknowledged; resuming agent.', type: 'resuming' }])
     } catch {
-      setAgentEvents(ev => [...ev, { text: '✕ Could not reach the agent resume endpoint.', type: 'step_failed' }])
+      setAgentEvents(ev => [...ev, { text: 'âœ• Could not reach the agent resume endpoint.', type: 'step_failed' }])
     }
   }
 
@@ -946,13 +896,13 @@ export default function App() {
         setTimeout(() => setSaveNote(''), 2500)
       }
     } catch {
-      setSaveNote('Save failed — check connection.')
+      setSaveNote('Save failed â€” check connection.')
     }
   }
 
   async function linkGoogle() {
     setOauthBusy(true)
-    setOauthMsg('Opening browser to sign in with Google…')
+    setOauthMsg('Opening browser to sign in with Googleâ€¦')
     try {
       const res = await fetch('/api/oauth/login', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
@@ -983,7 +933,7 @@ export default function App() {
 
   async function linkGmail() {
     setGmailBusy(true)
-    setGmailMsg('Opening browser to link Gmail (read-only)…')
+    setGmailMsg('Opening browser to link Gmail (read-only)â€¦')
     try {
       const res = await fetch('/api/gmail/login', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
@@ -1056,8 +1006,12 @@ export default function App() {
 
   return (
     <div className={`jarvis-root ${booting ? 'is-booting' : 'is-ready'}`}>
+      <StartupController
+        onStartupComplete={handleStartupComplete}
+        onBriefingReady={handleBriefingReady}
+      />
       <StartupAuditBanner onOpenCode={() => setActiveView('code')} />
-      {/* ── Proactive notifications (Gmail watcher) ── */}
+      {/* â”€â”€ Proactive notifications (Gmail watcher) â”€â”€ */}
       {notices.length > 0 && (
         <div style={{ position: 'fixed', top: 64, right: 16, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360 }}>
           {notices.map(n => (
@@ -1074,7 +1028,7 @@ export default function App() {
           ))}
         </div>
       )}
-      {/* ── Full-page overlays (Phone / Gallery) ── */}
+      {/* â”€â”€ Full-page overlays (Phone / Gallery) â”€â”€ */}
       {activeView === 'phone' && (
         <PhoneMirrorPage
           setActiveView={setActiveView}
@@ -1100,29 +1054,31 @@ export default function App() {
         <CodeCorePage setActiveView={setActiveView} />
       )}
 
-      {/* ── Core view (hidden when phone/files active) ── */}
+      {/* â”€â”€ Core view (hidden when phone/files active) â”€â”€ */}
       <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
 
 
       {/* TOP BAR */}
-<Header
-  online={online}
-  busy={busy}
-  chatMode={chatMode}
-  setChatMode={setChatMode}
-  isSpeaking={ttsSpeaking}
-  onOpenSettings={() => setSettingsOpen(true)}
-  voiceActive={voiceActive}
-  toggleVoice={toggleVoice}
-  voiceEnabled={voiceEnabled}
-  setVoiceEnabled={setVoiceEnabled}
-  agentMode={agentMode}
-  setAgentMode={setAgentMode}
-  agentStatus={agentStatus}
-/>
+      <div className={assembling ? 'assemble-header' : ''}>
+        <Header
+          online={online}
+          busy={busy}
+          chatMode={chatMode}
+          setChatMode={setChatMode}
+          isSpeaking={ttsSpeaking}
+          onOpenSettings={() => setSettingsOpen(true)}
+          voiceActive={voiceActive}
+          toggleVoice={toggleVoice}
+          voiceEnabled={voiceEnabled}
+          setVoiceEnabled={setVoiceEnabled}
+          agentMode={agentMode}
+          setAgentMode={setAgentMode}
+          agentStatus={agentStatus}
+        />
+      </div>
 
       {/* MAIN 3-COLUMN GRID */}
-      <nav className="module-rail" aria-label="JARVIS modules">
+      <nav className={`module-rail ${assembling ? 'assemble-rail' : ''}`} aria-label="JARVIS modules">
         <button className={activeView === 'core' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('core')}><Activity size={16} /><span>CORE</span></button>
         <button className={activeView === 'code' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('code')}><Terminal size={16} /><span>CODE CORE</span></button>
         <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
@@ -1130,11 +1086,11 @@ export default function App() {
       </nav>
       <div className="hud-grid">
 
-        {/* ── LEFT COLUMN: Chat + File Bay ── */}
+        {/* â”€â”€ LEFT COLUMN: Chat + File Bay â”€â”€ */}
         <div className="hud-left">
 
           {/* Chat / Transcript */}
-          <div className="panel hud-panel-chat">
+          <div className={`panel hud-panel-chat ${assembling ? 'assemble-chat' : ''}`}>
             <p className="panel-label"><span>Transcript</span><span>{messages.length} entries</span></p>
             <div className="chat-log">
               {messages.map((m, i) => (
@@ -1155,17 +1111,17 @@ export default function App() {
               <div className="pending-image-chip">
                 <img src={pendingImage.previewUrl} alt="preview" />
                 <span className="pending-image-name">{pendingImage.fileName}</span>
-                <button onClick={() => setPendingImage(null)}>✕</button>
+                <button onClick={() => setPendingImage(null)}>âœ•</button>
               </div>
             )}
             {pendingDocument && (
               <div className="pending-image-chip">
                 <FileIcon size={14} />
                 <span className="pending-image-name">{pendingDocument.fileName}</span>
-                <button onClick={() => setPendingDocument(null)}>✕</button>
+                <button onClick={() => setPendingDocument(null)}>âœ•</button>
               </div>
             )}
-            {extracting && <div className="listening-hint">Extracting document…</div>}
+            {extracting && <div className="listening-hint">Extracting documentâ€¦</div>}
 
             {/* Clarification prompt panel */}
             {clarificationPending && (
@@ -1218,23 +1174,23 @@ export default function App() {
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-                placeholder={agentQuestion ? `Answer: "${agentQuestion}"` : (busy && agentRunId) ? 'JARVIS is working — instruct or queue…' : clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvis…' : 'Give a command…'}
+                placeholder={agentQuestion ? `Answer: "${agentQuestion}"` : (busy && agentRunId) ? 'JARVIS is working â€” instruct or queueâ€¦' : clarificationPending ? `Answer: "${clarificationPending.question}"` : chatMode ? 'Chat with Jarvisâ€¦' : 'Give a commandâ€¦'}
                 disabled={busy && !agentRunId && !(agentWaitingForHuman && agentQuestion)}
               />
               <button className="send-btn" onClick={handleSend} disabled={(busy && !agentRunId && !(agentWaitingForHuman && agentQuestion)) || (!prompt.trim() && !pendingImage && !pendingDocument && !clarificationPending)}>
-                {busy ? '…' : 'SEND'}
+                {busy ? 'â€¦' : 'SEND'}
               </button>
             </div>
           </div>
 
           {/* File Bay */}
-          <div className="panel hud-panel-files">
+          <div className={`panel hud-panel-files ${assembling ? 'assemble-files' : ''}`}>
             <p className="panel-label" onClick={() => setActiveView('files')} style={{ cursor: 'pointer' }} title="Click to open full Files & Gallery Album">
               <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <Folder size={12} style={{ color: 'var(--cyan)' }} /> File Bay &amp; Album
               </span>
               <span className="clickable-tag" style={{ background: 'rgba(0,242,254,0.15)', padding: '2px 8px', borderRadius: 4, color: 'var(--cyan)', fontSize: 10 }}>
-                OPEN ALBUM ↗
+                OPEN ALBUM â†—
               </span>
             </p>
             <div className="file-bay">
@@ -1261,19 +1217,24 @@ export default function App() {
           </div>
         </div>
 
-        {/* ── CENTER COLUMN: Telemetry + Sphere + Logs ── */}
+        {/* â”€â”€ CENTER COLUMN: Telemetry + Sphere + Logs â”€â”€ */}
         <div className="hud-center">
-          <Telemetry stats={stats} />
+          <div className={assembling ? 'assemble-telemetry' : ''}>
+            <Telemetry stats={stats} />
+          </div>
 
           <div className="panel hud-panel-sphere">
             <div className="core-display-container">
-              <CoreSphere state={sphereState} agentMode={agentMode} />
+              <CoreSphere
+                state={sphereState}
+                agentMode={agentMode}
+              />
             </div>
           </div>
 
           {/* Show agent events in Agent Mode, otherwise show normal logs */}
           {agentMode && agentEvents.length > 0 && (
-            <div className="panel log-ticker">
+            <div className={`panel log-ticker ${assembling ? 'assemble-ticker' : ''}`}>
               {agentWaitingForHuman && (
                 <div className="line exec">
                   Human verification is required in the browser or app. Complete it, then{' '}
@@ -1282,7 +1243,7 @@ export default function App() {
               )}
               {queuedTasks.length > 0 && (
                 <div className="line exec">
-                  ⏳ Queued ({queuedTasks.length}): {queuedTasks[0].slice(0, 70)}{' '}
+                  â³ Queued ({queuedTasks.length}): {queuedTasks[0].slice(0, 70)}{' '}
                   <button className="btn-secondary" onClick={() => { const [next, ...rest] = queuedTasks; setQueuedTasks(rest); runAgentMode(next) }}>RUN NEXT</button>{' '}
                   <button className="btn-secondary" onClick={() => setQueuedTasks([])}>CLEAR</button>
                 </div>
@@ -1295,7 +1256,7 @@ export default function App() {
             </div>
           )}
           {!agentMode && logs.length > 0 && (
-            <div className="panel log-ticker">
+            <div className={`panel log-ticker ${assembling ? 'assemble-ticker' : ''}`}>
               {[...logs].reverse().map((l, i) => (
                 <div key={i} className={`line ${l.startsWith('ACTION') ? 'exec' : l.startsWith('RESULT') ? 'result' : ''}`}>
                   {l}
@@ -1308,10 +1269,14 @@ export default function App() {
           {timerData && <TimerWidget timerData={timerData} onCancel={() => setTimerData(null)} />}
         </div>
 
-        {/* ── RIGHT COLUMN: Quick Actions + Notes + Phone Mirror ── */}
+        {/* â”€â”€ RIGHT COLUMN: Quick Actions + Notes + Phone Mirror â”€â”€ */}
         <div className="hud-right">
-          <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} agentMode={agentMode} />
-          <PhonePanel />
+          <div className={assembling ? 'assemble-directives' : ''}>
+            <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} agentMode={agentMode} />
+          </div>
+          <div className={assembling ? 'assemble-phone' : ''}>
+            <PhonePanel />
+          </div>
         </div>
       </div>
       </div>{/* end core-view wrapper */}
@@ -1332,7 +1297,7 @@ export default function App() {
               <div className="oauth-row">
                 <div className="oauth-status">
                   <span className={`oauth-dot ${googleLinked === null ? 'checking' : googleLinked ? 'linked' : ''}`} />
-                  {googleLinked === null ? 'Checking…' : googleLinked ? 'Google account linked' : 'Not linked'}
+                  {googleLinked === null ? 'Checkingâ€¦' : googleLinked ? 'Google account linked' : 'Not linked'}
                 </div>
                 {googleLinked
                   ? <button className="btn-secondary" onClick={unlinkGoogle} disabled={oauthBusy}>Unlink</button>
@@ -1349,7 +1314,7 @@ export default function App() {
               <div className="oauth-row">
                 <div className="oauth-status">
                   <span className={`oauth-dot ${gmailLinked === null ? 'checking' : gmailLinked ? 'linked' : ''}`} />
-                  {gmailLinked === null ? 'Checking…' : gmailLinked ? 'Gmail linked' : 'Not linked'}
+                  {gmailLinked === null ? 'Checkingâ€¦' : gmailLinked ? 'Gmail linked' : 'Not linked'}
                 </div>
                 {gmailLinked
                   ? <button className="btn-secondary" onClick={unlinkGmail} disabled={gmailBusy}>Unlink</button>
@@ -1366,7 +1331,7 @@ export default function App() {
                 type="password"
                 value={geminiKey}
                 onChange={e => setGeminiKey(e.target.value)}
-                placeholder="AIza…"
+                placeholder="AIzaâ€¦"
               />
             </div>
             <div className="field">
@@ -1383,7 +1348,7 @@ export default function App() {
                 type="password"
                 value={hfKey}
                 onChange={e => setHfKey(e.target.value)}
-                placeholder="hf_…"
+                placeholder="hf_â€¦"
               />
             </div>
             <div className="field">
@@ -1394,7 +1359,7 @@ export default function App() {
                 onChange={e => setGroqKey(e.target.value)}
                 placeholder="gsk_..."
               />
-              <p className="oauth-hint">Get free key at console.groq.com — used as cloud fallback for voice transcription.</p>
+              <p className="oauth-hint">Get free key at console.groq.com â€” used as cloud fallback for voice transcription.</p>
             </div>
             <div className="field">
               <label>NVIDIA NIM API Key (Autonomous Code Core)</label>
@@ -1404,7 +1369,7 @@ export default function App() {
                 onChange={e => setNvidiaKey(e.target.value)}
                 placeholder="nvapi-..."
               />
-              <p className="oauth-hint">Get free key at build.nvidia.com — powers specialized code audits, bug repairs, and refactoring.</p>
+              <p className="oauth-hint">Get free key at build.nvidia.com â€” powers specialized code audits, bug repairs, and refactoring.</p>
             </div>
             <div className="field">
               <label>NVIDIA NIM Coding Model</label>
@@ -1426,3 +1391,4 @@ export default function App() {
     </div>
   )
 }
+

@@ -831,6 +831,21 @@ class Observer:
             msg = result.get("message", f"WhatsApp action {atype} failed") if isinstance(result, dict) else f"WhatsApp action {atype} returned no result"
             return {"verified": False, "message": msg, "classification": "retryable"}
 
+        elif atype in ("schedule_whatsapp", "list_scheduled_whatsapp",
+                       "cancel_scheduled_whatsapp", "reschedule_scheduled_whatsapp"):
+            if result and result.get("status") == "success":
+                return {"verified": True, "message": result.get("message", f"Scheduling action {atype} succeeded"), "classification": "success"}
+            msg = result.get("message", f"Scheduling action {atype} failed") if isinstance(result, dict) else f"Scheduling action {atype} returned no result"
+            # Parse/help errors (missing contact/time, no match) are deterministic —
+            # replanning the identical action cannot help.
+            if isinstance(result, dict) and any(k in msg.lower() for k in (
+                    "who should i send", "what should the message",
+                    "need a time", "could not understand the time",
+                    "already passed", "no pending", "no scheduled message",
+                    "which scheduled message", "more than a year")):
+                return {"verified": False, "message": msg, "classification": "recoverable"}
+            return {"verified": False, "message": msg, "classification": "retryable"}
+
         elif atype == "generate_image":
             if result and result.get("status") == "success":
                 return {"verified": True, "message": result.get("message", "Image generated"), "classification": "success"}

@@ -35,7 +35,10 @@ class ToolResult:
         }
         if self.data:
             result["data"] = self.data
-        if self.error:
+        # NOTE: the `error` field name collides with the `error()` classmethod
+        # below, so an unset error defaults to the bound method, not None.
+        # Only emit real error payloads; this also keeps results JSON-safe.
+        if self.error and not callable(self.error):
             result["error"] = self.error
         result["recoverable"] = self.recoverable
         if self.metadata:
@@ -236,6 +239,18 @@ class BrowserActionResult(ToolResult):
     title: Optional[str] = None
     page_state: Optional[str] = None
     results: Optional[List[Dict[str, Any]]] = None
+    # Optional payload fields used by extract/type/get_page_text/get_links/
+    # screenshot/click/search callers. All default to None so old code paths
+    # are unaffected; to_dict() only emits fields that are set.
+    text: Optional[str] = None
+    value: Optional[str] = None
+    selector: Optional[str] = None
+    query: Optional[str] = None
+    before_url: Optional[str] = None
+    links: Optional[List[Any]] = None
+    path: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+    retryable: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = super().to_dict()
@@ -247,6 +262,24 @@ class BrowserActionResult(ToolResult):
             result["page_state"] = self.page_state
         if self.results:
             result["results"] = self.results
+        if self.text:
+            result["text"] = self.text
+        if self.value is not None:
+            result["value"] = self.value
+        if self.selector:
+            result["selector"] = self.selector
+        if self.query:
+            result["query"] = self.query
+        if self.before_url:
+            result["before_url"] = self.before_url
+        if self.links is not None:
+            result["links"] = self.links
+        if self.path:
+            result["path"] = self.path
+        if self.details is not None:
+            result["details"] = self.details
+        if self.retryable is not None:
+            result["retryable"] = self.retryable
         return result
 
 

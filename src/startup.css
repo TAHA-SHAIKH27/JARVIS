@@ -1,0 +1,713 @@
+/**
+ * startup.css — Cinematic 3D Startup & Scattered UI Assembly Styling for J.A.R.V.I.S.
+ */
+
+/* ── Cinematic Fullscreen Stage (t = 0 to Assembly) ── */
+.cinematic-startup-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+  background: radial-gradient(ellipse 70% 60% at 50% 50%, #06101e 0%, #030812 60%, #01040a 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  pointer-events: auto;
+  transition: opacity 1.1s cubic-bezier(0.22, 1, 0.36, 1), visibility 1.1s ease;
+}
+
+.cinematic-startup-stage.is-online {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* ── Cybernetic Grid Background ── */
+.cinematic-grid-bg {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: 
+    linear-gradient(rgba(0, 229, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 229, 255, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: center center;
+  mask-image: radial-gradient(circle at center, #000 30%, transparent 85%);
+  z-index: 1;
+}
+
+/* Faint concentric targeting HUD reticle */
+.cinematic-reticle-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: grid;
+  place-items: center;
+  z-index: 2;
+}
+
+.reticle-ring {
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 229, 255, 0.08);
+  pointer-events: none;
+}
+
+.reticle-ring-1 {
+  width: min(54vw, 560px);
+  height: min(54vw, 560px);
+  border-style: dashed;
+  animation: reticle-slow-spin 80s linear infinite;
+}
+
+.reticle-ring-2 {
+  width: min(72vw, 760px);
+  height: min(72vw, 760px);
+  border-color: rgba(0, 229, 255, 0.04);
+}
+
+@keyframes reticle-slow-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Corner HUD Brackets & Technical Coordinates */
+.hud-corner {
+  position: absolute;
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: rgba(67, 217, 255, 0.45);
+  pointer-events: none;
+  z-index: 10;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.hud-corner.top-left {
+  top: 24px;
+  left: 28px;
+  border-top: 1px solid rgba(67, 217, 255, 0.35);
+  border-left: 1px solid rgba(67, 217, 255, 0.35);
+  padding: 8px 14px;
+}
+
+.hud-corner.top-right {
+  top: 24px;
+  right: 28px;
+  border-top: 1px solid rgba(67, 217, 255, 0.35);
+  border-right: 1px solid rgba(67, 217, 255, 0.35);
+  padding: 8px 14px;
+  text-align: right;
+  pointer-events: auto; /* For mute button */
+}
+
+.hud-corner.bottom-left {
+  bottom: 24px;
+  left: 28px;
+  border-bottom: 1px solid rgba(67, 217, 255, 0.35);
+  border-left: 1px solid rgba(67, 217, 255, 0.35);
+  padding: 8px 14px;
+}
+
+.hud-corner.bottom-right {
+  bottom: 24px;
+  right: 28px;
+  border-bottom: 1px solid rgba(67, 217, 255, 0.35);
+  border-right: 1px solid rgba(67, 217, 255, 0.35);
+  padding: 8px 14px;
+  text-align: right;
+}
+
+/* Audio control toggle button */
+.hud-sound-toggle {
+  background: rgba(0, 229, 255, 0.06);
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  color: var(--cyan, #00e5ff);
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 4px 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s ease;
+}
+
+.hud-sound-toggle:hover {
+  background: rgba(0, 229, 255, 0.15);
+  border-color: var(--cyan, #00e5ff);
+  box-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+}
+
+/* ── 3D Canvas Stage Container ── */
+.cinematic-core-stage {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+}
+
+/* ── CoreSphere cinematic phase wrapper ──
+   CSS drives the reveal sequence — CoreSphere renders full-page inside.   */
+.cinematic-sphere-phase {
+  width: 100vw;
+  height: 100vh;
+  pointer-events: auto;
+  transition:
+    transform 1.1s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity   0.7s ease;
+  will-change: transform, opacity;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* BOOT — glowing seed dot */
+.cinematic-sphere-phase.phase-BOOT {
+  transform: scale(0.08);
+  opacity: 0.4;
+  filter: brightness(3);
+}
+
+/* CORE_INITIALIZING — pulse up, crisp high brightness */
+.cinematic-sphere-phase.phase-CORE_INITIALIZING {
+  transform: scale(0.55);
+  opacity: 1;
+  filter: brightness(2.2);
+  animation: sphere-core-pulse 1.8s ease-in-out infinite alternate;
+}
+
+/* CORE_ACTIVE — larger glow */
+.cinematic-sphere-phase.phase-CORE_ACTIVE {
+  transform: scale(0.8);
+  opacity: 1;
+  filter: brightness(1.6);
+  animation: sphere-core-pulse 2.2s ease-in-out infinite alternate;
+}
+
+/* SPHERE_INITIALIZING — sharp dot grid appearance */
+.cinematic-sphere-phase.phase-SPHERE_INITIALIZING {
+  transform: scale(0.92);
+  opacity: 1;
+  filter: brightness(1.35);
+  animation: sphere-core-pulse 2.5s ease-in-out infinite alternate;
+}
+
+/* ORBITALS_INITIALIZING — sharp lock */
+.cinematic-sphere-phase.phase-ORBITALS_INITIALIZING {
+  transform: scale(1.0);
+  opacity: 1;
+  filter: brightness(1.2);
+  animation: sphere-gentle-float 4s ease-in-out infinite alternate;
+}
+
+/* UI_ASSEMBLY onwards — 100% sharp natural render */
+.cinematic-sphere-phase.phase-UI_ASSEMBLY,
+.cinematic-sphere-phase.phase-AUDIT_RUNNING,
+.cinematic-sphere-phase.phase-SYSTEM_VERIFYING,
+.cinematic-sphere-phase.phase-SYSTEM_READY,
+.cinematic-sphere-phase.phase-ONLINE {
+  transform: scale(1.0);
+  opacity: 1;
+  filter: brightness(1.0);
+  animation: sphere-gentle-float 5s ease-in-out infinite alternate;
+}
+
+@keyframes sphere-core-pulse {
+  0%   { transform: scale(0.78); }
+  100% { transform: scale(0.84); }
+}
+
+@keyframes sphere-gentle-float {
+  0%   { transform: translateY(0px); }
+  50%  { transform: translateY(-8px); }
+  100% { transform: translateY(0px); }
+}
+
+
+/* ── Startup Status Telemetry Readout (Lower Center) ── */
+.startup-telemetry-console {
+  position: absolute;
+  bottom: 50px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: rgba(220, 236, 244, 0.7);
+  text-align: center;
+  pointer-events: none;
+  min-width: 380px;
+}
+
+.startup-main-label {
+  font-family: var(--font-display, sans-serif);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.26em;
+  color: var(--cyan, #00e5ff);
+  text-shadow: 0 0 16px rgba(0, 229, 255, 0.5);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.startup-live-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--cyan, #00e5ff);
+  box-shadow: 0 0 10px var(--cyan, #00e5ff);
+  animation: pulse 1s infinite alternate;
+}
+
+.startup-log-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  background: rgba(4, 9, 16, 0.65);
+  border: 1px solid rgba(0, 229, 255, 0.12);
+  padding: 8px 16px;
+  backdrop-filter: blur(8px);
+}
+
+.startup-log-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 9.5px;
+}
+
+.startup-log-item .label {
+  color: rgba(140, 167, 184, 0.8);
+}
+
+.startup-log-item .val {
+  color: var(--cyan, #00e5ff);
+  font-weight: 500;
+}
+
+.startup-log-item .val.ok {
+  color: #72f0b0;
+}
+
+.startup-log-item .val.warn {
+  color: #ffb45c;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCATTERED UI ASSEMBLY KINEMATICS
+   Transforms panels from outer space into exact dashboard coordinates
+   ══════════════════════════════════════════════════════════════ */
+
+/* Initial scattered state before assembly */
+.is-scattered {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.is-scattered.telemetry-scattered {
+  transform: translateY(-160px) scale(0.94);
+}
+
+.is-scattered.directives-scattered {
+  transform: translateX(180px) scale(0.92);
+}
+
+.is-scattered.chat-scattered {
+  transform: translateX(-180px) scale(0.92);
+}
+
+.is-scattered.files-scattered {
+  transform: translateY(160px) translateX(-40px) scale(0.9);
+}
+
+.is-scattered.phone-scattered {
+  transform: translateY(160px) translateX(40px) scale(0.9);
+}
+
+.is-scattered.ticker-scattered {
+  transform: translateY(140px) scale(0.92);
+}
+
+/* ── Panel Assembly Animations ── */
+
+/* Telemetry: Enters from above, slight downward overshoot, settles */
+.assemble-telemetry {
+  animation: telemetry-entry 950ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes telemetry-entry {
+  0% {
+    opacity: 0;
+    transform: translateY(-140px) scale(0.94);
+  }
+  70% {
+    opacity: 1;
+    transform: translateY(9px) scale(1.015);
+  }
+  85% {
+    transform: translateY(-3px) scale(0.995);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Quick Directives: Enters from right, decelerates, locks into position */
+.assemble-directives {
+  animation: directives-entry 900ms cubic-bezier(0.12, 1, 0.28, 1) both;
+}
+
+@keyframes directives-entry {
+  0% {
+    opacity: 0;
+    transform: translateX(180px) scale(0.92);
+  }
+  75% {
+    opacity: 1;
+    transform: translateX(-6px) scale(1.008);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+/* Chat Transcript / Log: Enters from left & below, settles */
+.assemble-chat {
+  animation: chat-entry 880ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes chat-entry {
+  0% {
+    opacity: 0;
+    transform: translateX(-180px) scale(0.92);
+  }
+  75% {
+    opacity: 1;
+    transform: translateX(6px) scale(1.005);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+/* File Bay: Emerges with distinct timing from Chat Log */
+.assemble-files {
+  animation: files-entry 920ms 250ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes files-entry {
+  0% {
+    opacity: 0;
+    transform: translateY(160px) translateX(-30px) scale(0.9);
+  }
+  75% {
+    opacity: 1;
+    transform: translateY(-6px) translateX(2px) scale(1.01);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) translateX(0) scale(1);
+  }
+}
+
+/* Phone Mirroring: Preserved below Quick Directives */
+.assemble-phone {
+  animation: phone-entry 900ms 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes phone-entry {
+  0% {
+    opacity: 0;
+    transform: translateY(160px) translateX(30px) scale(0.9);
+  }
+  75% {
+    opacity: 1;
+    transform: translateY(-5px) translateX(-2px) scale(1.01);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) translateX(0) scale(1);
+  }
+}
+
+/* Center Log Ticker: Rises smoothly from below */
+.assemble-ticker {
+  animation: ticker-entry 850ms 350ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes ticker-entry {
+  0% {
+    opacity: 0;
+    transform: translateY(120px) scale(0.92);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Topbar Header & Module Rail Fade In */
+.assemble-header {
+  animation: header-entry 750ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes header-entry {
+  0% {
+    opacity: 0;
+    transform: translateY(-40px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.assemble-rail {
+  animation: rail-entry 750ms 150ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes rail-entry {
+  0% {
+    opacity: 0;
+    transform: translateX(-40px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  .cinematic-startup-stage {
+    display: none;
+  }
+  .is-scattered,
+  .assemble-telemetry,
+  .assemble-directives,
+  .assemble-chat,
+  .assemble-files,
+  .assemble-phone,
+  .assemble-ticker,
+  .assemble-header,
+  .assemble-rail {
+    animation: none !important;
+    transform: none !important;
+    opacity: 1 !important;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   LIVE SCAN ANIMATIONS — LHS File Scan & RHS Tools Check
+   ══════════════════════════════════════════════════════════════ */
+
+/* LHS Overlay container — big vertical box on left embedded over sphere */
+.scan-animation-overlay-lhs {
+  position: absolute;
+  left: 3.5vw;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  pointer-events: auto;
+}
+
+/* RHS Overlay container — big vertical box on right embedded over sphere */
+.scan-animation-overlay-rhs {
+  position: absolute;
+  right: 3.5vw;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  pointer-events: auto;
+}
+
+/* Main scan panel — Big Vertical Box */
+.scan-animation-panel {
+  width: 310px;
+  height: 440px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(3, 10, 20, 0.96);
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  position: relative;
+}
+
+.scan-panel-lhs {
+  border-left: 3px solid rgba(0, 229, 255, 0.85);
+  animation: scan-panel-lhs-in 450ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.scan-panel-rhs {
+  border-right: 3px solid rgba(0, 229, 255, 0.85);
+  animation: scan-panel-rhs-in 450ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes scan-panel-lhs-in {
+  from { opacity: 0; transform: translateX(-40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes scan-panel-rhs-in {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Header row */
+.scan-anim-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: rgba(0, 229, 255, 0.05);
+  border-bottom: 1px solid rgba(0, 229, 255, 0.18);
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  color: rgba(0, 229, 255, 0.9);
+  text-transform: uppercase;
+}
+
+.scan-anim-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #00e5ff;
+  box-shadow: 0 0 10px #00e5ff;
+  flex-shrink: 0;
+  animation: scan-dot-pulse 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes scan-dot-pulse {
+  from { opacity: 0.5; box-shadow: 0 0 4px #00e5ff; }
+  to   { opacity: 1;   box-shadow: 0 0 14px #00e5ff; }
+}
+
+.scan-anim-count {
+  margin-left: auto;
+  color: rgba(114, 240, 176, 0.9);
+  font-weight: 700;
+}
+
+/* Scrolling lines area — Tall Vertical Scroll */
+.scan-anim-lines {
+  flex: 1;
+  overflow: hidden;
+  padding: 10px 0 8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  position: relative;
+  /* Smooth mask image so lines fade gracefully at top */
+  mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 100%);
+}
+
+.scan-anim-line {
+  font-family: var(--font-mono, monospace);
+  font-size: 9.5px;
+  line-height: 1.7;
+  padding: 0 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.5;
+  transition: opacity 0.1s ease;
+  letter-spacing: 0.05em;
+}
+
+.scan-anim-line-active {
+  opacity: 1 !important;
+}
+
+/* Line type colors */
+.scan-anim-line-file   { color: rgba(56, 189, 248, 0.9); }
+.scan-anim-line-hex    { color: rgba(255, 180, 92, 0.85); }
+.scan-anim-line-token  { color: rgba(167, 139, 250, 0.9); }
+.scan-anim-line-ok     { color: rgba(114, 240, 176, 0.95); font-weight: 600; }
+.scan-anim-line-warn   { color: #ffb45c; }
+
+/* Blinking block cursor */
+.scan-cursor {
+  display: inline;
+  color: #00e5ff;
+  animation: scan-blink 0.55s step-end infinite;
+  font-size: 10px;
+  line-height: 1;
+}
+
+@keyframes scan-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+/* Progress bar footer */
+.scan-anim-progress-wrap {
+  padding: 10px 14px 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border-top: 1px solid rgba(0, 229, 255, 0.14);
+}
+
+.scan-anim-progress-bar {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  position: relative;
+  overflow: visible;
+  margin-bottom: 6px;
+  border-radius: 2px;
+}
+
+.scan-anim-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(0, 229, 255, 0.5), #00e5ff);
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.8);
+  transition: width 0.18s ease-out;
+  position: relative;
+  border-radius: 2px;
+}
+
+/* Travelling glow orb at progress head */
+.scan-anim-progress-glow {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 12px 3px #00e5ff, 0 0 22px #00e5ff;
+  transition: left 0.18s ease-out;
+}
+
+.scan-anim-progress-label {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono, monospace);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: rgba(0, 229, 255, 0.45);
+}
+
+/* Telemetry console positioning when scanning is active */
+.startup-telemetry-console.is-scanning {
+  bottom: 24px;
+}
+

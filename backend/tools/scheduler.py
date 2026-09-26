@@ -414,25 +414,76 @@ def fire_due_whatsapp(send_fn: Callable[[str, str], Dict[str, Any]],
 _SCHEDULE_LEAD = re.compile(
     r"^\s*(?:please\s+)?(?:schedule\s+(?:a\s+)?|send\s+(?:a\s+)?)?"
     r"whatsapp\s+(?:message\s+)?to\s+", re.I)
-_SAY_SPLIT = re.compile(r"\b(?:saying|that\s+says|with\s+(?:the\s+)?message|message\s*:|:)\s*", re.I)
+_GENERIC_MESSAGE_LEAD = re.compile(
+    r"^\s*(?:please\s+)?(?:schedule|send)\s+(?:a\s+)?(?:whatsapp\s+)?message\s+to\s+", re.I)
+_SAY_SPLIT = re.compile(
+    r"\b(?:saying|that\s+says|with\s+(?:the\s+)?message|message\s*:|as)\b\s*:?\s*|:\s*", re.I)
+
+
+def _parse_flexible_order(raw: str) -> Optional[Dict[str, Any]]:
+    """Order-independent fallback: time anywhere, contact after 'to', message
+    after saying/as/:/etc. Handles e.g.
+    'schedule a message at 11 am to +91... as HELLO' (time before contact)."""
+    parsed_time = parse_when(raw)
+    if not parsed_time.get("ok"):
+        return {"error": "I need a time, sir. For example: send whatsapp to Mom at 6pm saying happy birthday."}
+    when = parsed_time["when"]
+    if when <= _now():
+        return {"error": "That time has already passed, sir. Please pick a future time."}
+    remainder = _strip_span(raw, parsed_time.get("span")).strip()
+    if not remainder:
+        return {"error": "Who should I send the WhatsApp to, sir?"}
+    say_parts = _SAY_SPLIT.split(remainder, maxsplit=1)
+    if len(say_parts) != 2:
+        return {"error": "What should the message say, sir? Add 'saying …' (or 'as …') after the time."}
+    left, message = say_parts[0].strip(), say_parts[1].strip(" .,-:")
+    if not message:
+        return {"error": "What should the message say, sir? Add 'saying …' (or 'as …') after the time."}
+    # Contact is whatever follows the LAST 'to' in the left part, so leading
+    # verbs ('schedule a message', 'send whatsapp', ...) never leak into it.
+    contact_match = re.search(r"\bto\s+(.+)$", left.strip(), re.I | re.S)
+    if not contact_match:
+        return {"error": "Who should I send the WhatsApp to, sir? Add 'to …' with a name or number."}
+    contact = contact_match.group(1).strip(" .,-:")
+    # Strip any leftover leading verbs if 'to' was missing earlier (defensive).
+    contact = re.sub(
+        r"^(?:please\s+)?(?:schedule\s+(?:a\s+)?|send\s+(?:a\s+)?)?"
+        r"(?:whatsapp\s+(?:message\s+)?|message\s+)?", "", contact, flags=re.I).strip()
+    if not contact:
+        return {"error": "Who should I send the WhatsApp to, sir?"}
+    return {"contact": contact, "message": message, "when": when}
 
 
 def parse_scheduled_whatsapp(text: str) -> Optional[Dict[str, Any]]:
     """Parse 'send/schedule whatsapp to X at <time> saying Y'.
 
+    Also accepts the generic alias 'schedule (a) [whatsapp] message …'
+    (treated as WhatsApp — the only scheduled-messaging channel) and
+    time-before-contact order ('… at 11 am to +91… as HELLO').
+
     Returns None when this is NOT a scheduling request (e.g. an immediate
     send with no time expression → falls through to the normal sender)."""
     raw = (text or "").strip()
-    if not re.search(r"\bwhatsapp\b", raw, re.I):
+    has_whatsapp = bool(re.search(r"\bwhatsapp\b", raw, re.I))
+    # Generic "schedule/send a message …" (no explicit 'whatsapp') is treated
+    # as a WhatsApp schedule — the only scheduled-messaging channel JARVIS has.
+    has_generic_message = bool(
+        re.search(r"\bmessage\b", raw, re.I)
+        and re.search(r"\b(schedul\w*|send)\b", raw, re.I))
+    if not (has_whatsapp or has_generic_message):
         return None
     if not re.search(r"\b(schedule|at\s+|in\s+\d|in\s+an?\s+|tomorrow|today|tonight|on\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", raw, re.I):
         return None  # no time expression → immediate send, not our business
     body = _SCHEDULE_LEAD.sub("", raw).strip()
     if not body or body == raw.strip():
+        body = _GENERIC_MESSAGE_LEAD.sub("", raw).strip()
+    if not body or body == raw.strip():
         # "whatsapp Mom at 6pm saying hi" without send/schedule verb
         body = re.sub(r"^\s*(?:please\s+)?whatsapp\s+(?:message\s+)?to\s+", "", raw, flags=re.I).strip()
         if not body or body == raw.strip():
-            return None
+            # Time-before-contact order ("… at 11 am to +91… as HELLO") never
+            # fits the contact-first split below — use the flexible parser.
+            return _parse_flexible_order(raw)
     at_split = re.split(r"\s+at\s+", body, maxsplit=1, flags=re.I)
     if len(at_split) == 2:
         contact, rest = at_split[0].strip(), at_split[1].strip()
@@ -441,6 +492,11 @@ def parse_scheduled_whatsapp(text: str) -> Optional[Dict[str, Any]]:
         if len(in_split) >= 3:
             contact, rest = in_split[0].strip(), (in_split[1] + in_split[2]).strip()
         else:
+            # Contact-first split failed (e.g. time-before-contact order) —
+            # retry with the order-independent parser before giving up.
+            flexible = _parse_flexible_order(raw)
+            if flexible is not None and "error" not in flexible:
+                return flexible
             return {"error": "I need a time, sir. For example: send whatsapp to Mom at 6pm saying happy birthday."}
     if not contact:
         return {"error": "Who should I send the WhatsApp to, sir?"}
@@ -454,7 +510,7 @@ def parse_scheduled_whatsapp(text: str) -> Optional[Dict[str, Any]]:
         if parsed_probe.get("ok") and parsed_probe.get("span"):
             message = _strip_span(rest, parsed_probe.get("span")).strip(" .,-:")
     if not message:
-        return {"error": "What should the message say, sir? Add 'saying …' after the time."}
+        return {"error": "What should the message say, sir? Add 'saying …' (or 'as …') after the time."}
     parsed = parse_when(time_part if len(say_parts) == 2 else rest)
     if not parsed.get("ok"):
         return {"error": "I could not understand the time, sir. Try 'at 6pm' or 'in 2 hours'."}
@@ -561,8 +617,11 @@ def handle_schedule_command(text: str) -> Optional[Dict[str, Any]]:
         return _response(result.get("message", ""),
                          f"SCHEDULED WA reschedule: {result.get('status')}", result)
 
-    # -- new scheduled whatsapp --
-    if "whatsapp" in lowered and re.search(r"\b(schedule|at\b|in\s+\d|tomorrow|today|tonight)\b", lowered):
+    # -- new scheduled whatsapp (incl. generic "schedule a message …" alias) --
+    _is_wa = "whatsapp" in lowered
+    _is_generic_msg = ("message" in lowered
+                       and ("schedul" in lowered or "send" in lowered))
+    if (_is_wa or _is_generic_msg) and re.search(r"\b(schedule|at\b|in\s+\d|tomorrow|today|tonight)\b", lowered):
         parsed = parse_scheduled_whatsapp(raw)
         if parsed is None:
             return None  # immediate send → normal sender path

@@ -39,6 +39,42 @@ class PageStateResult:
     details: Dict[str, Any]
 
 
+def unwrap_search_url(url: str) -> str:
+    """Unwrap search-engine redirect URLs to the real destination.
+
+    Search results often contain wrappers (Google Scholar `scholar_url?url=`,
+    Google `/url?q=`, Bing `ck/a?...&u=`, DuckDuckGo `l/?uddg=`) instead of
+    the destination. Navigating the wrapper works (it redirects), but
+    verification then compares the landed URL against the wrapper and
+    wrongly reports a mismatch. Unwrapping first fixes both: fewer hops
+    and a comparable URL. Unknown formats pass through unchanged.
+    """
+    if not url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if not parts.query:
+            return url
+        params = urllib.parse.parse_qs(parts.query)
+        for key in ("url", "q", "uddg", "u"):
+            for raw in params.get(key, []):
+                candidate = urllib.parse.unquote(raw).strip()
+                if candidate.startswith(("http://", "https://")):
+                    return candidate
+                if key == "u":
+                    # Bing encodes the destination (base64, sometimes padded).
+                    try:
+                        padded = candidate + "=" * (-len(candidate) % 4)
+                        decoded = __import__("base64").urlsafe_b64decode(padded).decode("utf-8", errors="strict").strip()
+                        if decoded.startswith(("http://", "https://")):
+                            return decoded
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return url
+
+
 class Browser:
     """Playwright browser control with persistent user profile to avoid CAPTCHAs."""
 
@@ -361,6 +397,25 @@ class Browser:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def search(self, query: str) -> Dict[str, Any]:
+        """
+        Search fast-first: DuckDuckGo (light, usually answers in seconds),
+        then Google, then Bing. First engine with results wins.
+        Returns structured results to avoid redundant extraction step.
+        """
+        try:
+            ddg = await self._search_engine(
+                "https://duckduckgo.com/?q=",
+                query,
+                blocked_domains=["duckduckgo.com", "duck.com"],
+                engine_name="DuckDuckGo",
+            )
+            if ddg.get("status") == "success" and ddg.get("results"):
+                return ddg
+        except Exception:
+            pass
+        return await self._search_google(query)
+
+    async def _search_google(self, query: str) -> Dict[str, Any]:
         """
         Search Google and extract results in one action.
         Falls back to Bing automatically if Google shows CAPTCHA/sorry page.
@@ -1100,14 +1155,14 @@ class Browser:
             return create_browser_result("get_links", "error", f"Failed to get links: {str(e)}")
 
     async def screenshot(self) -> Dict[str, Any]:
-        """Take a screenshot."""
+        """Take a screenshot (laptop Screenshots folder + album mirror)."""
         try:
-            from system_ops import WORK_DIR
-            img_dir = os.path.join(WORK_DIR, "images")
-            os.makedirs(img_dir, exist_ok=True)
+            from system_ops import get_screenshots_dir, mirror_into_gallery
+            img_dir = get_screenshots_dir()
             filename = f"browser_{int(time.time())}.png"
             path = os.path.join(img_dir, filename)
             await self.page.screenshot(path=path)
+            mirror_into_gallery(path)
             return create_browser_result("screenshot", "success", f"Screenshot saved: {path}", path=path)
         except Exception as e:
             return create_browser_result("screenshot", "error", f"Failed to screenshot: {str(e)}")
@@ -1177,6 +1232,278 @@ class Browser:
             return {"status": "success", "message": "Wait completed"}
         except Exception as e:
             return {"status": "error", "message": f"Wait failed: {str(e)}"}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Browser Pro: downloads, login assist, parallel tabs, table extraction
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _filename_from_url(url: str, fallback: str = "download") -> str:
+        try:
+            path = urllib.parse.urlsplit(url).path.rstrip("/")
+            name = path.rsplit("/", 1)[-1] if path else ""
+            name = urllib.parse.unquote(name).strip()
+            if name and "." in name and len(name) <= 128:
+                return re.sub(r'[<>:"/\\|?*]', "_", name)
+        except Exception:
+            pass
+        return fallback
+
+    async def download_file(self, url: str, save_dir: str,
+                            max_mb: int = 100) -> Dict[str, Any]:
+        """Download a file URL directly (no page navigation needed).
+
+        Bounded (default 100MB cap) and never raises — returns a result dict
+        with `path` on success. `save_dir` is created when missing."""
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            import requests
+            resp = requests.get(
+                url, timeout=30, stream=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            if resp.status_code != 200:
+                return create_browser_result("download", "error",
+                    f"Download failed: HTTP {resp.status_code} for {url}")
+            filename = self._filename_from_url(url)
+            ctype = (resp.headers.get("Content-Disposition", "") or "")
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', ctype)
+            if m:
+                cand = urllib.parse.unquote(m.group(1).strip().strip('"'))
+                if cand and len(cand) <= 128:
+                    filename = re.sub(r'[<>:"/\\|?*]', "_", cand)
+            path = os.path.join(save_dir, filename)
+            base, ext = os.path.splitext(path)
+            i = 1
+            while os.path.exists(path):
+                i += 1
+                path = f"{base}_{i}{ext}"
+            size = 0
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > max_mb * 1024 * 1024:
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                        return create_browser_result("download", "error",
+                            f"Download exceeds {max_mb}MB cap — aborted")
+                    f.write(chunk)
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                return create_browser_result("download", "error",
+                    "Download produced an empty file")
+            return create_browser_result("download", "success",
+                f"Downloaded: {path}", path=path, url=url)
+        except Exception as e:
+            return create_browser_result("download", "error",
+                f"Download failed: {str(e)}")
+
+    async def download_via_click(self, selector: str, save_dir: str,
+                                 timeout: int = 15000) -> Dict[str, Any]:
+        """Click a download link/button and capture the browser download event.
+
+        Used when the file has no direct URL (JS-driven downloads). Saves into
+        `save_dir` and returns `path` on success."""
+        await self._ensure_page()
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            locator = self.page.locator(selector).first
+            if await locator.count() == 0:
+                return create_browser_result("download", "error",
+                    f"Download element not found: {selector}")
+            async with self.page.expect_download(timeout=timeout) as dl_info:
+                await locator.click(timeout=8000)
+            download = await dl_info.value
+            filename = download.suggested_filename or "download"
+            filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
+            path = os.path.join(save_dir, filename)
+            await download.save_as(path)
+            if os.path.isfile(path):
+                return create_browser_result("download", "success",
+                    f"Downloaded: {path}", path=path)
+            return create_browser_result("download", "error",
+                "Browser download event fired but no file was saved")
+        except Exception as e:
+            return create_browser_result("download", "error",
+                f"Click-download failed (no download event within {timeout}ms): {str(e)}")
+
+    async def fill_login_username(self, selector: str, username: str) -> Dict[str, Any]:
+        """Fill ONLY the username/email field of a login form.
+
+        Passwords are never accepted here by design — the human completes the
+        password/2FA/CAPTCHA step in the visible browser while the agent waits
+        (human-in-the-loop). Returns success when the value was retained."""
+        await self._ensure_page()
+        try:
+            locator = self.page.locator(selector).first
+            if await locator.count() == 0 or not await locator.is_visible():
+                return create_browser_result("login_fill", "error",
+                    f"Login field unavailable: {selector}")
+            await locator.fill(username, timeout=8000)
+            value = await locator.input_value(timeout=3000)
+            if value != username:
+                return create_browser_result("login_fill", "error",
+                    f"Username was not retained by {selector}")
+            return create_browser_result("login_fill", "success",
+                "Username entered — waiting for human to complete password/2FA", value=value)
+        except Exception as e:
+            return create_browser_result("login_fill", "error",
+                f"Failed to fill login field: {str(e)}")
+
+    async def check_logged_in(self) -> Dict[str, Any]:
+        """Heuristic login check: logout/account markers or post-login URL.
+
+        Returns `logged_in: True/False` plus the evidence found. Conservative:
+        unknown pages report False so the agent asks the human instead of
+        claiming a login it cannot prove."""
+        await self._ensure_page()
+        try:
+            url = (self.page.url or "").lower()
+            body = await self.page.evaluate(
+                "() => (document.body ? document.body.innerText : '').slice(0, 8000)")
+            text = (body or "").lower()
+            if self.page.url:
+                try:
+                    title = (await self.page.title() or "").lower()
+                except Exception:
+                    title = ""
+                text = f"{title}\n{text}"
+            login_markers = ["log out", "logout", "sign out", "sign-out",
+                             "my account", "account settings", "dashboard"]
+            evidence = [m for m in login_markers if m in text]
+            on_login_page = any(k in url for k in
+                ["login", "signin", "sign-in", "auth", "sso", "oauth"])
+            logged_in = bool(evidence) or (not on_login_page and bool(evidence))
+            if evidence:
+                logged_in = True
+            return create_browser_result("login_check",
+                "success" if logged_in else "error",
+                ("Logged in (%s)" % ", ".join(evidence)) if logged_in
+                else "No login evidence found (still on login page or no account markers)",
+                logged_in=logged_in, url=self.page.url)
+        except Exception as e:
+            return create_browser_result("login_check", "error",
+                f"Login check failed: {str(e)}", logged_in=False)
+
+    async def extract_tables(self, max_tables: int = 5,
+                             max_rows: int = 200) -> Dict[str, Any]:
+        """Extract HTML tables from the current page as structured rows.
+
+        Returns `tables: [{caption, headers, rows}]`. Never raises."""
+        await self._ensure_page()
+        try:
+            raw = await self.page.evaluate("""() => {
+                const out = [];
+                for (const t of document.querySelectorAll('table')) {
+                    const rows = [];
+                    for (const tr of t.querySelectorAll('tr')) {
+                        const cells = [];
+                        for (const c of tr.querySelectorAll('th, td')) {
+                            cells.push((c.innerText || '').trim().replace(/\\s+/g, ' '));
+                        }
+                        if (cells.length) rows.push(cells);
+                    }
+                    if (!rows.length) continue;
+                    let caption = '';
+                    const cap = t.querySelector('caption');
+                    if (cap) caption = (cap.innerText || '').trim().slice(0, 120);
+                    out.push({caption, rows});
+                }
+                return out;
+            }""")
+            tables = []
+            for entry in (raw or [])[:max_tables]:
+                rows = entry.get("rows", [])[:max_rows]
+                if not rows:
+                    continue
+                first = rows[0]
+                rest = rows[1:]
+                # Heuristic: first row is a header when no cell looks numeric.
+                is_header = first and not any(
+                    re.search(r"\d", c) for c in first)
+                tables.append({
+                    "caption": entry.get("caption", ""),
+                    "headers": first if is_header else [],
+                    "rows": rest if is_header else rows,
+                })
+            if not tables:
+                return create_browser_result("extract_table", "error",
+                    "No HTML tables found on this page", tables=[])
+            return create_browser_result("extract_table", "success",
+                f"Extracted {len(tables)} table(s)", tables=tables)
+        except Exception as e:
+            return create_browser_result("extract_table", "error",
+                f"Table extraction failed: {str(e)}", tables=[])
+
+    async def extract_parallel(self, urls: List[str],
+                               max_pages: int = 5) -> Dict[str, Any]:
+        """Open up to `max_pages` URLs in separate tabs and extract each.
+
+        Tabs are navigated concurrently; text is then pulled through the
+        existing single-page extractor so cleaning rules stay identical.
+        Extra tabs are closed afterwards and the original tab is restored.
+        Returns `sources: [{url, title, text}]`. Never raises."""
+        await self._ensure_page()
+        urls = [u for u in (urls or []) if u and u.startswith(("http://", "https://"))]
+        urls = urls[:max(1, max_pages)]
+        if not urls:
+            return create_browser_result("parallel_extract", "error",
+                "No valid http(s) URLs provided", sources=[])
+        original = self.page
+        pages = []
+        try:
+            for _ in urls:
+                try:
+                    pages.append(await self.context.new_page())
+                except Exception:
+                    pass
+            if not pages:
+                return create_browser_result("parallel_extract", "error",
+                    "Could not open new tabs", sources=[])
+
+            async def _load(page, url):
+                try:
+                    await page.goto(unwrap_search_url(url), wait_until="domcontentloaded",
+                                    timeout=25000)
+                    return True
+                except Exception:
+                    return False
+
+            await asyncio.gather(*[_load(p, u) for p, u in zip(pages, urls)])
+            sources = []
+            for page, url in zip(pages, urls):
+                if page.is_closed():
+                    continue
+                self.page = page
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                text_res = await self.get_page_text()
+                text = text_res.get("text", "") if text_res else ""
+                if text and len(text.strip()) > 50:
+                    sources.append({"url": page.url or url,
+                                    "title": title, "text": text[:5000]})
+            return create_browser_result("parallel_extract", "success",
+                f"Extracted {len(sources)}/{len(urls)} pages", sources=sources)
+        except Exception as e:
+            return create_browser_result("parallel_extract", "error",
+                f"Parallel extraction failed: {str(e)}", sources=[])
+        finally:
+            for p in pages:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+            try:
+                if original and not original.is_closed():
+                    self.page = original
+                else:
+                    await self._ensure_page()
+            except Exception:
+                pass
 
     @property
     def current_url(self) -> str:

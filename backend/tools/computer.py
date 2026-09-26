@@ -349,14 +349,16 @@ class Computer:
             return create_computer_result("press_key", ToolResultStatus.ERROR.value, f"Failed to press key: {str(e)}", recoverable=True)
 
     async def screenshot(self, state: TaskState) -> Dict[str, Any]:
+        """Capture the screen into the laptop's main Screenshots folder
+        (mirrored to the JARVIS album)."""
         try:
             import pyautogui
             import os
-            from system_ops import WORK_DIR
-            img_dir = os.path.join(WORK_DIR, "screenshots")
-            os.makedirs(img_dir, exist_ok=True)
+            from system_ops import get_screenshots_dir, mirror_into_gallery
+            img_dir = get_screenshots_dir()
             path = os.path.join(img_dir, f"ui_{int(time.time() * 1000)}.png")
             pyautogui.screenshot(path)
+            mirror_into_gallery(path)
             return create_computer_result("screenshot", ToolResultStatus.SUCCESS.value, f"Screenshot saved: {path}", screenshot_path=path)
         except Exception as e:
             return create_computer_result("screenshot", ToolResultStatus.ERROR.value, f"Failed to take screenshot: {str(e)}", recoverable=True)
@@ -397,11 +399,11 @@ class Computer:
     # ════════════════════════════════════════════════════════════════════════
 
     async def get_screen(self, state: TaskState) -> Dict[str, Any]:
-        """Capture full screen using mss (efficient) or pyautogui fallback."""
+        """Capture full screen using mss (efficient) or pyautogui fallback.
+        Saves to the laptop's main Screenshots folder (mirrored to the album)."""
         try:
-            from system_ops import WORK_DIR
-            img_dir = os.path.join(WORK_DIR, "screenshots")
-            os.makedirs(img_dir, exist_ok=True)
+            from system_ops import get_screenshots_dir, mirror_into_gallery
+            img_dir = get_screenshots_dir()
             path = os.path.join(img_dir, f"screen_{int(time.time() * 1000)}.png")
 
             mss_instance = self._get_mss()
@@ -413,6 +415,7 @@ class Computer:
             else:
                 return create_computer_result("get_screen", ToolResultStatus.ERROR.value, "No screenshot backend available", recoverable=False)
 
+            mirror_into_gallery(path)
             return create_computer_result("get_screen", ToolResultStatus.SUCCESS.value, f"Full screen captured: {path}", screenshot_path=path)
         except Exception as e:
             return create_computer_result("get_screen", ToolResultStatus.ERROR.value, f"Failed to capture screen: {str(e)}", recoverable=True)
@@ -578,11 +581,10 @@ class Computer:
         return create_computer_result("wait_for_element", ToolResultStatus.ERROR.value, f"Element not found within {timeout}s: {criteria}", recoverable=True)
 
     async def screenshot_region(self, x: int, y: int, width: int, height: int, state: TaskState) -> Dict[str, Any]:
-        """Capture a specific screen region."""
+        """Capture a specific screen region (laptop Screenshots + album mirror)."""
         try:
-            from system_ops import WORK_DIR
-            img_dir = os.path.join(WORK_DIR, "screenshots")
-            os.makedirs(img_dir, exist_ok=True)
+            from system_ops import get_screenshots_dir, mirror_into_gallery
+            img_dir = get_screenshots_dir()
             path = os.path.join(img_dir, f"region_{int(time.time() * 1000)}.png")
 
             mss_instance = self._get_mss()
@@ -597,6 +599,7 @@ class Computer:
             else:
                 return create_computer_result("screenshot_region", ToolResultStatus.ERROR.value, "No screenshot backend available for region capture", recoverable=False)
 
+            mirror_into_gallery(path)
             return create_computer_result("screenshot_region", ToolResultStatus.SUCCESS.value, f"Region captured: {path}", screenshot_path=path, data={"region": [x, y, width, height]})
         except Exception as e:
             return create_computer_result("screenshot_region", ToolResultStatus.ERROR.value, f"Failed to capture region: {str(e)}", recoverable=True)

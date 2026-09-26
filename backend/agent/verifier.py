@@ -159,6 +159,20 @@ class Verifier:
             }
         elif not exec_ok:
             # Executor error - check if it's a known recoverable error
+            if classification == "fatal":
+                # Deterministic failure (e.g. terminal policy block): retrying
+                # the identical action cannot help — fail fast with the reason.
+                return {
+                    "verified": False,
+                    "outcome": VerificationOutcome.FAILURE.value,
+                    "status": "fatal",
+                    "message": obs_message or exec_message,
+                    "should_retry": False,
+                    "classification": FailureClassification.FATAL.value,
+                    "requires_user": False,
+                    "recoverable": False,
+                    "confidence": 0.05,
+                }
             if "timeout" in exec_message.lower() or "timed out" in exec_message.lower():
                 return {
                     "verified": False,
