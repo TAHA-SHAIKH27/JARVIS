@@ -131,3 +131,13 @@ Baseline (2026-09-27): `test_scheduler.py` + `backend/agent/test_phase1_runtime.
   + older than 30d only; unread never auto-removed). Verification: smoke
   (upsert dedup, read/unread counts, dismiss visibility, clear guards) OK.
   Commit `feat: persistent notification store` pushed, in sync.
+- 2026-09-27 — Step 3 DONE: scheduler + API (`backend/tools/scheduler.py`,
+  `main.py`). `fire_due_reminders` uses `mark_triggered` (stable id, no dup);
+  new `cancel/reschedule_job_by_id`; gmail/whatsapp results persist with stable
+  ids (`gmail:<id>`, `wa:<job-id>`); reminders stay views (no duplication).
+  Endpoints: toasts (compat + unread_count), unread-count, center snapshot,
+  reminders, scheduled, read/unread/read-all/delete/clear-history/snooze,
+  reminder + scheduled delete/reschedule. Verification: import OK; 26 passed
+  (scheduler/runtime/gmail); TestClient E2E (create→fire→unread→snooze→
+  refire-0→read→unread→delete→gone) OK. Commit `feat: notification APIs`
+  pushed, in sync.

@@ -260,21 +260,75 @@ def cancel_reminder(fragment: str) -> Dict[str, Any]:
 
 
 def fire_due_reminders(on_fire: Callable[[Dict[str, Any]], None]) -> int:
-    """Speak+toast every due reminder exactly once. Returns fired count."""
+    """Speak+toast every due reminder exactly once. Returns fired count.
+
+    Firing marks the reminder TRIGGERED/UNREAD in ReminderStore (stable id,
+    persisted) instead of the legacy completed-only flag, so restarts can
+    never mint a second identity for the same reminder and the Notification
+    Center can show it as unread history."""
     fired = 0
     try:
         from backend.agent.phase1_runtime import runtime
         for reminder in runtime.reminders.due():
             try:
-                on_fire({"kind": "reminder", "text": str(reminder.get("text") or ""),
-                         "reminder": reminder})
-                runtime.reminders.complete(reminder.get("id", ""))
+                marked = runtime.reminders.mark_triggered(reminder.get("id", ""))
+                live = marked.get("reminder", reminder) if marked.get("status") == "success" else reminder
+                on_fire({"kind": "reminder", "text": str(live.get("text") or ""),
+                         "reminder": live})
                 fired += 1
             except Exception:
                 continue
     except Exception:
         pass
     return fired
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    for job in _load_jobs():
+        if job.get("id") == job_id:
+            return job
+    return None
+
+
+def cancel_job_by_id(job_id: str) -> Dict[str, Any]:
+    """Cancel one scheduled WhatsApp by stable id. Keeps the record as
+    cancelled history (never refires, never disappears silently)."""
+    jobs = _load_jobs()
+    for job in jobs:
+        if job.get("id") == job_id:
+            if job.get("status") != "pending":
+                return {"status": "error",
+                        "message": f"That message is already {job.get('status')}, sir."}
+            job["status"] = "cancelled"
+            _save_jobs(jobs)
+            return {"status": "success",
+                    "message": f"Cancelled the scheduled WhatsApp to {job.get('contact')}, sir.",
+                    "job": job}
+    return {"status": "error", "message": "Scheduled message not found, sir."}
+
+
+def reschedule_job_by_id(job_id: str, when: datetime) -> Dict[str, Any]:
+    """Move one pending job to a new future time (stable id, history kept)."""
+    if when.tzinfo is None:
+        return {"status": "error", "message": "I need a timezone-aware time, sir."}
+    if when <= _now():
+        return {"status": "error",
+                "message": "That time has already passed, sir. Please pick a future time."}
+    if (when - _now()) > timedelta(days=366):
+        return {"status": "error", "message": "That is more than a year away, sir."}
+    jobs = _load_jobs()
+    for job in jobs:
+        if job.get("id") == job_id:
+            if job.get("status") != "pending":
+                return {"status": "error",
+                        "message": f"That message is already {job.get('status')}, sir."}
+            job["send_at"] = when.isoformat()
+            _save_jobs(jobs)
+            return {"status": "success",
+                    "message": f"Rescheduled, sir. WhatsApp to {job.get('contact')} "
+                               f"now sends {describe_when(when)}.",
+                    "job": job}
+    return {"status": "error", "message": "Scheduled message not found, sir."}
 
 
 # ── scheduled WhatsApp store ──────────────────────────────────────────────────

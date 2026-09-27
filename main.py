@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 import os
 import asyncio
 import json
@@ -481,6 +481,15 @@ def _announce_mail(message: Dict[str, Any]) -> None:
     speak_text = message.get("speak") or ""
     title = f"Important mail from {message.get('from_name', 'Unknown sender')}"
     _push_notification("gmail", title, str(message.get("subject", "")), speak_text)
+    try:
+        from backend.agent import notifications as _nc
+        mid = str(message.get("id") or "").strip()
+        _nc.upsert_notification(f"gmail:{mid}" if mid else str(uuid.uuid4()),
+                                "gmail", title, str(message.get("subject", "")),
+                                speak_text, priority="important",
+                                ref_type="gmail", ref_id=mid)
+    except Exception as exc:
+        print(f"[gmail] persist announce failed: {exc}")
     if not speak_text:
         return
     try:
@@ -581,10 +590,14 @@ def gmail_check_now():
 
 @app.get("/api/notifications")
 def list_notifications():
-    """Undismissed toasts for the UI (polled alongside /api/status)."""
+    """Undismissed toasts for the UI (polled alongside /api/status).
+
+    Shape preserved for the existing toast stack; unread_count (persistent
+    notifications + unread triggered reminders) added for the badge."""
     with _NOTIFICATIONS_LOCK:
         items = [dict(n) for n in _NOTIFICATIONS if not n.get("dismissed")]
-    return {"notifications": items, "count": len(items)}
+    return {"notifications": items, "count": len(items),
+            "unread_count": _center_unread_count()}
 
 
 class DismissRequest(BaseModel):
@@ -601,7 +614,339 @@ def dismiss_notification(req: DismissRequest):
                 if not item.get("dismissed"):
                     item["dismissed"] = True
                     removed += 1
-    return {"status": "success", "dismissed": removed}
+    persistent = {"status": "skipped"}
+    if req.id:
+        persistent = _do_center_action("dismiss", req.id)
+    elif req.all:
+        try:
+            from backend.agent import notifications as _nc
+            from backend.agent.phase1_runtime import runtime as _rt
+            for item in _nc.list_notifications():
+                _nc.dismiss(item["id"])
+            for reminder in _rt.reminders.active_for_bar():
+                _rt.reminders.dismiss(reminder["id"])
+            persistent = {"status": "success"}
+        except Exception as exc:
+            persistent = {"status": "error", "message": str(exc)[:160]}
+    return {"status": "success", "dismissed": removed, "persistent": persistent,
+            "unread_count": _center_unread_count()}
+
+
+# ── Notification Center (persistent, stable IDs) ─────────────────────────────
+# Reminders + scheduled messages are VIEWS over their own stores (no second
+# reminder system, no duplicate records). Only gmail/whatsapp/system
+# notifications live in the notification store. The backend is the source of
+# truth: every action mutates backend state first, the frontend mirrors it.
+def _center_unread_count() -> int:
+    total = 0
+    try:
+        from backend.agent import notifications as _nc
+        total += _nc.unread_count()
+    except Exception:
+        pass
+    try:
+        from backend.agent.phase1_runtime import runtime as _rt
+        total += _rt.reminders.unread_count()
+    except Exception:
+        pass
+    return total
+
+
+def _split_center_id(nid: str):
+    nid = (nid or "").strip()
+    for prefix in ("reminder:", "scheduled:"):
+        if nid.startswith(prefix):
+            return prefix[:-1], nid[len(prefix):]
+    return "notification", nid
+
+
+def _reminder_to_item(reminder: Dict[str, Any]) -> Dict[str, Any]:
+    rid = str(reminder.get("id") or "")
+    ts = (reminder.get("notified_at") or reminder.get("due_at")
+          or reminder.get("created_at") or "")
+    return {"id": f"reminder:{rid}", "kind": "reminder", "title": "Reminder",
+            "body": str(reminder.get("text") or ""),
+            "ts": ts, "due_at": reminder.get("due_at"),
+            "read": bool(reminder.get("read")),
+            "dismissed": bool(reminder.get("dismissed")),
+            "priority": reminder.get("priority") or "normal",
+            "status": reminder.get("status") or "scheduled",
+            "ref_id": rid}
+
+
+def _job_to_item(job: Dict[str, Any]) -> Dict[str, Any]:
+    jid = str(job.get("id") or "")
+    status = str(job.get("status") or "pending")
+    return {"id": f"scheduled:{jid}", "kind": "scheduled",
+            "title": f"WhatsApp to {job.get('contact') or 'Unknown'}",
+            "body": str(job.get("message") or ""),
+            "ts": job.get("send_at") or job.get("created_at") or "",
+            "due_at": job.get("send_at"),
+            "read": status != "pending", "dismissed": False,
+            "priority": "normal", "status": status, "ref_id": jid,
+            "contact": job.get("contact") or ""}
+
+
+def _do_center_action(action: str, nid: str,
+                       minutes: float = 10.0,
+                       when_iso: str = "") -> Dict[str, Any]:
+    """Route one read/unread/dismiss/delete/snooze by stable id prefix."""
+    kind, bare = _split_center_id(nid)
+    try:
+        if kind == "reminder":
+            from backend.agent.phase1_runtime import runtime as _rt
+            store = _rt.reminders
+            if action == "read":
+                return store.mark_read(bare)
+            if action == "unread":
+                return store.mark_unread(bare)
+            if action == "dismiss":
+                return store.dismiss(bare)
+            if action == "delete":
+                return store.remove(bare)
+            if action == "snooze":
+                return store.snooze(bare, minutes=minutes,
+                                    when_iso=when_iso or None)
+            return {"status": "error", "message": f"Unknown action '{action}'."}
+        if kind == "scheduled":
+            from backend.tools import scheduler as _sched
+            if action == "delete":
+                return _sched.cancel_job_by_id(bare)
+            if action in ("read", "dismiss"):
+                return {"status": "success", "message": "Noted, sir."}
+            if action == "snooze" or action == "reschedule":
+                return {"status": "error",
+                        "message": "Reschedule a message with a new time, sir."}
+            if action == "unread":
+                return {"status": "error",
+                        "message": "Scheduled messages have no unread state, sir."}
+            return {"status": "error", "message": f"Unknown action '{action}'."}
+        from backend.agent import notifications as _nc
+        if action == "read":
+            return _nc.mark_read(bare if bare != nid else nid)
+        if action == "unread":
+            return _nc.mark_unread(bare if bare != nid else nid)
+        if action == "dismiss":
+            return _nc.dismiss(bare if bare != nid else nid)
+        if action == "delete":
+            return _nc.delete(bare if bare != nid else nid)
+        return {"status": "error", "message": f"Unknown action '{action}'."}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:160]}
+
+
+class CenterActionRequest(BaseModel):
+    id: str = ""
+
+
+class SnoozeRequest(BaseModel):
+    id: str = ""
+    minutes: float = 10.0
+    when: str = ""
+
+
+class RescheduleRequest(BaseModel):
+    when: str = ""
+
+
+@app.get("/api/notifications/unread-count")
+def notifications_unread_count():
+    return {"unread": _center_unread_count()}
+
+
+@app.get("/api/notifications/center")
+def notification_center():
+    """Aggregated snapshot for the Notification Center panel."""
+    try:
+        from backend.agent import notifications as _nc
+        _nc.purge_expired()
+        standalone = _nc.list_notifications(include_dismissed=True)
+    except Exception:
+        standalone = []
+    try:
+        from backend.agent.phase1_runtime import runtime as _rt
+        history = _rt.reminders.history()
+        active = [r for r in history if r.get("status") == "triggered"
+                  and not r.get("read") and not r.get("dismissed")]
+        upcoming = [r for r in history
+                    if r.get("status") in ("scheduled", "snoozed")
+                    and not r.get("completed")]
+        past = [r for r in history
+                if r.get("status") in ("triggered", "dismissed", "done")]
+    except Exception:
+        active, upcoming, past = [], [], []
+    try:
+        from backend.tools import scheduler as _sched
+        jobs = _sched.list_scheduled(include_done=True)
+    except Exception:
+        jobs = []
+    return {"notifications": standalone,
+            "reminders": {"active": [_reminder_to_item(r) for r in active],
+                          "upcoming": [_reminder_to_item(r) for r in upcoming],
+                          "history": [_reminder_to_item(r) for r in past]},
+            "scheduled": [_job_to_item(j) for j in jobs],
+            "unread_count": _center_unread_count()}
+
+
+@app.get("/api/reminders")
+def list_reminders_api():
+    try:
+        from backend.agent.phase1_runtime import runtime as _rt
+        history = _rt.reminders.history()
+        return {"active": [_reminder_to_item(r) for r in _rt.reminders.active_for_bar()],
+                "upcoming": [_reminder_to_item(r) for r in history
+                             if r.get("status") in ("scheduled", "snoozed")
+                             and not r.get("completed")],
+                "history": [_reminder_to_item(r) for r in history
+                            if r.get("status") in ("triggered", "dismissed", "done")],
+                "unread": _rt.reminders.unread_count()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.get("/api/scheduled")
+def list_scheduled_api():
+    try:
+        from backend.tools import scheduler as _sched
+        jobs = _sched.list_scheduled(include_done=True)
+        return {"jobs": [_job_to_item(j) for j in jobs],
+                "pending": sum(1 for j in jobs if j.get("status") == "pending")}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/notifications/read")
+def notification_read(req: CenterActionRequest):
+    if not req.id.strip():
+        raise HTTPException(status_code=400, detail="Notification id required.")
+    res = _do_center_action("read", req.id)
+    if res.get("status") != "success":
+        raise HTTPException(status_code=404, detail=res.get("message", "Not found."))
+    return {**res, "unread_count": _center_unread_count()}
+
+
+@app.post("/api/notifications/unread")
+def notification_unread(req: CenterActionRequest):
+    if not req.id.strip():
+        raise HTTPException(status_code=400, detail="Notification id required.")
+    res = _do_center_action("unread", req.id)
+    if res.get("status") != "success":
+        raise HTTPException(status_code=404, detail=res.get("message", "Not found."))
+    return {**res, "unread_count": _center_unread_count()}
+
+
+@app.post("/api/notifications/read-all")
+def notification_read_all():
+    try:
+        from backend.agent import notifications as _nc
+        result = _nc.mark_all_read()
+    except Exception as exc:
+        result = {"status": "error", "message": str(exc)[:160]}
+    try:
+        from backend.agent.phase1_runtime import runtime as _rt
+        marked = 0
+        for reminder in _rt.reminders.active_for_bar():
+            if _rt.reminders.mark_read(reminder["id"]).get("status") == "success":
+                marked += 1
+        result["reminders_marked"] = marked
+    except Exception:
+        pass
+    return {**result, "unread_count": _center_unread_count()}
+
+
+@app.post("/api/notifications/delete")
+def notification_delete(req: CenterActionRequest):
+    if not req.id.strip():
+        raise HTTPException(status_code=400, detail="Notification id required.")
+    res = _do_center_action("delete", req.id)
+    if res.get("status") != "success":
+        raise HTTPException(status_code=404, detail=res.get("message", "Not found."))
+    return {**res, "unread_count": _center_unread_count()}
+
+
+@app.post("/api/notifications/clear-history")
+def notification_clear_history():
+    """Delete read notification history. Never touches unread items, future
+    reminders, or scheduled messages (different stores by construction)."""
+    try:
+        from backend.agent import notifications as _nc
+        result = _nc.clear_read_history()
+    except Exception as exc:
+        result = {"status": "error", "message": str(exc)[:160]}
+    return {**result, "unread_count": _center_unread_count()}
+
+
+@app.post("/api/notifications/snooze")
+def notification_snooze(req: SnoozeRequest):
+    if not req.id.strip():
+        raise HTTPException(status_code=400, detail="Notification id required.")
+    kind, _ = _split_center_id(req.id)
+    if kind != "reminder":
+        raise HTTPException(status_code=400,
+                            detail="Only reminders can be snoozed, sir.")
+    res = _do_center_action("snooze", req.id, minutes=req.minutes,
+                            when_iso=(req.when or "").strip())
+    if res.get("status") != "success":
+        raise HTTPException(status_code=400, detail=res.get("message", "Snooze failed."))
+    wake = str(res.get("wake_at") or "")
+    try:
+        from backend.tools.scheduler import describe_when as _describe
+        from datetime import datetime as _dt
+        human = _describe(_dt.fromisoformat(wake)) if wake else wake
+    except Exception:
+        human = wake
+    return {**res, "human": human, "unread_count": _center_unread_count()}
+
+
+@app.delete("/api/reminders/{reminder_id}")
+def delete_reminder_api(reminder_id: str):
+    if not reminder_id.strip():
+        raise HTTPException(status_code=400, detail="Reminder id required.")
+    _, bare = _split_center_id(reminder_id)
+    try:
+        from backend.agent.phase1_runtime import runtime as _rt
+        res = _rt.reminders.remove(bare)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+    if res.get("status") != "success":
+        raise HTTPException(status_code=404, detail=res.get("message", "Not found."))
+    return {**res, "unread_count": _center_unread_count()}
+
+
+@app.delete("/api/scheduled/{job_id}")
+def delete_scheduled_api(job_id: str):
+    """Cancel one scheduled message (kept as cancelled history, never refires)."""
+    if not job_id.strip():
+        raise HTTPException(status_code=400, detail="Scheduled message id required.")
+    _, bare = _split_center_id(job_id)
+    try:
+        from backend.tools import scheduler as _sched
+        res = _sched.cancel_job_by_id(bare)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+    if res.get("status") != "success":
+        raise HTTPException(status_code=404, detail=res.get("message", "Not found."))
+    return res
+
+
+@app.post("/api/scheduled/{job_id}/reschedule")
+def reschedule_scheduled_api(job_id: str, req: RescheduleRequest):
+    if not (req.when or "").strip():
+        raise HTTPException(status_code=400, detail="New time required.")
+    try:
+        from datetime import datetime as _dt
+        when = _dt.fromisoformat(req.when.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid time format.")
+    _, bare = _split_center_id(job_id)
+    try:
+        from backend.tools import scheduler as _sched
+        res = _sched.reschedule_job_by_id(bare, when)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+    if res.get("status") != "success":
+        raise HTTPException(status_code=400, detail=res.get("message", "Reschedule failed."))
+    return res
 
 
 # ── Normal-mode scheduler ticker (reminders + scheduled WhatsApp) ────────────
@@ -640,6 +985,19 @@ def _on_whatsapp_result(job: Dict[str, Any], result: Dict[str, Any]) -> None:
         speak_text = (f"Sir, the scheduled WhatsApp to {contact} failed: "
                       f"{str(result.get('message') or 'unknown error')[:160]}")
         _push_notification("whatsapp", "WhatsApp failed", speak_text, speak_text)
+    try:
+        from backend.agent import notifications as _nc
+        jid = str(job.get("id") or "").strip()
+        _nc.upsert_notification(f"wa:{jid}" if jid else str(uuid.uuid4()),
+                                "whatsapp",
+                                "WhatsApp delivered" if ok else "WhatsApp failed",
+                                (f"To {contact}: {str(job.get('message') or '')[:120]}"
+                                 if ok else speak_text),
+                                speak_text,
+                                priority="normal" if ok else "urgent",
+                                ref_type="scheduled", ref_id=jid)
+    except Exception as exc:
+        print(f"[scheduler] persist whatsapp result failed: {exc}")
     try:
         get_voice_system().speak(speak_text, priority=5, interrupt=False)
     except Exception as exc:
