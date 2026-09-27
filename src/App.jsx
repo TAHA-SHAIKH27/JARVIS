@@ -491,6 +491,19 @@ export default function App() {
     } catch { }
   }
 
+  // Declared up here (before the mount/poll effect below): the effect's
+  // dependency array is evaluated during render, so this must already be
+  // initialized — otherwise the whole page blanks with a TDZ ReferenceError.
+  const refreshVoiceMute = useCallback(async () => {
+    try {
+      const res = await fetch('/api/voice/mute')
+      if (res.ok) {
+        const data = await res.json()
+        if (typeof data.muted === 'boolean') setVoiceEnabled(!data.muted)
+      }
+    } catch { }
+  }, [])
+
   const refreshStats = useCallback(async () => {
     try {
       const res = await fetch('/api/stats')
@@ -604,16 +617,6 @@ export default function App() {
       setMessages(m => [...m, { role: 'jarvis', text: 'Frontend voice muted, sir — but I could not reach the backend voice, so PC announcements may still speak.' }])
     }
   }, [voiceEnabled])
-
-  const refreshVoiceMute = useCallback(async () => {
-    try {
-      const res = await fetch('/api/voice/mute')
-      if (res.ok) {
-        const data = await res.json()
-        if (typeof data.muted === 'boolean') setVoiceEnabled(!data.muted)
-      }
-    } catch { }
-  }, [])
 
   function toggleVoice() {
     toggleListening()
