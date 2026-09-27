@@ -196,12 +196,20 @@ export default function CoreSphere({ state = 'idle', agentMode = false, startupP
     event.currentTarget.releasePointerCapture?.(event.pointerId)
   }
   
-  // Mouse wheel listener for zooming the sphere enormously or making it smaller
-  const handleWheel = (event) => {
-    event.preventDefault()
-    const zoomDelta = event.deltaY < 0 ? 0.12 : -0.12
-    zoomRef.current = Math.max(0.4, Math.min(3.8, zoomRef.current + zoomDelta))
-  }
+  // Mouse wheel zoom needs preventDefault, but React attaches wheel
+  // listeners as passive (calling preventDefault warns in the console).
+  // A native non-passive listener on the canvas avoids the warning.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const onWheelNative = (event) => {
+      event.preventDefault()
+      const zoomDelta = event.deltaY < 0 ? 0.12 : -0.12
+      zoomRef.current = Math.max(0.4, Math.min(3.8, zoomRef.current + zoomDelta))
+    }
+    canvas.addEventListener('wheel', onWheelNative, { passive: false })
+    return () => canvas.removeEventListener('wheel', onWheelNative)
+  }, [])
 
   return (
     <div className={`core-container core-${state}`} style={{ '--core-color': color }}>
@@ -213,7 +221,6 @@ export default function CoreSphere({ state = 'idle', agentMode = false, startupP
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
-        onWheel={handleWheel}
       />
     </div>
   )

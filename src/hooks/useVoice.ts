@@ -62,31 +62,39 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const bargeRevertTimerRef = useRef<any>(null);
 
   // Words that cut through JARVIS speech. Ordered longest-first for stripping.
-  const BARGE_CUES = ['hey jarvis', 'hold on', 'jarvis', 'listen', 'stop', 'wait', 'quiet', 'shush', 'hey'];
+  const BARGE_CUES = ['hey jarvis', 'hold on', 'jarvis', 'जार्विस', 'listen', 'stop', 'wait', 'quiet', 'shush', 'hey'];
+  // Wake-word forms: Latin, Devanagari (Chrome often returns Hindi in native
+  // script), plus common mishearings of "Jarvis".
+  const WAKE_WORDS = ['jarvis', 'जार्विस', 'javis', 'jarwis'];
   const bargedAtRef = useRef(0);
 
+  // Word matching that also works for non-Latin scripts (JS \b is ASCII-only,
+  // so "they" must not trip "hey", and जार्विस must match mid-sentence).
+  const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const BOUND = '[\\s,.!?;:\'\"()\\[\\]-]';
+  const hasWord = (text: string, word: string): boolean =>
+    new RegExp(`(^|${BOUND})${escRe(word)}($|${BOUND})`).test(text);
+  const leadsWord = (text: string, word: string): boolean =>
+    new RegExp(`^${escRe(word)}($|${BOUND})`).test(text);
+  const stripLeadingWord = (text: string, word: string): string =>
+    text.replace(new RegExp(`^${escRe(word)}($|${BOUND})[\\s,]*`), '');
+
   // Whole-word cue match ("they" must not trigger on "hey").
-  const cueIn = (text: string): string | undefined => {
-    for (const c of BARGE_CUES) {
-      const pattern = new RegExp(`\\b${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-      if (pattern.test(text)) return c;
-    }
-    return undefined;
-  };
-  const cueLeads = (text: string): boolean => {
-    for (const c of BARGE_CUES) {
-      const pattern = new RegExp(`^${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-      if (pattern.test(text)) return true;
-    }
-    return false;
-  };
+  const cueIn = (text: string): string | undefined =>
+    BARGE_CUES.find(c => hasWord(text, c));
+  const cueLeads = (text: string): boolean =>
+    BARGE_CUES.some(c => leadsWord(text, c));
   const stripLeadingCue = (text: string): string => {
     for (const c of [...BARGE_CUES].sort((a, b) => b.length - a.length)) {
-      const pattern = new RegExp(`^${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b[\\s,]*`);
-      if (pattern.test(text)) return text.replace(pattern, '');
+      const stripped = stripLeadingWord(text, c);
+      if (stripped !== text) return stripped;
     }
     return text;
   };
+
+  // Per-result recognition logs are chatty (interim Hindi streams fast);
+  // keep them off unless debugging voice.
+  const VERBOSE_VOICE_LOG = false;
 
   // Mute flag from the host app (single "mute JARVIS" control). Read via ref
   // at speak time so callbacks never go stale.
@@ -376,7 +384,9 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       }
 
       const currentSegment = finalText || interimText;
-      console.log(`[Voice] Continuous Recognition [State: ${listenStateRef.current}] | Interim: "${interimText}" | Final: "${finalText}"`);
+      if (VERBOSE_VOICE_LOG) {
+        console.log(`[Voice] Continuous Recognition [State: ${listenStateRef.current}] | Interim: "${interimText}" | Final: "${finalText}"`);
+      }
       
       setPartialTranscript(interimText || finalText);
 
@@ -396,9 +406,10 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       const fullText = currentSegment.trim().toLowerCase();
 
       if (listenStateRef.current === 'WAKE') {
-        if (fullText.includes('jarvis')) {
+        const wakeHit = WAKE_WORDS.find(w => hasWord(fullText, w));
+        if (wakeHit) {
           // Check for "Jarvis, do X" (one sentence trigger)
-          const parts = fullText.split('jarvis');
+          const parts = fullText.split(wakeHit);
           const commandText = parts[1] ? parts[1].replace(/^[,\s]+|[,\s]+$/g, '').trim() : '';
 
           if (commandText.length > 1) {
