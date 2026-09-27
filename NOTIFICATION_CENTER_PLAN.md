@@ -154,3 +154,13 @@ Baseline (2026-09-27): `test_scheduler.py` + `backend/agent/test_phase1_runtime.
   (confirm), Esc/overlay close, empty states. Verification: `vite build` clean,
   bundled CSS contains new styles; 26 backend tests pass.
   Commit `feat: add notification center` pushed, in sync.
+- 2026-09-27 — Step 6 DONE: `test_notifications.py` (17 tests: lifecycle,
+  restart persistence, snooze re-fire same-id, legacy migration, store CRUD,
+  clear-history guards, expiry, scheduled cancel/reschedule/delete, API
+  contract incl. 404/400 paths). 17/17 pass. Runnable suite: 220 passed;
+  2 failed in `test_phase1_models.py` (planner/router mocks) — PROVEN
+  pre-existing: my diff never touches planner/router/factory/test files
+  (last changed 0972f07/da8fba0-era), and they fail identically on the
+  pristine tree. Excluded per repo record: research_pipeline (SystemExit at
+  import), test_agent (import bug), architecture/computer_use (no async
+  plugin). Commit `test: add notification lifecycle coverage` pushed, in sync.
