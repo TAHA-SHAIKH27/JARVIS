@@ -248,6 +248,7 @@ export default function App() {
 
   // New voice system
   const voiceHook = useVoice({
+    muted: !voiceEnabled,
     onTranscript: (event) => {
       // onTranscript only adds the user bubble â€” actual command execution
       // happens via runVoiceCommand (set on _setExecuteCommand below)
@@ -491,10 +492,11 @@ export default function App() {
     refreshFiles()
     refreshNotices()
     refreshReminders()
-    const statusTimer = setInterval(() => { refreshStatus(); refreshNotices(); refreshReminders() }, 8000)
+    refreshVoiceMute()
+    const statusTimer = setInterval(() => { refreshStatus(); refreshNotices(); refreshReminders(); refreshVoiceMute() }, 8000)
     const statsTimer = setInterval(refreshStats, 4000)
     return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
-  }, [refreshStatus, refreshStats, refreshFiles, refreshNotices, refreshReminders])
+  }, [refreshStatus, refreshStats, refreshFiles, refreshNotices, refreshReminders, refreshVoiceMute])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -557,6 +559,39 @@ export default function App() {
     utter.onerror = () => setIsSpeaking(false)
     window.speechSynthesis.speak(utter)
   }
+
+  // The single "mute JARVIS" control: stops in-flight frontend speech
+  // immediately and syncs backend speech (reminders/announcements) too.
+  const toggleVoiceEnabled = useCallback(async () => {
+    const next = !voiceEnabled
+    setVoiceEnabled(next)
+    if (!next) {
+      try { window.speechSynthesis?.cancel() } catch { }
+      setIsSpeaking(false)
+    }
+    try {
+      const res = await fetch('/api/voice/mute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ muted: !next })
+      })
+      if (!res.ok) {
+        setMessages(m => [...m, { role: 'jarvis', text: 'Frontend voice muted, sir — but I could not reach the backend voice, so PC announcements may still speak.' }])
+      }
+    } catch {
+      setMessages(m => [...m, { role: 'jarvis', text: 'Frontend voice muted, sir — but I could not reach the backend voice, so PC announcements may still speak.' }])
+    }
+  }, [voiceEnabled])
+
+  const refreshVoiceMute = useCallback(async () => {
+    try {
+      const res = await fetch('/api/voice/mute')
+      if (res.ok) {
+        const data = await res.json()
+        if (typeof data.muted === 'boolean') setVoiceEnabled(!data.muted)
+      }
+    } catch { }
+  }, [])
 
   function toggleVoice() {
     toggleListening()
@@ -1171,6 +1206,7 @@ export default function App() {
           toggleVoice={toggleVoice}
           voiceEnabled={voiceEnabled}
           setVoiceEnabled={setVoiceEnabled}
+          onToggleVoiceEnabled={toggleVoiceEnabled}
           agentMode={agentMode}
           setAgentMode={setAgentMode}
           agentStatus={agentStatus}

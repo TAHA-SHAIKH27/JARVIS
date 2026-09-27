@@ -1,7 +1,7 @@
 import React from 'react';
 import { Settings, Mic, MicOff, Brain, X, Bell } from 'lucide-react';
 
-export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled, agentMode, setAgentMode, agentStatus, unreadCount = 0, onOpenNotifications }) {
+export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled, onToggleVoiceEnabled, agentMode, setAgentMode, agentStatus, unreadCount = 0, onOpenNotifications }) {
   let statusLabel = 'ONLINE';
   let statusClass = '';
   if (!online) statusLabel = 'OFFLINE', statusClass = 'offline';
@@ -60,8 +60,9 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
 
         <button
           className={`icon-btn ${voiceEnabled ? 'active' : ''}`}
-          onClick={() => setVoiceEnabled(v => !v)}
-          title={voiceEnabled ? 'Voice on' : 'Voice off'}
+          onClick={onToggleVoiceEnabled || (() => setVoiceEnabled(v => !v))}
+          title={voiceEnabled ? 'Mute JARVIS voice' : 'Unmute JARVIS voice'}
+          aria-label={voiceEnabled ? 'Mute JARVIS voice' : 'Unmute JARVIS voice'}
         >
           {voiceEnabled ? '🔊' : '🔇'}
         </button>

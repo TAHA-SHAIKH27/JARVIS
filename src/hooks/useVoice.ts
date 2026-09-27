@@ -30,6 +30,7 @@ export interface UseVoiceReturn {
 interface UseVoiceOptions {
   onTranscript?: (event: { type: 'final'; text: string; timestamp: number }) => void;
   onError?: (error: string) => void;
+  muted?: boolean; // when true the hook never speaks (e.g. wake-word "Yes?")
 }
 
 export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
@@ -48,6 +49,13 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const isMutedForTTSRef = useRef(false);
   const awaitingFinalPttRef = useRef(false);
   const executeCommandRef = useRef<((text: string) => void) | null>(null);
+
+  // Mute flag from the host app (single "mute JARVIS" control). Read via ref
+  // at speak time so callbacks never go stale.
+  const mutedRef = useRef(false);
+  useEffect(() => {
+    mutedRef.current = !!options.muted;
+  }, [options.muted]);
 
   // Keep a ref of partialTranscript to read the latest state in async callbacks safely
   const partialTranscriptRef = useRef('');
@@ -331,12 +339,14 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
               
               listenState = 'COMMAND';
 
-              // Play beep and output "Yes?"
+              // Play beep and output "Yes?" (silent when JARVIS is muted)
               playBeep(850);
-              const utter = new SpeechSynthesisUtterance('Yes?');
-              utter.rate = 1.0;
-              utter.pitch = 0.85;
-              window.speechSynthesis.speak(utter);
+              if (!mutedRef.current && window.speechSynthesis) {
+                const utter = new SpeechSynthesisUtterance('Yes?');
+                utter.rate = 1.0;
+                utter.pitch = 0.85;
+                window.speechSynthesis.speak(utter);
+              }
             }
           }
         }

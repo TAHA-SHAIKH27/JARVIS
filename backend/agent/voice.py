@@ -5,6 +5,7 @@ Uses Windows SAPI for TTS (no external dependencies).
 STT is handled by the frontend (browser Web Speech API) and sent via /api/voice/command.
 """
 import asyncio
+import itertools
 import threading
 import queue
 import time
@@ -50,6 +51,13 @@ class VoiceSystem:
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
+        # Tiebreaker so same-priority requests never compare TTSRequest
+        # objects (which would raise TypeError and drop announcements).
+        self._seq = itertools.count()
+        # Mute: while set, speak() drops new requests (no queueing, so
+        # unmuting never replays stale announcements) and any in-flight
+        # speech is interrupted. Toasts/notifications are unaffected.
+        self._muted = False
         
         # Initialize Windows SAPI
         self._init_sapi()
@@ -98,7 +106,7 @@ class VoiceSystem:
             try:
                 # Wait for a request with timeout
                 try:
-                    priority, request = self._tts_queue.get(timeout=0.5)
+                    _, _, request = self._tts_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 
@@ -171,6 +179,9 @@ class VoiceSystem:
         """
         if not text or not text.strip():
             return False
+        with self._lock:
+            if self._muted:
+                return False
         
         request = TTSRequest(
             text=text.strip(),
@@ -181,7 +192,7 @@ class VoiceSystem:
         )
         
         # Use negative priority for max-heap behavior (higher priority = processed first)
-        self._tts_queue.put((-priority, request))
+        self._tts_queue.put((-priority, next(self._seq), request))
         return True
     
     def interrupt(self) -> bool:
@@ -227,6 +238,22 @@ class VoiceSystem:
                 self._tts_queue.get_nowait()
             except queue.Empty:
                 break
+
+    def set_muted(self, muted: bool) -> bool:
+        """Mute or unmute the voice system. Muting interrupts in-flight
+        speech and drops the pending queue; unmuting does not replay."""
+        with self._lock:
+            self._muted = bool(muted)
+            should_stop = bool(muted)
+        if should_stop:
+            self.interrupt()
+            self.clear_queue()
+        return self._muted
+
+    def is_muted(self) -> bool:
+        """Check whether the voice system is muted."""
+        with self._lock:
+            return self._muted
     
     def get_available_voices(self) -> list:
         """Get list of available voices."""
@@ -282,6 +309,16 @@ def interrupt_speech() -> bool:
 def get_tts_state() -> TTSState:
     """Get current TTS state."""
     return get_voice_system().get_state()
+
+
+def set_muted(muted: bool) -> bool:
+    """Convenience function to mute/unmute the voice system."""
+    return get_voice_system().set_muted(muted)
+
+
+def is_muted() -> bool:
+    """Convenience function to check the mute state."""
+    return get_voice_system().is_muted()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

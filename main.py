@@ -1083,7 +1083,25 @@ async def voice_tts_interrupt():
 async def voice_tts_state():
     """Get current TTS state."""
     voice = get_voice_system()
-    return {"status": "success", "state": voice.get_state().value, "speaking": voice.is_speaking()}
+    return {"status": "success", "state": voice.get_state().value, "speaking": voice.is_speaking(), "muted": voice.is_muted()}
+
+
+class VoiceMuteRequest(BaseModel):
+    muted: bool = False
+
+
+@app.get("/api/voice/mute")
+async def voice_mute_state():
+    """Whether backend speech (reminders, announcements) is muted."""
+    return {"status": "success", "muted": get_voice_system().is_muted()}
+
+
+@app.post("/api/voice/mute")
+async def voice_mute(req: VoiceMuteRequest):
+    """Mute/unmute backend speech. Muting stops in-flight speech and drops
+    queued announcements (toasts/notifications are unaffected)."""
+    muted = get_voice_system().set_muted(req.muted)
+    return {"status": "success", "muted": muted}
 
 
 # ── Notes endpoints ───────────────────────────────────────────────────────
