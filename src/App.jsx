@@ -33,6 +33,8 @@ import CodeCorePage from './CodeCorePage';
 
 import StartupAuditBanner from './StartupAuditBanner';
 
+import ReminderBar from './components/ReminderBar';
+
 import { useVoice } from './hooks/useVoice';
 
 
@@ -187,6 +189,14 @@ export default function App() {
 
   const [notices, setNotices] = useState([])
   const knownNoticeIds = useRef(new Set())
+
+  // ── Notification Center state (backend is the source of truth) ──
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [activeReminders, setActiveReminders] = useState([])
+  const [centerOpen, setCenterOpen] = useState(false)
+  const [centerData, setCenterData] = useState(null)
+  const [centerLoading, setCenterLoading] = useState(false)
+  const [notifBusy, setNotifBusy] = useState(false)
 
   const [gmailLinked, setGmailLinked] = useState(null)
 
@@ -355,8 +365,74 @@ export default function App() {
         playBeep()
       }
       setNotices(items.slice(0, 5))
+      if (typeof data.unread_count === 'number') setUnreadCount(data.unread_count)
     } catch { }
   }, [])
+
+  const refreshReminders = useCallback(async () => {
+    // Active bar items only; the badge total arrives via /api/notifications.
+    try {
+      const res = await fetch('/api/reminders')
+      if (!res.ok) return
+      const data = await res.json()
+      setActiveReminders(data.active || [])
+    } catch { }
+  }, [])
+
+  // Backend-confirmed notification actions: mutate backend first, mirror
+  // the confirmed state locally. On failure the item stays visible.
+  async function notifAction(path, body, afterOk) {
+    setNotifBusy(true)
+    try {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setMessages(m => [...m, { role: 'jarvis', text: data.detail || 'That did not work, sir. The item is unchanged.' }])
+        return null
+      }
+      if (typeof data.unread_count === 'number') setUnreadCount(data.unread_count)
+      await refreshReminders()
+      if (afterOk) await afterOk(data)
+      return data
+    } catch {
+      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Nothing was changed.' }])
+      return null
+    } finally {
+      setNotifBusy(false)
+    }
+  }
+
+  const snoozeReminder = useCallback((id, opts) => {
+    const body = { id }
+    if (opts && opts.when) body.when = opts.when
+    else body.minutes = (opts && opts.minutes) || 10
+    return notifAction('/api/notifications/snooze', body)
+  }, [refreshReminders])
+
+  const readReminder = useCallback((id) => notifAction('/api/notifications/read', { id }), [refreshReminders])
+  const dismissReminder = useCallback((id) => notifAction('/api/notifications/dismiss', { id }), [refreshReminders])
+
+  const fetchCenter = useCallback(async () => {
+    setCenterLoading(true)
+    try {
+      const res = await fetch('/api/notifications/center')
+      if (res.ok) {
+        const data = await res.json()
+        setCenterData(data)
+        if (typeof data.unread_count === 'number') setUnreadCount(data.unread_count)
+      }
+    } catch { }
+    finally { setCenterLoading(false) }
+  }, [])
+
+  const openNotifications = useCallback(() => {
+    setCenterOpen(true)
+    fetchCenter()
+  }, [fetchCenter])
 
   async function dismissNotice(id) {
     setNotices(prev => prev.filter(n => n.id !== id))
@@ -391,10 +467,11 @@ export default function App() {
     refreshStats()
     refreshFiles()
     refreshNotices()
-    const statusTimer = setInterval(() => { refreshStatus(); refreshNotices() }, 8000)
+    refreshReminders()
+    const statusTimer = setInterval(() => { refreshStatus(); refreshNotices(); refreshReminders() }, 8000)
     const statsTimer = setInterval(refreshStats, 4000)
     return () => { clearInterval(statusTimer); clearInterval(statsTimer) }
-  }, [refreshStatus, refreshStats, refreshFiles, refreshNotices])
+  }, [refreshStatus, refreshStats, refreshFiles, refreshNotices, refreshReminders])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -1074,6 +1151,8 @@ export default function App() {
           agentMode={agentMode}
           setAgentMode={setAgentMode}
           agentStatus={agentStatus}
+          unreadCount={unreadCount}
+          onOpenNotifications={openNotifications}
         />
       </div>
 
@@ -1271,6 +1350,17 @@ export default function App() {
 
         {/* â”€â”€ RIGHT COLUMN: Quick Actions + Notes + Phone Mirror â”€â”€ */}
         <div className="hud-right">
+          {activeReminders.length > 0 && (
+            <ReminderBar
+              reminder={activeReminders[0]}
+              moreCount={activeReminders.length - 1}
+              onSnooze={snoozeReminder}
+              onRead={readReminder}
+              onDismiss={dismissReminder}
+              onOpenCenter={openNotifications}
+              busy={notifBusy}
+            />
+          )}
           <div className={assembling ? 'assemble-directives' : ''}>
             <CommandGrid quickActions={quickActions} runCommand={runCommand} busy={busy} agentMode={agentMode} />
           </div>

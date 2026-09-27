@@ -1,7 +1,7 @@
 import React from 'react';
-import { Settings, Mic, MicOff, Brain, X } from 'lucide-react';
+import { Settings, Mic, MicOff, Brain, X, Bell } from 'lucide-react';
 
-export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled, agentMode, setAgentMode, agentStatus }) {
+export default function Header({ online, busy, chatMode, setChatMode, isSpeaking, onOpenSettings, voiceActive, toggleVoice, voiceEnabled, setVoiceEnabled, agentMode, setAgentMode, agentStatus, unreadCount = 0, onOpenNotifications }) {
   let statusLabel = 'ONLINE';
   let statusClass = '';
   if (!online) statusLabel = 'OFFLINE', statusClass = 'offline';
@@ -42,6 +42,20 @@ export default function Header({ online, busy, chatMode, setChatMode, isSpeaking
           title={agentMode ? 'Exit Agent Mode' : 'Enter Agent Mode'}
         >
           {agentMode ? <X size={15} /> : <Brain size={15} />}
+        </button>
+
+        <button
+          className="icon-btn notif-btn"
+          onClick={onOpenNotifications}
+          title={unreadCount > 0 ? `${unreadCount} unread notification${unreadCount === 1 ? '' : 's'} — open Notification Center` : 'Open Notification Center'}
+          aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : 'Notifications'}
+        >
+          <Bell size={15} />
+          {unreadCount > 0 && (
+            <span className="notif-badge" aria-hidden="true">
+              {unreadCount > 99 ? '99+' : unreadCount}
+            </span>
+          )}
         </button>
 
         <button

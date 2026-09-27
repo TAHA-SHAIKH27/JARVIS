@@ -141,3 +141,8 @@ Baseline (2026-09-27): `test_scheduler.py` + `backend/agent/test_phase1_runtime.
   (scheduler/runtime/gmail); TestClient E2E (create→fire→unread→snooze→
   refire-0→read→unread→delete→gone) OK. Commit `feat: notification APIs`
   pushed, in sync.
+- 2026-09-27 — Step 4 DONE: frontend bar + button (`ReminderBar.jsx` new,
+  `Header.jsx` bell + badge, `App.jsx` state/poll/actions/bar-above-directives,
+  `src/index.css` glass styles). Backend-confirmed actions (failure keeps item
+  + chat feedback). Verification: `vite build` clean (1523 modules).
+  Commit `feat: reminder bar plus notification button` pushed, in sync.
