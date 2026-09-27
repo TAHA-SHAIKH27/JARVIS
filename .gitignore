@@ -58,6 +58,7 @@ token_gmail.json
 # Normal-mode scheduler: private message content + personal reminders (never commit)
 backend/data/scheduled_whatsapp.json
 backend/data/reminders.json
+backend/data/notifications.json
 
 # Durable task checkpoints / universal history (local runtime data, survives restarts)
 jarvis_tasks.db*
