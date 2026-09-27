@@ -114,3 +114,12 @@ Baseline (2026-09-27): `test_scheduler.py` + `backend/agent/test_phase1_runtime.
 - 2026-09-27 — Investigation + baseline (16 passed) + this plan created.
   Root cause confirmed (in-memory notifications, no reminder lifecycle state).
   No code changed yet.
+- 2026-09-27 — Step 1 DONE: `ReminderStore` lifecycle (`phase1_runtime.py` only).
+  Added `status/notified/notified_at/read/dismissed/snoozed_until/priority/
+  trigger_count` with `_normalize_reminder` migration; new `get/history/
+  active_for_bar/unread_count/mark_triggered/mark_read/mark_unread/dismiss/
+  snooze/set_priority`; `due()` only yields scheduled/snooze-expired items.
+  Legacy `completed:true` (already announced) migrates to read history, never bar.
+  Verification: import OK; `test_scheduler + test_phase1_runtime` 16 passed;
+  smoke (tmp store): migrate→trigger→dismiss→reopen→snooze→delete all OK.
+  Commit `fix: persist reminder notification state` pushed, in sync.

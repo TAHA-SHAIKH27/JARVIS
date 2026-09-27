@@ -6,7 +6,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.agent import phase1_memory
@@ -237,31 +237,107 @@ class ConversationContext:
         return "\n".join(f"{t['role']}: {t['content']}" for t in turns)
 
 
+REMINDER_STATUSES = ("scheduled", "triggered", "snoozed", "dismissed", "done")
+REMINDER_PRIORITIES = ("normal", "important", "urgent")
+
+
+def _normalize_reminder(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill lifecycle defaults on legacy records in place (never raises).
+
+    Old records (pre-notification-center) only carry completed/text/due_at.
+    A legacy completed reminder means "already fired": it becomes
+    status=triggered + notified (visible in history, never active again).
+    A legacy pending reminder becomes status=scheduled.
+    """
+    if not isinstance(item, dict):
+        return item
+    completed = bool(item.get("completed", False))
+    status = str(item.get("status") or "")
+    if status not in REMINDER_STATUSES:
+        if completed or item.get("notified"):
+            status = "triggered"
+            # Legacy fired reminders were already announced (voice + toast)
+            # under the old system, which had no read concept: keep them as
+            # read history so they NEVER resurface as active bar items.
+            item.setdefault("read", True)
+            item.setdefault("notified_at", item.get("updated_at"))
+        else:
+            status = "scheduled"
+        item["status"] = status
+    item.setdefault("notified", status in ("triggered", "dismissed", "done"))
+    item.setdefault("notified_at", None)
+    item.setdefault("read", status in ("dismissed", "done"))
+    item.setdefault("dismissed", status == "dismissed")
+    item.setdefault("snoozed_until", None)
+    if item.get("priority") not in REMINDER_PRIORITIES:
+        item["priority"] = "normal"
+    if not isinstance(item.get("trigger_count"), int):
+        try:
+            item["trigger_count"] = int(item.get("trigger_count") or (1 if item["notified"] else 0))
+        except (TypeError, ValueError):
+            item["trigger_count"] = 1 if item["notified"] else 0
+    return item
+
+
 class ReminderStore:
     def _load(self) -> List[Dict[str, Any]]:
         value = _read_json(_reminder_path(), [])
-        return value if isinstance(value, list) else []
+        items = value if isinstance(value, list) else []
+        return [_normalize_reminder(r) for r in items if isinstance(r, dict)]
 
-    def add(self, text: str, due_at: Optional[str] = None, repeat: Optional[str] = None) -> Dict[str, Any]:
+    def _save(self, reminders: List[Dict[str, Any]]) -> None:
+        _write_json(_reminder_path(), [_normalize_reminder(r) for r in reminders])
+
+    def add(self, text: str, due_at: Optional[str] = None, repeat: Optional[str] = None,
+            priority: str = "normal") -> Dict[str, Any]:
         text = (text or "").strip()
         if not text:
             return {"status": "error", "message": "Reminder text cannot be empty."}
+        if priority not in REMINDER_PRIORITIES:
+            priority = "normal"
         now = utc_now()
-        item = {"id": str(uuid.uuid4()), "text": text, "due_at": due_at, "repeat": repeat, "completed": False, "created_at": now, "updated_at": now}
+        item = {"id": str(uuid.uuid4()), "text": text, "due_at": due_at, "repeat": repeat,
+                "completed": False, "created_at": now, "updated_at": now,
+                "status": "scheduled", "notified": False, "notified_at": None,
+                "read": False, "dismissed": False, "snoozed_until": None,
+                "priority": priority, "trigger_count": 0}
         with _LOCK:
             reminders = self._load()
             reminders.append(item)
-            _write_json(_reminder_path(), reminders)
+            self._save(reminders)
         return {"status": "success", "message": "Reminder saved.", "reminder": item}
+
+    def get(self, reminder_id: str) -> Optional[Dict[str, Any]]:
+        for reminder in self._load():
+            if reminder.get("id") == reminder_id:
+                return reminder
+        return None
 
     def list(self, include_completed: bool = False) -> List[Dict[str, Any]]:
         reminders = self._load()
         return reminders if include_completed else [r for r in reminders if not r.get("completed")]
 
+    def history(self) -> List[Dict[str, Any]]:
+        """Every stored reminder, newest-triggered-first (for History views)."""
+        reminders = self._load()
+        reminders.sort(key=lambda r: str(r.get("notified_at") or r.get("created_at") or ""), reverse=True)
+        return reminders
+
+    def active_for_bar(self) -> List[Dict[str, Any]]:
+        """Triggered reminders needing attention: not read, not dismissed."""
+        return [r for r in self._load()
+                if r.get("status") == "triggered"
+                and not r.get("read") and not r.get("dismissed")]
+
+    def unread_count(self) -> int:
+        return len(self.active_for_bar())
+
     def due(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         current = now or datetime.now(timezone.utc)
         result = []
         for reminder in self.list():
+            if reminder.get("status") not in ("scheduled", "snoozed"):
+                continue
             due_at = reminder.get("due_at")
             if not due_at:
                 continue
@@ -269,11 +345,135 @@ class ReminderStore:
                 due = datetime.fromisoformat(str(due_at).replace("Z", "+00:00"))
                 if due.tzinfo is None:
                     due = due.replace(tzinfo=timezone.utc)
-                if due <= current:
-                    result.append(reminder)
+                if due > current:
+                    continue
+                if reminder.get("status") == "snoozed":
+                    snoozed_until = reminder.get("snoozed_until")
+                    if snoozed_until:
+                        try:
+                            wake = datetime.fromisoformat(str(snoozed_until).replace("Z", "+00:00"))
+                            if wake.tzinfo is None:
+                                wake = wake.replace(tzinfo=timezone.utc)
+                            if wake > current:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                result.append(reminder)
             except (TypeError, ValueError):
                 continue
         return result
+
+    def mark_triggered(self, reminder_id: str) -> Dict[str, Any]:
+        """SCHEDULED → TRIGGERED/UNREAD. Idempotent: re-marking an already
+        triggered reminder only bumps trigger_count (used by the ticker so a
+        restart can never mint a second identity for the same reminder)."""
+        with _LOCK:
+            reminders = self._load()
+            for reminder in reminders:
+                if reminder.get("id") == reminder_id:
+                    now = utc_now()
+                    reminder["status"] = "triggered"
+                    reminder["notified"] = True
+                    reminder["notified_at"] = now
+                    reminder["read"] = False
+                    reminder["dismissed"] = False
+                    reminder["snoozed_until"] = None
+                    reminder["completed"] = True  # legacy: out of the pending queue
+                    try:
+                        reminder["trigger_count"] = int(reminder.get("trigger_count") or 0) + 1
+                    except (TypeError, ValueError):
+                        reminder["trigger_count"] = 1
+                    reminder["updated_at"] = now
+                    self._save(reminders)
+                    return {"status": "success", "reminder": reminder}
+        return {"status": "error", "message": "Reminder not found."}
+
+    def mark_read(self, reminder_id: str) -> Dict[str, Any]:
+        return self._set_read_state(reminder_id, True)
+
+    def mark_unread(self, reminder_id: str) -> Dict[str, Any]:
+        return self._set_read_state(reminder_id, False)
+
+    def _set_read_state(self, reminder_id: str, read: bool) -> Dict[str, Any]:
+        with _LOCK:
+            reminders = self._load()
+            for reminder in reminders:
+                if reminder.get("id") == reminder_id:
+                    reminder["read"] = read
+                    if not read and reminder.get("status") == "dismissed":
+                        # Re-opening surfaces it as an active triggered reminder again.
+                        reminder["status"] = "triggered"
+                        reminder["dismissed"] = False
+                    reminder["updated_at"] = utc_now()
+                    self._save(reminders)
+                    return {"status": "success", "reminder": reminder}
+        return {"status": "error", "message": "Reminder not found."}
+
+    def dismiss(self, reminder_id: str) -> Dict[str, Any]:
+        """Remove from active presentation; the record stays for history."""
+        with _LOCK:
+            reminders = self._load()
+            for reminder in reminders:
+                if reminder.get("id") == reminder_id:
+                    reminder["status"] = "dismissed"
+                    reminder["read"] = True
+                    reminder["dismissed"] = True
+                    reminder["completed"] = True
+                    reminder["updated_at"] = utc_now()
+                    self._save(reminders)
+                    return {"status": "success", "reminder": reminder}
+        return {"status": "error", "message": "Reminder not found."}
+
+    def snooze(self, reminder_id: str, minutes: float = 10,
+               when_iso: Optional[str] = None) -> Dict[str, Any]:
+        """UNREAD → SNOOZED → re-armed. Persists across restarts; the ticker
+        re-triggers exactly once via the same stable reminder id."""
+        with _LOCK:
+            reminders = self._load()
+            for reminder in reminders:
+                if reminder.get("id") == reminder_id:
+                    if when_iso:
+                        try:
+                            wake = datetime.fromisoformat(str(when_iso).replace("Z", "+00:00"))
+                        except (TypeError, ValueError):
+                            return {"status": "error", "message": "Invalid snooze time."}
+                    else:
+                        try:
+                            minutes = float(minutes)
+                        except (TypeError, ValueError):
+                            return {"status": "error", "message": "Invalid snooze duration."}
+                        if minutes <= 0 or minutes > 60 * 24 * 7:
+                            return {"status": "error",
+                                    "message": "Snooze between 1 minute and 7 days, sir."}
+                        wake = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+                    if wake.tzinfo is None:
+                        wake = wake.replace(tzinfo=timezone.utc)
+                    wake_iso = wake.isoformat()
+                    reminder["status"] = "snoozed"
+                    reminder["snoozed_until"] = wake_iso
+                    reminder["due_at"] = wake_iso
+                    reminder["completed"] = False  # re-arm the pending queue
+                    reminder["read"] = False
+                    reminder["dismissed"] = False
+                    reminder["updated_at"] = utc_now()
+                    self._save(reminders)
+                    return {"status": "success", "reminder": reminder,
+                            "wake_at": wake_iso}
+        return {"status": "error", "message": "Reminder not found."}
+
+    def set_priority(self, reminder_id: str, priority: str) -> Dict[str, Any]:
+        if priority not in REMINDER_PRIORITIES:
+            return {"status": "error",
+                    "message": f"Priority must be one of {', '.join(REMINDER_PRIORITIES)}."}
+        with _LOCK:
+            reminders = self._load()
+            for reminder in reminders:
+                if reminder.get("id") == reminder_id:
+                    reminder["priority"] = priority
+                    reminder["updated_at"] = utc_now()
+                    self._save(reminders)
+                    return {"status": "success", "reminder": reminder}
+        return {"status": "error", "message": "Reminder not found."}
 
     def complete(self, reminder_id: str) -> Dict[str, Any]:
         with _LOCK:
@@ -281,8 +481,11 @@ class ReminderStore:
             for reminder in reminders:
                 if reminder.get("id") == reminder_id:
                     reminder["completed"] = True
+                    if reminder.get("status") == "scheduled":
+                        reminder["status"] = "done"
+                        reminder["read"] = True
                     reminder["updated_at"] = utc_now()
-                    _write_json(_reminder_path(), reminders)
+                    self._save(reminders)
                     return {"status": "success", "reminder": reminder}
         return {"status": "error", "message": "Reminder not found."}
 
@@ -292,7 +495,7 @@ class ReminderStore:
             kept = [r for r in reminders if r.get("id") != reminder_id]
             if len(kept) == len(reminders):
                 return {"status": "error", "message": "Reminder not found."}
-            _write_json(_reminder_path(), kept)
+            self._save(kept)
             return {"status": "success", "message": "Reminder deleted."}
 
 
