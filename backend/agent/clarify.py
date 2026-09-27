@@ -129,7 +129,8 @@ def apply_answer(task: str, answer: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────
 
 INTERRUPT_WORDS = ("stop", "cancel", "abort", "halt", "wait", "hold on",
-                   "hold up", "pause", "interrupt", "never mind", "forget it")
+                   "hold up", "pause", "interrupt", "never mind", "forget it",
+                   "quiet", "shush", "that's enough", "that is enough")
 
 RELATED_MARKERS = ("actually", "instead", "rather", "change", "modify",
                    "update", "correction", "make it", "make the", "add",

@@ -280,14 +280,36 @@ export default function App() {
 
   // runVoiceCommand: like runCommand but does NOT add a user bubble
   // (the voice hook already adds it via onTranscript)
+  //
+  // Bare stop-words spoken while JARVIS talks ("stop", "wait", …) silence
+  // him instantly via this pattern — no backend round-trip needed.
+  const LOCAL_STOP_RE = /^(stop|wait|hold on|halt|quiet|shush|never mind|that'?s enough)$/i
+
   async function runVoiceCommand(text) {
-    if (!text.trim() || busy) return
+    const clean = (text || '').trim()
+    if (!clean) return
+    // Agent mid-run: route voice into the live run (merge / queue / interrupt)
+    // instead of starting a separate normal-mode command.
+    if (agentMode && agentRunId) {
+      await sendInstruct(clean, false)
+      return
+    }
+    if (busy) return
+    // Local instant-stop: bare stop-word while JARVIS speaks silences him
+    // immediately (frontend + backend voice) with no backend round-trip.
+    if ((ttsSpeaking || isSpeaking) && LOCAL_STOP_RE.test(clean.replace(/[.?!]+$/, ''))) {
+      try { window.speechSynthesis?.cancel() } catch { }
+      setIsSpeaking(false)
+      fetch('/api/voice/tts/interrupt', { method: 'POST' }).catch(() => {})
+      setMessages(m => [...m, { role: 'jarvis', text: 'Stopped, sir.' }])
+      return
+    }
     setBusy(true)
     try {
       const res = await fetch('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
+        body: JSON.stringify({ prompt: clean })
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
@@ -794,9 +816,10 @@ export default function App() {
     }
   }
 
-  async function sendInstruct(text) {
+  async function sendInstruct(text, withBubble = true) {
     // New command while a run is active: merge related changes, queue the rest.
-    setMessages(m => [...m, { role: 'user', text }])
+    // Voice callers pass withBubble=false (the transcript bubble already exists).
+    if (withBubble) setMessages(m => [...m, { role: 'user', text }])
     setPrompt('')
     try {
       const res = await fetch('/api/agent/instruct', {

@@ -446,7 +446,8 @@ class VoiceCommandProcessor:
         interruption_keywords = [
             "stop", "wait", "halt", "cancel", "abort",
             "interrupt", "pause", "hold on", "hold up",
-            "never mind", "forget it", "ignore that"
+            "never mind", "forget it", "ignore that",
+            "quiet", "shush", "that's enough", "that is enough",
         ]
         return any(kw in text_lower for kw in interruption_keywords)
     

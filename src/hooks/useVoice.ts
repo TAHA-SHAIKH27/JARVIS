@@ -50,6 +50,44 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   const awaitingFinalPttRef = useRef(false);
   const executeCommandRef = useRef<((text: string) => void) | null>(null);
 
+  // ---------- Barge-in refs (interrupt JARVIS mid-reply by voice) ----------
+  // Recognition now STAYS ALIVE during TTS. Results arriving while JARVIS
+  // speaks are ignored unless they carry a barge-in cue — this is what lets
+  // the user cut in with "Jarvis, …" / "stop" / "wait" instead of waiting.
+  const ttsPlayingRef = useRef(false);
+  // Rolling window of what JARVIS recently said (lowercase) for echo guard.
+  const lastSpokenRef = useRef('');
+  // WAKE | COMMAND listen state lives in a ref so barge-in can drive it.
+  const listenStateRef = useRef<'WAKE' | 'COMMAND'>('WAKE');
+  const bargeRevertTimerRef = useRef<any>(null);
+
+  // Words that cut through JARVIS speech. Ordered longest-first for stripping.
+  const BARGE_CUES = ['hey jarvis', 'hold on', 'jarvis', 'listen', 'stop', 'wait', 'quiet', 'shush', 'hey'];
+  const bargedAtRef = useRef(0);
+
+  // Whole-word cue match ("they" must not trigger on "hey").
+  const cueIn = (text: string): string | undefined => {
+    for (const c of BARGE_CUES) {
+      const pattern = new RegExp(`\\b${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+      if (pattern.test(text)) return c;
+    }
+    return undefined;
+  };
+  const cueLeads = (text: string): boolean => {
+    for (const c of BARGE_CUES) {
+      const pattern = new RegExp(`^${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+      if (pattern.test(text)) return true;
+    }
+    return false;
+  };
+  const stripLeadingCue = (text: string): string => {
+    for (const c of [...BARGE_CUES].sort((a, b) => b.length - a.length)) {
+      const pattern = new RegExp(`^${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b[\\s,]*`);
+      if (pattern.test(text)) return text.replace(pattern, '');
+    }
+    return text;
+  };
+
   // Mute flag from the host app (single "mute JARVIS" control). Read via ref
   // at speak time so callbacks never go stale.
   const mutedRef = useRef(false);
@@ -164,34 +202,17 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     console.log('[Voice] Web Audio API visualizer stopped.');
   }, []);
 
-  // ---------- Muting/Pausing STT during TTS to prevent feedback loop ----------
-  const pauseRecognition = useCallback(() => {
-    console.log('[Voice] Pausing recognition for TTS playback');
+  // ---------- TTS markers (recognition stays alive for barge-in) ----------
+  const noteTtsStarted = useCallback(() => {
+    console.log('[Voice] TTS playing — listening for barge-in cues');
     isMutedForTTSRef.current = true;
-    
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {}
-    }
-    if (pttRecognitionRef.current) {
-      try {
-        pttRecognitionRef.current.stop();
-      } catch {}
-    }
+    ttsPlayingRef.current = true;
   }, []);
 
-  const resumeRecognition = useCallback(() => {
-    console.log('[Voice] Resuming recognition after TTS playback');
+  const noteTtsEnded = useCallback(() => {
+    console.log('[Voice] TTS ended — normal wake-word listening');
     isMutedForTTSRef.current = false;
-    
-    if (isListeningRef.current) {
-      try {
-        recognitionRef.current?.start();
-      } catch (e) {
-        console.warn('[Voice] Failed to restart continuous recognition:', e);
-      }
-    }
+    ttsPlayingRef.current = false;
   }, []);
 
   // ---------- Command Execution Wrapper ----------
@@ -224,15 +245,22 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       const originalOnEnd = utterance.onend;
       const originalOnError = utterance.onerror;
 
+      // Remember what JARVIS is saying so the barge-in echo guard can
+      // tell our own voice apart from the user's.
+      try {
+        const said = (utterance.text || '').toLowerCase();
+        lastSpokenRef.current = (lastSpokenRef.current + ' ' + said).slice(-400);
+      } catch {}
+
       utterance.onstart = function (e) {
         setIsSpeaking(true);
-        pauseRecognition();
+        noteTtsStarted();
         if (originalOnStart) originalOnStart.call(this, e);
       };
 
       const handleSpeechEnd = (e: any, originalCb: any) => {
         setIsSpeaking(false);
-        resumeRecognition();
+        noteTtsEnded();
         if (originalCb) originalCb.call(this, e);
       };
 
@@ -250,7 +278,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     return () => {
       window.speechSynthesis.speak = originalSpeak;
     };
-  }, [pauseRecognition, resumeRecognition]);
+  }, [noteTtsStarted, noteTtsEnded]);
 
   // ---------- Continuous Wake-Word Mode ----------
   const initRecognition = useCallback(() => {
@@ -267,11 +295,65 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     rec.interimResults = true;
     rec.lang = 'en-US';
 
-    // State tracks whether we are WAKING ('hey jarvis') or capturing a COMMAND ('Yes?' response)
-    let listenState: 'WAKE' | 'COMMAND' = 'WAKE';
+    // listenState lives in listenStateRef (declared above) so barge-in can drive it.
+
+    // Barge-in: user cuts in while JARVIS speaks. Returns true when the
+    // result was consumed (echo ignored or cue handled).
+    const tryBargeIn = (segment: string, isFinal: boolean): boolean => {
+      const lower = segment.trim().toLowerCase();
+      if (!lower) return false;
+
+      // Echo guard: if most of these words are ones JARVIS just said,
+      // this is our own voice coming back through the mic — ignore it.
+      const words = lower.split(/\s+/).filter(w => w.length > 2);
+      if (words.length > 0) {
+        const spoken = lastSpokenRef.current;
+        let hits = 0;
+        for (const w of words) if (spoken.includes(w)) hits++;
+        if (hits / words.length >= 0.6) return true;
+      }
+
+      const cue = cueIn(lower);
+      if (!cue) return false;
+      // Interim results only count when the user leads with the cue
+      // ("Jarvis, …", "stop") — keeps latency low without false trips.
+      if (!isFinal && !cueLeads(lower)) return false;
+      // One barge per moment: follow-up interim/final fragments of the same
+      // utterance must not re-cancel and re-beep.
+      if (Date.now() - bargedAtRef.current < 2500) return true;
+      bargedAtRef.current = Date.now();
+
+      console.log('[Voice] Barge-in cue detected:', cue, '| segment:', segment);
+      try { window.speechSynthesis?.cancel(); } catch {}
+      setIsSpeaking(false);
+      playBeep(650);
+      setPartialTranscript('❚❚ Interrupted — listening…');
+
+      // Strip a leading cue: "jarvis open notepad" runs at once, a lone
+      // "stop" just opens a short window for the real command.
+      const rest = stripLeadingCue(lower);
+      const restHasCommand = rest.length > 2 && !cueIn(rest);
+      if (restHasCommand) {
+        listenStateRef.current = 'WAKE';
+        setTranscript(rest);
+        setPartialTranscript('');
+        options.onTranscript?.({ type: 'final', text: rest, timestamp: Date.now() });
+        executeCommand(rest);
+      } else {
+        listenStateRef.current = 'COMMAND';
+        if (bargeRevertTimerRef.current) clearTimeout(bargeRevertTimerRef.current);
+        bargeRevertTimerRef.current = setTimeout(() => {
+          if (listenStateRef.current === 'COMMAND') {
+            listenStateRef.current = 'WAKE';
+            setPartialTranscript('');
+          }
+        }, 8000);
+      }
+      return true;
+    };
 
     rec.onresult = (event: any) => {
-      if (isMutedForTTSRef.current) return;
+      if (isMutedForTTSRef.current && !ttsPlayingRef.current) return;
 
       let interimText = '';
       let finalText = '';
@@ -285,15 +367,24 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
         }
       }
 
+      const lastIsFinal = event.results[event.results.length - 1].isFinal || !interimText;
+
+      // While JARVIS speaks, only barge-in cues get through.
+      if (ttsPlayingRef.current) {
+        tryBargeIn(finalText || interimText, lastIsFinal);
+        return;
+      }
+
       const currentSegment = finalText || interimText;
-      console.log(`[Voice] Continuous Recognition [State: ${listenState}] | Interim: "${interimText}" | Final: "${finalText}"`);
+      console.log(`[Voice] Continuous Recognition [State: ${listenStateRef.current}] | Interim: "${interimText}" | Final: "${finalText}"`);
       
       setPartialTranscript(interimText || finalText);
 
-      // Reset silence detection timeout
+      // Reset silence detection timeout (never force-stop while TTS plays —
+      // that would kill barge-in listening mid-reply).
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      
-      if (currentSegment.trim()) {
+
+      if (currentSegment.trim() && !ttsPlayingRef.current) {
         silenceTimerRef.current = setTimeout(() => {
           console.log('[Voice] Silence detected. Stopping to force finalization.');
           try {
@@ -304,7 +395,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
       const fullText = currentSegment.trim().toLowerCase();
 
-      if (listenState === 'WAKE') {
+      if (listenStateRef.current === 'WAKE') {
         if (fullText.includes('jarvis')) {
           // Check for "Jarvis, do X" (one sentence trigger)
           const parts = fullText.split('jarvis');
@@ -337,9 +428,9 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
               setIsWakeDetected(true);
               setTimeout(() => setIsWakeDetected(false), 1200);
               
-              listenState = 'COMMAND';
+              listenStateRef.current = 'COMMAND';
 
-              // Play beep and output "Yes?" (silent when JARVIS is muted)
+              // Play beep and output "Yes?" (silent when JARVIS is muted) (silent when JARVIS is muted)
               playBeep(850);
               if (!mutedRef.current && window.speechSynthesis) {
                 const utter = new SpeechSynthesisUtterance('Yes?');
@@ -350,13 +441,17 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
             }
           }
         }
-      } else if (listenState === 'COMMAND') {
+      } else if (listenStateRef.current === 'COMMAND') {
         // Capture next command in COMMAND state
         if (fullText && (event.results[event.results.length - 1].isFinal || !interimText)) {
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          
+          if (bargeRevertTimerRef.current) {
+            clearTimeout(bargeRevertTimerRef.current);
+            bargeRevertTimerRef.current = null;
+          }
+
           console.log('[Voice] Captured follow-up command:', currentSegment);
-          listenState = 'WAKE'; // Revert back to wake word mode
+          listenStateRef.current = 'WAKE'; // Revert back to wake word mode
 
           setTranscript(currentSegment);
           setPartialTranscript('');
@@ -589,6 +684,11 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
+      }
+
+      if (bargeRevertTimerRef.current) {
+        clearTimeout(bargeRevertTimerRef.current);
+        bargeRevertTimerRef.current = null;
       }
 
       if (recognitionRef.current) {
