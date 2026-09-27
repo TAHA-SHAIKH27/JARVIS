@@ -35,6 +35,7 @@ import StartupAuditBanner from './StartupAuditBanner';
 
 import ReminderBar from './components/ReminderBar';
 import NotificationCenter from './components/NotificationCenter';
+import { detectLang, pickBrowserVoice } from './langDetect';
 
 import { useVoice } from './hooks/useVoice';
 
@@ -242,7 +243,7 @@ export default function App() {
   const handleBriefingReady = useCallback((briefingText) => {
     if (briefingText) {
       setMessages((m) => [...m, { role: 'jarvis', text: briefingText }])
-      speak(briefingText)
+      speak(briefingText, detectLang(briefingText))
     }
   }, [voiceEnabled])
 
@@ -319,7 +320,7 @@ export default function App() {
       }
       const data = await res.json()
       setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
-      speak(data.speak)
+      speak(data.speak, data.speak_lang || detectLang(data.speak, clean))
       setLogs(data.logs || [])
       setFileData(data.file_data || null)
       setImageData(data.image_data || null)
@@ -583,12 +584,25 @@ export default function App() {
 
   useEffect(() => { runCommandRef.current = chatMode ? runStreamingChat : runCommand })
 
-  function speak(text) {
+  const SPEAK_LOCALE = { hi: 'hi-IN', mr: 'mr-IN', ur: 'ur-PK', en: 'en-IN', fr: 'fr-FR', es: 'es-ES' }
+
+  function speak(text, lang) {
     if (!voiceEnabled || !text || !window.speechSynthesis) return
+    // Speak in the reply's language (Hindi/Urdu/Marathi/French/Spanish/English):
+    // set the utterance locale and pick a matching installed voice.
+    let resolved = (lang || '').slice(0, 2).toLowerCase()
+    if (!resolved) {
+      try { resolved = detectLang(text) } catch { resolved = 'en' }
+    }
     window.speechSynthesis.cancel()
     const utter = new SpeechSynthesisUtterance(text)
     utter.rate = 1
     utter.pitch = 0.85
+    try {
+      utter.lang = SPEAK_LOCALE[resolved] || SPEAK_LOCALE.en
+      const voice = pickBrowserVoice(resolved)
+      if (voice) utter.voice = voice
+    } catch { /* default voice stays */ }
     utter.onstart = () => setIsSpeaking(true)
     utter.onend = () => setIsSpeaking(false)
     utter.onerror = () => setIsSpeaking(false)
@@ -649,7 +663,7 @@ export default function App() {
       }
       const data = await res.json()
       setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
-      speak(data.speak)
+      speak(data.speak, data.speak_lang || detectLang(data.speak, text))
       setLogs(data.logs || [])
       setFileData(data.file_data || null)
       setImageData(data.image_data || null)
@@ -704,11 +718,11 @@ export default function App() {
           return copy
         })
       }
-      if (full) speak(full)
+      if (full) speak(full, detectLang(full, text))
     } catch {
       setMessages(m => {
         const copy = [...m]
-        copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }
+        copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir.' }
         return copy
       })
     } finally {
@@ -808,7 +822,7 @@ export default function App() {
       // Add final JARVIS message
       const reply = finalSpeak || 'Agent task complete, sir.'
       setMessages(m => [...m, { role: 'jarvis', text: reply }])
-      speak(reply)
+      speak(reply, detectLang(reply, text))
       refreshFiles()
 
     } catch (err) {
@@ -837,7 +851,7 @@ export default function App() {
       }
       setAgentEvents(ev => [...ev, { text: `â†’ ${data.speak || 'Noted, sir.'}`, type: data.status === 'queued' ? 'task_queued' : 'plan_restarted' }])
       if (Array.isArray(data.queued)) setQueuedTasks(data.queued)
-      if (data.speak) speak(data.speak)
+      if (data.speak) speak(data.speak, detectLang(data.speak, text))
     } catch {
       setAgentEvents(ev => [...ev, { text: 'âœ• Could not reach the agent instruct endpoint.', type: 'step_failed' }])
     }
@@ -947,7 +961,7 @@ export default function App() {
         full += decoder.decode(value, { stream: true })
         setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
       }
-      if (full) speak(full)
+      if (full) speak(full, detectLang(full, questionText))
     } catch {
       setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
     } finally {
@@ -981,7 +995,7 @@ export default function App() {
         full += decoder.decode(value, { stream: true })
         setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
       }
-      if (full) speak(full)
+      if (full) speak(full, detectLang(full, questionText))
     } catch {
       setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
     } finally {

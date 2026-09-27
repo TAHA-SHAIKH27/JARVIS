@@ -58,6 +58,7 @@ class VoiceSystem:
         # unmuting never replays stale announcements) and any in-flight
         # speech is interrupted. Toasts/notifications are unaffected.
         self._muted = False
+        self._active_lang = "en"
         
         # Initialize Windows SAPI
         self._init_sapi()
@@ -163,7 +164,7 @@ class VoiceSystem:
                 except Exception:
                     pass
     
-    def speak(self, text: str, priority: int = 0, interrupt: bool = True, callback: Optional[Callable] = None, metadata: dict = None) -> bool:
+    def speak(self, text: str, priority: int = 0, interrupt: bool = True, callback: Optional[Callable] = None, metadata: dict = None, lang: Optional[str] = None) -> bool:
         """
         Queue text for speech synthesis.
         
@@ -173,6 +174,9 @@ class VoiceSystem:
             interrupt: Whether to interrupt current speech
             callback: Called with (success, message) on completion
             metadata: Optional metadata
+            lang: BCP-47-ish code (hi/mr/ur/en/fr/es). Auto-detected from
+                the text when omitted; selects a matching installed SAPI
+                voice when one exists, otherwise keeps the current voice.
             
         Returns:
             True if queued successfully
@@ -182,6 +186,22 @@ class VoiceSystem:
         with self._lock:
             if self._muted:
                 return False
+            try:
+                from backend.agent.lang_detect import detect_lang, select_voice_for_lang
+                resolved = (lang or "").strip().lower()[:2] or detect_lang(text)
+                if resolved and resolved != getattr(self, "_active_lang", "en"):
+                    voice = select_voice_for_lang(getattr(self, "_voices", []), resolved)
+                    if voice is not None and self._sapi_voice is not None:
+                        try:
+                            for installed in self._sapi_voice.GetVoices():
+                                if installed.Id == voice.get("id"):
+                                    self._sapi_voice.Voice = installed
+                                    self._active_lang = resolved
+                                    break
+                        except Exception as exc:
+                            print(f"[VoiceSystem] Voice switch failed: {exc}")
+            except Exception as exc:
+                print(f"[VoiceSystem] Language routing failed: {exc}")
         
         request = TTSRequest(
             text=text.strip(),
@@ -296,9 +316,9 @@ def get_voice_system() -> VoiceSystem:
     return _voice_system
 
 
-def speak(text: str, priority: int = 0, interrupt: bool = True, callback: Optional[Callable] = None) -> bool:
+def speak(text: str, priority: int = 0, interrupt: bool = True, callback: Optional[Callable] = None, lang: Optional[str] = None) -> bool:
     """Convenience function to speak text."""
-    return get_voice_system().speak(text, priority, interrupt, callback)
+    return get_voice_system().speak(text, priority, interrupt, callback, lang=lang)
 
 
 def interrupt_speech() -> bool:

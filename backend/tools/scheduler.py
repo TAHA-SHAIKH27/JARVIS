@@ -590,7 +590,7 @@ def parse_scheduled_whatsapp(text: str) -> Optional[Dict[str, Any]]:
 
 # ── normal-mode command router ────────────────────────────────────────────────
 def _response(speak: str, log: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    response = {"speak": speak, "logs": [log], "file_data": None,
+    response = {"speak": speak, "speak_lang": "en", "logs": [log], "file_data": None,
                 "refresh_files": False, "image_data": None}
     if extra:
         response.update(extra)

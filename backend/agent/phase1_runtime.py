@@ -164,6 +164,7 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
     if not memory_text:
         return {
             "speak": "Please tell me what you want me to remember, sir.",
+            "speak_lang": "en",
             "logs": ["MEMORY: No memory content supplied"],
             "file_data": None,
             "refresh_files": False,
@@ -174,6 +175,7 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
     if result.get("status") != "success":
         return {
             "speak": result.get("message", "I could not save that memory, sir."),
+            "speak_lang": "en",
             "logs": [f"MEMORY ERROR: {result.get('message', 'unknown error')}"],
             "file_data": None,
             "refresh_files": False,
@@ -184,6 +186,7 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
     logged_text = memory_item.get("text", memory_text)
     return {
         "speak": f"Understood, sir. I will remember that: {memory_text}",
+        "speak_lang": "en",
         "logs": [f"MEMORY SAVED: {logged_text}"],
         "file_data": None,
         "refresh_files": False,
@@ -619,7 +622,7 @@ async def _memory_route_app(scope, receive, send, original_app):
             agent.clear_history()
         except Exception:
             pass
-        response = {"speak": "Memory banks cleared, sir. Starting fresh.", "logs": ["ACTION: Cleared conversation history"], "file_data": None, "refresh_files": False, "image_data": None, "phase1_reset": True}
+        response = {"speak": "Memory banks cleared, sir. Starting fresh.", "speak_lang": "en", "logs": ["ACTION: Cleared conversation history"], "file_data": None, "refresh_files": False, "image_data": None, "phase1_reset": True}
         from starlette.responses import JSONResponse
         await JSONResponse(response)(scope, receive, send)
         return

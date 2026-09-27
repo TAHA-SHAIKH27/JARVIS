@@ -1031,6 +1031,7 @@ class TTSRequest(BaseModel):
     text: str
     priority: int = 0
     interrupt: bool = True
+    lang: Optional[str] = None
 
 
 @app.post("/api/voice/command")
@@ -1067,7 +1068,7 @@ async def voice_command(req: VoiceCommandRequest):
 async def voice_tts(req: TTSRequest):
     """Text-to-speech endpoint with interruption support."""
     voice = get_voice_system()
-    success = voice.speak(req.text, priority=req.priority, interrupt=req.interrupt)
+    success = voice.speak(req.text, priority=req.priority, interrupt=req.interrupt, lang=req.lang)
     return {"status": "success" if success else "error", "speaking": voice.is_speaking()}
 
 
@@ -1473,6 +1474,7 @@ async def process_command(req: CommandRequest):
             pass
         return {
             "speak": "Memory banks cleared, sir. Starting fresh.",
+            "speak_lang": "en",
             "logs": ["ACTION: Cleared conversation history"],
             "file_data": None,
             "refresh_files": False,
@@ -1978,8 +1980,14 @@ async def process_command(req: CommandRequest):
             city = action.get("city", "London")
             # Already fetched above; grab from last weather result if available
         
+    try:
+        from backend.agent.lang_detect import detect_lang
+        speak_lang = detect_lang(speak_text, req.prompt)
+    except Exception:
+        speak_lang = "en"
     return {
         "speak": speak_text,
+        "speak_lang": speak_lang,
         "logs": execution_logs,
         "file_data": file_data,
         "refresh_files": refresh_files,
