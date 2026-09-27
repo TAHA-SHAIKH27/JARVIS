@@ -146,3 +146,11 @@ Baseline (2026-09-27): `test_scheduler.py` + `backend/agent/test_phase1_runtime.
   `src/index.css` glass styles). Backend-confirmed actions (failure keeps item
   + chat feedback). Verification: `vite build` clean (1523 modules).
   Commit `feat: reminder bar plus notification button` pushed, in sync.
+- 2026-09-27 — Step 5 DONE: Notification Center (`NotificationCenter.jsx` new,
+  `App.jsx` center actions + overlay render; `scheduler.delete_job_by_id` +
+  routed scheduled delete: pending→cancel-kept, history→hard-delete).
+  Panel: tabs All|Unread|Reminders|Scheduled|Notifications, search, Today/
+  Upcoming/History sections, per-kind actions, mark-all-read, clear-history
+  (confirm), Esc/overlay close, empty states. Verification: `vite build` clean,
+  bundled CSS contains new styles; 26 backend tests pass.
+  Commit `feat: add notification center` pushed, in sync.

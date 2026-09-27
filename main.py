@@ -711,7 +711,10 @@ def _do_center_action(action: str, nid: str,
         if kind == "scheduled":
             from backend.tools import scheduler as _sched
             if action == "delete":
-                return _sched.cancel_job_by_id(bare)
+                job = _sched.get_job(bare)
+                if job is not None and job.get("status") == "pending":
+                    return _sched.cancel_job_by_id(bare)
+                return _sched.delete_job_by_id(bare)
             if action in ("read", "dismiss"):
                 return {"status": "success", "message": "Noted, sir."}
             if action == "snooze" or action == "reschedule":
@@ -915,13 +918,12 @@ def delete_reminder_api(reminder_id: str):
 
 @app.delete("/api/scheduled/{job_id}")
 def delete_scheduled_api(job_id: str):
-    """Cancel one scheduled message (kept as cancelled history, never refires)."""
+    """Cancel a pending message (kept as history) or delete a history entry."""
     if not job_id.strip():
         raise HTTPException(status_code=400, detail="Scheduled message id required.")
     _, bare = _split_center_id(job_id)
     try:
-        from backend.tools import scheduler as _sched
-        res = _sched.cancel_job_by_id(bare)
+        res = _do_center_action("delete", f"scheduled:{bare}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)[:200])
     if res.get("status") != "success":

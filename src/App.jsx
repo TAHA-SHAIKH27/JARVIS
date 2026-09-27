@@ -34,6 +34,7 @@ import CodeCorePage from './CodeCorePage';
 import StartupAuditBanner from './StartupAuditBanner';
 
 import ReminderBar from './components/ReminderBar';
+import NotificationCenter from './components/NotificationCenter';
 
 import { useVoice } from './hooks/useVoice';
 
@@ -433,6 +434,28 @@ export default function App() {
     setCenterOpen(true)
     fetchCenter()
   }, [fetchCenter])
+
+  // Notification Center actions: backend first, then re-pull the snapshot.
+  const centerRefreshAfter = useCallback(async (data) => {
+    if (data) await fetchCenter()
+    return data
+  }, [fetchCenter])
+
+  const centerRead = useCallback((id) => notifAction('/api/notifications/read', { id }, centerRefreshAfter), [fetchCenter])
+  const centerUnread = useCallback((id) => notifAction('/api/notifications/unread', { id }, centerRefreshAfter), [fetchCenter])
+  const centerDelete = useCallback((id) => notifAction('/api/notifications/delete', { id }, centerRefreshAfter), [fetchCenter])
+  const centerSnooze = useCallback((id, opts) => {
+    const body = { id }
+    if (opts && opts.when) body.when = opts.when
+    else body.minutes = (opts && opts.minutes) || 10
+    return notifAction('/api/notifications/snooze', body, centerRefreshAfter)
+  }, [fetchCenter])
+  const centerReschedule = useCallback((id, when) => {
+    const bare = String(id).replace(/^scheduled:/, '')
+    return notifAction(`/api/scheduled/${encodeURIComponent(bare)}/reschedule`, { when }, centerRefreshAfter)
+  }, [fetchCenter])
+  const centerReadAll = useCallback(() => notifAction('/api/notifications/read-all', {}, centerRefreshAfter), [fetchCenter])
+  const centerClearHistory = useCallback(() => notifAction('/api/notifications/clear-history', {}, centerRefreshAfter), [fetchCenter])
 
   async function dismissNotice(id) {
     setNotices(prev => prev.filter(n => n.id !== id))
@@ -1370,6 +1393,24 @@ export default function App() {
         </div>
       </div>
       </div>{/* end core-view wrapper */}
+
+      {/* Notification Center overlay (JARVIS-native panel, Esc to close) */}
+      {centerOpen && (
+        <NotificationCenter
+          data={centerData}
+          loading={centerLoading}
+          busy={notifBusy}
+          onClose={() => setCenterOpen(false)}
+          onRead={centerRead}
+          onUnread={centerUnread}
+          onDelete={centerDelete}
+          onSnooze={centerSnooze}
+          onReschedule={centerReschedule}
+          onReadAll={centerReadAll}
+          onClearHistory={centerClearHistory}
+          onRefresh={fetchCenter}
+        />
+      )}
 
       {/* Settings Modal (always rendered so it can open from any view) */}
       {settingsOpen && (

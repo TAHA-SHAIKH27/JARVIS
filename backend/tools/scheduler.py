@@ -283,6 +283,21 @@ def fire_due_reminders(on_fire: Callable[[Dict[str, Any]], None]) -> int:
     return fired
 
 
+def delete_job_by_id(job_id: str) -> Dict[str, Any]:
+    """Hard-delete a non-pending job record (history cleanup only). Pending
+    jobs must go through cancel so the audit trail is kept; refused here."""
+    jobs = _load_jobs()
+    for job in jobs:
+        if job.get("id") == job_id:
+            if job.get("status") == "pending":
+                return {"status": "error",
+                        "message": "That message is still pending, sir — cancel it instead."}
+            _save_jobs([j for j in jobs if j.get("id") != job_id])
+            return {"status": "success", "message": "History entry deleted, sir.",
+                    "job": job}
+    return {"status": "error", "message": "Scheduled message not found, sir."}
+
+
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     for job in _load_jobs():
         if job.get("id") == job_id:
