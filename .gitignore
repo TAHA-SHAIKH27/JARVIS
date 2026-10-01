@@ -64,8 +64,25 @@ backend/data/notifications.json
 jarvis_tasks.db*
 backend/data/session_memory.json
 backend/data/current_session_memory.json
+backend/data/conversation_context.json
+backend/data/persistent_memory.json
 backend/data/last_audit.json
 backend/agent/model_registry_store.json
+
+# Personal notes/todos panels (local runtime data, survives restarts)
+notes.json
+todos.json
+
+# Internal planning docs + agent working notes (never commit)
+CINEMATIC_STARTUP_PLAN.md
+IMPLEMENTATION_PLAN.md
+JARVIS_IMPLEMENTATION_PLAN.md
+NOTIFICATION_CENTER_PLAN.md
+JARVIS_Master_Plan.docx
+AGENT_RECALL.txt
+
+# One-off dev scratch scripts (never commit)
+check-braces3.cjs
 
 # Startup crash reports + repaired-file archive (per-incident user artifacts)
 STARTUP CRASH/
