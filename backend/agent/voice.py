@@ -64,25 +64,55 @@ class VoiceSystem:
         self._init_sapi()
     
     def _init_sapi(self):
-        """Initialize Windows SAPI voice."""
+        """Initialize Windows SAPI voice. JARVIS is male, so the default
+        voice is forced to a male English voice (David/Mark/...) instead of
+        the Windows default (usually Zira, female). Never raises."""
         try:
             import win32com.client
             self._sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
             self._sapi_available = True
-            
-            # Get available voices
+
+            # Get available voices (with gender when SAPI exposes it)
             self._voices = []
             for voice in self._sapi_voice.GetVoices():
-                self._voices.append({
-                    "id": voice.Id,
-                    "name": voice.GetDescription(),
-                    "language": voice.GetAttribute("Language")
-                })
+                try:
+                    gender = voice.GetAttribute("Gender")
+                except Exception:
+                    gender = ""
+                try:
+                    self._voices.append({
+                        "id": voice.Id,
+                        "name": voice.GetDescription(),
+                        "language": voice.GetAttribute("Language"),
+                        "gender": gender or "",
+                    })
+                except Exception:
+                    pass
+            self._select_default_male_voice()
         except Exception as e:
             print(f"[VoiceSystem] SAPI initialization failed: {e}")
             self._sapi_voice = None
             self._sapi_available = False
             self._voices = []
+
+    def _select_default_male_voice(self):
+        """Point SAPI at the most masculine English voice available."""
+        try:
+            if not getattr(self, "_sapi_available", False) or self._sapi_voice is None:
+                return False
+            from backend.agent.lang_detect import select_voice_for_lang
+            choice = select_voice_for_lang(getattr(self, "_voices", []), "en")
+            if choice is None:
+                return False
+            for installed in self._sapi_voice.GetVoices():
+                if installed.Id == choice.get("id"):
+                    self._sapi_voice.Voice = installed
+                    self._active_lang = "en"
+                    print(f"[VoiceSystem] Default voice: {choice.get('name')}")
+                    return True
+        except Exception as exc:
+            print(f"[VoiceSystem] Default male voice selection failed: {exc}")
+        return False
     
     def start(self):
         """Start the TTS worker thread."""

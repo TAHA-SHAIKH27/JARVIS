@@ -966,47 +966,82 @@ def get_battery_info() -> dict:
 
 
 def get_network_info() -> dict:
-    """Get IP addresses, active interfaces, and internet connectivity."""
+    """Get IP addresses, active interfaces, and detailed internet connectivity.
+
+    Uses net_diagnostics as the single source of truth so "am I connected?"
+    distinguishes: Wi-Fi off / not joined / router-no-internet / DNS failing /
+    Google-unreachable / fully online. Extra fields are additive — the old
+    {connected, local_ip, public_ip, hostname, interfaces} shape is preserved.
+    """
     import socket
     import urllib.request
     try:
+        from net_diagnostics import STATE_LABELS, get_connectivity_snapshot
+        snap = get_connectivity_snapshot()
+        state = snap.get("state", "wifi_off")
+        ssid = snap.get("ssid", "")
+        local_ips = snap.get("local_ips", [])
+
         hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
+        try:
+            local_ip = socket.gethostbyname(hostname)
+        except Exception:
+            local_ip = local_ips[0] if local_ips else "Unknown"
 
-        # Get all interface IPs
-        interfaces = {}
-        for iface, addrs in psutil.net_if_addrs().items():
-            for addr in addrs:
-                if addr.family == socket.AF_INET and not addr.address.startswith('127.'):
-                    interfaces[iface] = addr.address
+        interfaces = {k: (v["addrs"][0] if v.get("addrs") else "?")
+                      for k, v in snap.get("interfaces", {}).items()}
 
-        # Get public IP
+        # Public IP — only attempted when basic internet routing works.
         public_ip = "Unknown"
-        try:
-            with urllib.request.urlopen('https://api.ipify.org', timeout=3) as r:
-                public_ip = r.read().decode('utf-8').strip()
-        except Exception:
-            pass
+        if snap.get("internet"):
+            try:
+                with urllib.request.urlopen('https://api.ipify.org', timeout=3) as r:
+                    public_ip = r.read().decode('utf-8').strip()
+            except Exception:
+                pass
 
-        # Check connectivity
-        connected = False
-        try:
-            socket.setdefaulttimeout(2)
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
-            connected = True
-        except Exception:
-            pass
+        connected = bool(snap.get("internet"))
+        internet = connected
+        online = state == "online"
+        label = STATE_LABELS.get(state, state)
+        shown_ifaces = {k: v for k, v in interfaces.items() if not v.startswith("169.254.")}
+        iface_str = ", ".join(f"{k}: {v}" for k, v in list(shown_ifaces.items())[:3])
 
-        iface_str = ", ".join(f"{k}: {v}" for k, v in list(interfaces.items())[:3])
-        msg = (f"Network status: {'Connected' if connected else 'Offline'}. "
-               f"Local IP: {local_ip}. Public IP: {public_ip}. "
-               f"Active interfaces: {iface_str or 'None detected'}.")
+        if state == "wifi_off":
+            msg = ("Network status: Offline, sir — no active Wi-Fi or Ethernet adapter. "
+                   "Please check the Wi-Fi switch, airplane mode, or cable.")
+        elif state == "disconnected":
+            msg = ("Network status: Offline, sir — not joined to any network (no valid IP). "
+                   "Please connect to a Wi-Fi network first.")
+        elif state == "local_only":
+            where = f" ({ssid}, {local_ip})" if ssid else f" ({local_ip})"
+            msg = (f"Network status: Connected to your router{where}, sir, but the router "
+                   f"has no internet. Public IP: {public_ip}. Active interfaces: {iface_str or 'None'}. "
+                   "Check the router's WAN light or reboot it.")
+        elif state == "no_dns":
+            msg = (f"Network status: Connected with internet routing, sir, but DNS resolution is failing. "
+                   f"Local IP: {local_ip}. Public IP: {public_ip}. Try DNS 8.8.8.8 or disable VPN filters.")
+        elif state == "gemini_unreachable":
+            msg = (f"Network status: Internet is working, sir (Local IP: {local_ip}, Public IP: {public_ip}), "
+                   "but Google's API edge is unreachable — possible Google outage, firewall, or ISP block. "
+                   "Local controls still work; cloud reasoning will fail until it clears.")
+        else:
+            msg = (f"Network status: Online and connected, sir. Local IP: {local_ip}. Public IP: {public_ip}. "
+                   f"Active interfaces: {iface_str or 'None detected'}.")
         return {
             "status": "success",
             "message": msg,
             "network": {
                 "connected": connected,
+                "internet": internet,
+                "online": online,
+                "state": state,
+                "state_label": label,
+                "ssid": ssid,
+                "dns": bool(snap.get("dns")),
+                "gemini_reachable": bool(snap.get("gemini_reachable")),
                 "local_ip": local_ip,
+                "local_ips": local_ips,
                 "public_ip": public_ip,
                 "hostname": hostname,
                 "interfaces": interfaces

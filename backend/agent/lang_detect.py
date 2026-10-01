@@ -110,12 +110,63 @@ def _lang_attr_to_lcid(value: Any) -> Optional[int]:
         return None
 
 
+def _voice_name_tokens(voice: Dict[str, Any]) -> List[str]:
+    try:
+        blob = f"{voice.get('name', '')} {voice.get('id', '')}".lower()
+        return re.split(r"[^a-zàâêëîïôûùçœæñ]+", blob)
+    except Exception:
+        return []
+
+
+# JARVIS is male: within one language, a male voice always wins over a
+# female one, and an androgynous/unknown voice beats a female one. Tokens
+# are whole-word so "man" never matches "Samantha".
+_MALE_TOKENS = frozenset({
+    "male", "man", "david", "mark", "daniel", "james", "george", "guy",
+    "madhur", "hemant", "pablo", "jorge", "diego", "carlos", "paul",
+    "thomas", "alexander", "fred", "arthur", "oscar",
+})
+_FEMALE_TOKENS = frozenset({
+    "female", "woman", "zira", "samantha", "aria", "jenny", "swara",
+    "kalpana", "helena", "laura", "monica", "hortense", "julie", "hazel",
+    "sabina", "heera", "kanya", "veena", "lekha", "susan", "karen",
+})
+
+
+def _voice_masculinity_rank(voice: Dict[str, Any]) -> int:
+    """0 = male, 1 = unknown, 2 = female. Explicit SAPI Gender wins first."""
+    try:
+        gender = str(voice.get("gender", "") or "").strip().lower()
+        if gender == "male":
+            return 0
+        if gender == "female":
+            return 2
+    except Exception:
+        pass
+    tokens = set(_voice_name_tokens(voice))
+    male = bool(tokens & _MALE_TOKENS)
+    female = bool(tokens & _FEMALE_TOKENS)
+    if male and not female:
+        return 0
+    if female and not male:
+        return 2
+    return 1
+
+
+def _prefer_male(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Most masculine candidate first (stable — unknowns keep order)."""
+    if not candidates:
+        return None
+    return sorted(candidates, key=_voice_masculinity_rank)[0]
+
+
 def select_voice_for_lang(voices: List[Dict[str, Any]], lang: str) -> Optional[Dict[str, Any]]:
     """Pick the best installed voice for lang from a SAPI-style voice list.
 
     Each voice: {"id", "name", "language"}. Prefers LCID match, then a name
-    containing the language name. Returns None when nothing matches (caller
-    keeps the current voice). Never raises.
+    containing the language name. Within one language JARVIS is male, so a
+    male voice always beats a female one. Returns None when nothing matches
+    (caller keeps the current voice). Never raises.
     """
     try:
         if lang not in LANGS:
@@ -124,17 +175,22 @@ def select_voice_for_lang(voices: List[Dict[str, Any]], lang: str) -> Optional[D
                  "ur": ("urdu",), "fr": ("french", "français", "francais"),
                  "es": ("spanish", "español", "espanol")}
         lcids = set(SAPI_LCID.get(lang, ()))
-        for voice in voices or []:
-            if not isinstance(voice, dict):
-                continue
-            if _lang_attr_to_lcid(voice.get("language")) in lcids:
-                return voice
+        lcid_hits = [
+            voice for voice in voices or []
+            if isinstance(voice, dict)
+            and _lang_attr_to_lcid(voice.get("language")) in lcids
+        ]
+        if lcid_hits:
+            return _prefer_male(lcid_hits)
+        name_hits = []
         for voice in voices or []:
             if not isinstance(voice, dict):
                 continue
             blob = f"{voice.get('name', '')} {voice.get('id', '')}".lower()
             if any(n in blob for n in names.get(lang, ())):
-                return voice
+                name_hits.append(voice)
+        if name_hits:
+            return _prefer_male(name_hits)
     except Exception:
         pass
     return None

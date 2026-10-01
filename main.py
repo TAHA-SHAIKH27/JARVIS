@@ -1022,6 +1022,33 @@ def read_status():
     return {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}
 
 
+@app.get("/api/network/status")
+def network_status():
+    """Live connectivity snapshot for the HUD (cached ~10s in net_diagnostics).
+
+    Lets the frontend distinguish backend-down vs Wi-Fi-off vs
+    router-no-internet vs Google-unreachable instead of one generic OFFLINE.
+    """
+    try:
+        from net_diagnostics import STATE_LABELS, get_connectivity_snapshot
+        snap = get_connectivity_snapshot()
+        state = snap.get("state", "wifi_off")
+        return {
+            "status": "success",
+            "state": state,
+            "state_label": STATE_LABELS.get(state, state),
+            "online": state == "online",
+            "internet": bool(snap.get("internet")),
+            "dns": bool(snap.get("dns")),
+            "gemini_reachable": bool(snap.get("gemini_reachable")),
+            "ssid": snap.get("ssid", ""),
+            "local_ips": snap.get("local_ips", []),
+            "up_interfaces": snap.get("up_interfaces", []),
+        }
+    except Exception as e:
+        return {"status": "error", "state": "unknown", "message": str(e)}
+
+
 # ── Voice Command Endpoint (for native voice service) ──────────────────────
 class VoiceCommandRequest(BaseModel):
     prompt: str
@@ -1085,6 +1112,21 @@ async def voice_tts_state():
     """Get current TTS state."""
     voice = get_voice_system()
     return {"status": "success", "state": voice.get_state().value, "speaking": voice.is_speaking(), "muted": voice.is_muted()}
+
+
+@app.get("/api/voice/voices")
+async def voice_list():
+    """Installed TTS voices (SAPI) with genders + which one JARVIS uses."""
+    voice = get_voice_system()
+    try:
+        current_id = voice._sapi_voice.Voice.Id if voice._sapi_voice is not None else ""
+    except Exception:
+        current_id = ""
+    return {
+        "status": "success",
+        "active_voice_id": current_id,
+        "voices": voice.get_available_voices(),
+    }
 
 
 class VoiceMuteRequest(BaseModel):

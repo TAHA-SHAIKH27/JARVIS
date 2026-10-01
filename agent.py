@@ -10,6 +10,50 @@ from datetime import datetime
 from system_ops import list_files, read_file, write_file
 import google_oauth
 
+
+def _smart_network_message(exc: BaseException | None = None, mode: str = "chat") -> str:
+    """Diagnose live connectivity and explain it Jarvis-style.
+
+    Replaces the old single generic "network issue communicating with my
+    neural processors" line. Distinguishes Wi-Fi off / router-no-internet /
+    DNS failure / Google-unreachable / brief wobble. Never raises — falls
+    back to the legacy generic line if diagnostics themselves fail.
+    """
+    try:
+        from net_diagnostics import build_jarvis_message, get_connectivity_snapshot
+        snap = get_connectivity_snapshot()
+        return build_jarvis_message(snap, exc, mode=mode)
+    except Exception:
+        return "I encountered a network issue communicating with my neural processors, sir. Please check your internet connection and API key."
+
+
+def _offline_command_fallback(prompt: str, exc: BaseException | None = None) -> list:
+    """Build an offline-aware action list when Gemini is unreachable.
+
+    Tries the local rule-based parser so offline-capable commands (volume,
+    screenshot, timers, files, app launch, ...) still execute. The returned
+    speak text always leads with the real connectivity diagnosis.
+    """
+    smart_msg = _smart_network_message(exc, mode="command")
+    try:
+        local = parse_local_command(prompt)
+    except Exception:
+        local = []
+    if not local:
+        return [{"type": "speak", "text": smart_msg}]
+    speaks = [a for a in local if a.get("type") == "speak"]
+    non_speaks = [a for a in local if a.get("type") != "speak"]
+    # parse_local_command's default apology means "no local match" — don't stack it.
+    if len(local) == 1 and speaks and "couldn't process that command locally" in speaks[0].get("text", ""):
+        return [{"type": "speak", "text": smart_msg}]
+    local_speak = speaks[0].get("text", "") if speaks else ""
+    if local_speak:
+        combined = f"{smart_msg} Still proceeding locally, sir: {local_speak}"
+    else:
+        combined = smart_msg
+    add_to_history("assistant", combined)
+    return [{"type": "speak", "text": combined}, *non_speaks]
+
 # Simple system commands keyword mapping for local offline fallback
 OFFLINE_RESPONSES = {
     "hello": "Hello, sir. Systems are online and operating at peak efficiency. What can I do for you today?",
@@ -1027,8 +1071,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
         return [{"type": "speak", "text": msg}]
     except Exception as e:
         print(f"Gemini API Error: {str(e)}")
-        msg = "I encountered a network issue communicating with my neural processors, sir. Please check your internet connection and API key."
-        return [{"type": "speak", "text": msg}]
+        return _offline_command_fallback(prompt, e)
 
 
 # ===== STREAMING CONVERSATIONAL CHAT =====
@@ -1146,7 +1189,7 @@ def stream_chat_response(prompt: str, api_key: str, project_id: str = ""):
             else:
                 msg = f"Communication error with my neural processors (HTTP {last_error.code}), sir."
         else:
-            msg = "I encountered a network issue communicating with my neural processors, sir."
+            msg = _smart_network_message(last_error, mode="chat")
         add_to_history("assistant", msg)
         yield msg
 
@@ -1329,10 +1372,13 @@ def stream_gemini_actions(prompt: str, api_key: str, project_id: str = ""):
                 msg = "My credentials for the Generative Language API seem to be invalid or lack permission, sir."
             else:
                 msg = f"Communication error with my neural processors (HTTP {last_error.code}), sir."
+            add_to_history("assistant", msg)
+            yield {"type": "speak", "text": msg}
         else:
-            msg = "I encountered a network issue communicating with my neural processors, sir."
-        add_to_history("assistant", msg)
-        yield {"type": "speak", "text": msg}
+            # Network-level failure: explain the real state AND still run
+            # any offline-capable part of the command locally.
+            for _act in _offline_command_fallback(prompt, last_error):
+                yield _act
 
 
 # ===== IMAGE UNDERSTANDING =====
@@ -1452,7 +1498,7 @@ def stream_image_analysis(image_base64: str, mime_type: str, prompt: str, api_ke
             else:
                 msg = f"Communication error with my neural processors (HTTP {last_error.code}), sir."
         else:
-            msg = "I encountered a network issue analyzing that image, sir."
+            msg = _smart_network_message(last_error, mode="vision")
         add_to_history("assistant", msg)
         yield msg
 
@@ -1577,6 +1623,6 @@ def stream_document_analysis(document_text: str, filename: str, prompt: str, api
             else:
                 msg = f"Communication error with my neural processors (HTTP {last_error.code}), sir."
         else:
-            msg = "I encountered a network issue analyzing that document, sir."
+            msg = _smart_network_message(last_error, mode="document")
         add_to_history("assistant", msg)
         yield msg

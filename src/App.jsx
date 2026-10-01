@@ -150,6 +150,7 @@ function TimerWidget({ timerData, onCancel }) {
 export default function App() {
 
   const [online, setOnline] = useState(true)
+  const [netState, setNetState] = useState('online')
 
   const [busy, setBusy] = useState(false)
 
@@ -372,9 +373,27 @@ export default function App() {
   const refreshStatus = useCallback(async () => {
     try {
       const res = await fetch('/api/status')
-      setOnline(res.ok)
+      if (!res.ok) {
+        setOnline(false)
+        setNetState('backend_offline')
+        return
+      }
+      setOnline(true)
     } catch {
       setOnline(false)
+      setNetState('backend_offline')
+      return
+    }
+    // Backend is up — now ask it about real internet connectivity so the
+    // HUD can tell Wi-Fi-off / router-no-internet / Google-down apart.
+    try {
+      const net = await fetch('/api/network/status')
+      if (net.ok) {
+        const data = await net.json()
+        setNetState(data.state || 'online')
+      }
+    } catch {
+      /* keep last known netState */
     }
   }, [])
 
@@ -1237,6 +1256,7 @@ export default function App() {
       <div className={assembling ? 'assemble-header' : ''}>
         <Header
           online={online}
+          netState={netState}
           busy={busy}
           chatMode={chatMode}
           setChatMode={setChatMode}

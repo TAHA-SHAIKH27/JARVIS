@@ -3,6 +3,7 @@
 // Coordinates SpeechRecognition, speechSynthesis, and Web Audio API mic-level visualization.
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { pickBrowserVoice } from '../langDetect';
 
 declare global {
   interface Window {
@@ -447,6 +448,11 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
                 const utter = new SpeechSynthesisUtterance('Yes?');
                 utter.rate = 1.0;
                 utter.pitch = 0.85;
+                try {
+                  // JARVIS is male — use the male English voice, never the default.
+                  const maleVoice = pickBrowserVoice('en');
+                  if (maleVoice) utter.voice = maleVoice;
+                } catch {}
                 window.speechSynthesis.speak(utter);
               }
             }
