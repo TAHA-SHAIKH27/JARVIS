@@ -54,6 +54,10 @@ backend/data/jarvis_memory.db*
 backend/data/gmail_watch.json
 backend/data/gmail_seen.json
 token_gmail.json
+token.json
+
+# Knowledge engine rotation state (runtime data, survives restarts)
+backend/data/knowledge_rotation.json
 
 # Normal-mode scheduler: private message content + personal reminders (never commit)
 backend/data/scheduled_whatsapp.json

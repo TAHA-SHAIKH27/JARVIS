@@ -150,40 +150,154 @@ def write_file(filename: str, content: str) -> dict:
     except Exception as e:
         return {"status": "error", "message": f"Failed to write file: {str(e)}"}
 
-def read_file(filename: str) -> dict:
-    """Read file content in the work files directory (supports nested paths like screenshots/x.png)."""
-    filename = filename.replace("\\", "/").lstrip("/")
-    path = os.path.abspath(os.path.join(WORK_DIR, filename))
-    if not path.startswith(os.path.abspath(WORK_DIR)):
-        return {"status": "error", "message": "Invalid path."}
-    if not os.path.exists(path):
-        return {"status": "error", "message": f"File not found: {filename}"}
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+# Top-level project files users ask about ("requirements.txt", "main.py").
+# Directories are NEVER searched at project root (node_modules etc. are huge).
+_ROOT_SEARCH_SKIP = {
+    "node_modules", ".git", "__pycache__", "dist", "whisper.cpp",
+    "ws-scrcpy", "work_files", ".backup", "downloads",
+}
+
+
+def _strip_folder_phrases(raw: str) -> str:
+    """Turn 'requirements.txt in the jarvis (claude) folder' into a filename."""
+    text = (raw or "").strip().strip("\"'").replace("\\", "/")
+    # Drop trailing folder phrases: "in X", "from X folder", "under X dir".
+    text = re.split(r"\s+(?:in|from|under|inside|of)\s+", text, maxsplit=1)[0].strip()
+    # "read file named X" leftovers.
+    text = re.sub(r"^(?:file|the file|a file)\s+(?:named|called)?\s*", "", text,
+                  flags=re.I).strip()
+    return text.strip("\"'")
+
+
+def _iter_candidate_files():
+    """(display, full_path) pairs: work_files recursive + project-root files."""
+    seen = set()
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        for dirpath, dirnames, filenames in os.walk(WORK_DIR):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d != "__pycache__"]
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, WORK_DIR)
+                if full not in seen:
+                    seen.add(full)
+                    yield rel, full
+    except Exception:
+        pass
+    try:
+        for fn in os.listdir(PROJECT_ROOT):
+            full = os.path.join(PROJECT_ROOT, fn)
+            if os.path.isfile(full) and full not in seen:
+                seen.add(full)
+                yield fn, full
+    except Exception:
+        pass
+
+
+def resolve_user_file(raw: str) -> dict:
+    """Resolve a user's (possibly typo'd) file reference.
+
+    Returns {"status": "success", "path", "display", "fuzzy": bool} or
+    {"status": "clarify", "message", "options"} or {"status": "error", "message"}.
+    Searches work_files (recursive) first, then top-level project files.
+    """
+    import difflib
+    query = _strip_folder_phrases(raw)
+    if not query:
+        return {"status": "error", "message": "You didn't name a file, sir."}
+    candidates = list(_iter_candidate_files())
+    if not candidates:
+        return {"status": "error", "message": "I have no files to search, sir."}
+
+    q = query.strip()
+    q_base = os.path.basename(q).lower()
+    q_nospace = re.sub(r"\s+", "", q_base)
+
+    def base_of(display: str) -> str:
+        return os.path.basename(display).lower()
+
+    # 1. Exact: full relative path or basename, case-insensitive.
+    for display, full in candidates:
+        if display.lower() == q.lower() or base_of(display) == q_base:
+            return {"status": "success", "path": full, "display": display,
+                    "fuzzy": False}
+    # 2. Extension-optional: "requirements" -> "requirements.txt".
+    stem_hits = [(d, f) for d, f in candidates
+                 if os.path.splitext(base_of(d))[0] == os.path.splitext(q_base)[0]
+                 and q_base and "." not in q_base]
+    if len(stem_hits) == 1:
+        d, f = stem_hits[0]
+        return {"status": "success", "path": f, "display": d, "fuzzy": True}
+
+    basenames = [base_of(d) for d, _ in candidates]
+    # 3. Typo tolerance: close basename matches.
+    close = difflib.get_close_matches(q_base, basenames, n=3, cutoff=0.6)
+    close += [b for b in basenames
+              if q_nospace and q_nospace in re.sub(r"\s+", "", b)
+              and b not in close][:3 - len(close)]
+    options = []
+    for b in close:
+        for d, _ in candidates:
+            if base_of(d) == b and d not in options:
+                options.append(d)
+                break
+    if len(options) == 1:
+        d = options[0]
+        full = next(f for dd, f in candidates if dd == d)
+        return {"status": "success", "path": full, "display": d, "fuzzy": True}
+    if len(options) > 1:
+        return {"status": "clarify",
+                "message": (f"I found a few files like '{query}', sir — "
+                            f"which one did you mean?"),
+                "options": options[:3]}
+    return {"status": "error",
+            "message": f"I couldn't find any file like '{query}', sir. I searched "
+                       f"your work files and the project folder."}
+
+def read_file(filename: str) -> dict:
+    """Read a user file — exact, extension-optional, or typo-tolerant match."""
+    resolved = resolve_user_file(filename)
+    if resolved["status"] != "success":
+        return resolved
+    try:
+        with open(resolved["path"], "r", encoding="utf-8") as f:
             content = f.read()
-        return {"status": "success", "content": content, "filename": filename}
+        out = {"status": "success", "content": content,
+               "filename": resolved["display"]}
+        if resolved.get("fuzzy"):
+            out["message"] = f"Matched '{resolved['display']}', sir."
+        return out
     except Exception as e:
         return {"status": "error", "message": f"Failed to read file: {str(e)}"}
 
 def delete_file(filename: str) -> dict:
-    """Delete a file or folder inside the work files directory."""
+    """Delete a file or folder — exact, extension-optional, or typo-tolerant.
 
-    filename = filename.replace("\\", "/").lstrip("/")
+    Folders are still only deletable inside the work files directory."""
+    resolved = resolve_user_file(filename)
+    if resolved["status"] != "success":
+        # Fallback: deleting a whole folder inside work files by exact path.
+        safe = _strip_folder_phrases(filename).replace("\\", "/").lstrip("/")
+        dir_path = os.path.abspath(os.path.join(WORK_DIR, safe))
+        if (safe and dir_path.startswith(os.path.abspath(WORK_DIR) + os.sep)
+                and os.path.isdir(dir_path)):
+            try:
+                shutil.rmtree(dir_path)
+                return {"status": "success",
+                        "message": f"Deleted folder: {safe}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+        return resolved
+    path = resolved["path"]
 
-    path = os.path.abspath(os.path.join(WORK_DIR, filename))
-
-    # Prevent deleting anything outside WORK_DIR
-    if not path.startswith(os.path.abspath(WORK_DIR)):
-        return {
-            "status": "error",
-            "message": "Invalid path."
-        }
-
-    if not os.path.exists(path):
-        return {
-            "status": "error",
-            "message": f"Not found: {filename}"
-        }
+    # Safety: project-root files are read-only through JARVIS; only the
+    # work-files tree may be deleted.
+    if not os.path.abspath(path).startswith(os.path.abspath(WORK_DIR) + os.sep):
+        return {"status": "error",
+                "message": f"For safety I can only delete files inside your work "
+                           f"folder, sir — '{resolved['display']}' lives outside it."}
 
     try:
         if os.path.isfile(path):
@@ -198,7 +312,7 @@ def delete_file(filename: str) -> dict:
 
         return {
             "status": "success",
-            "message": f"Deleted: {filename}"
+            "message": f"Deleted: {resolved['display']}"
         }
 
     except Exception as e:
@@ -604,27 +718,171 @@ def check_pc_health() -> dict:
         warnings.append("No active internet connection detected")
         
     status = "EXCELLENT" if health_score >= 90 else "GOOD" if health_score >= 75 else "DEGRADED" if health_score >= 50 else "CRITICAL"
-    
+
+    # 5. Top resource hogs + uptime + free space (actionable, not just numbers)
+    top_cpu, top_mem, uptime_str, free_gb = [], [], "", 0.0
+    try:
+        procs = []
+        for proc in psutil.process_iter(['name', 'cpu_percent', 'memory_info']):
+            try:
+                info = proc.info
+                name = (info.get('name') or '?').replace('.exe', '')
+                cpu_p = float(info.get('cpu_percent') or 0.0)
+                try:
+                    mem_mb = float((info.get('memory_info') or (0,))[0]) / (1024 * 1024)
+                except (TypeError, IndexError):
+                    mem_mb = 0.0
+                if cpu_p > 0.5 or mem_mb > 100:
+                    procs.append({"name": name, "cpu": cpu_p, "mem_mb": mem_mb})
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        top_cpu = sorted(procs, key=lambda p: p["cpu"], reverse=True)[:3]
+        top_mem = sorted(procs, key=lambda p: p["mem_mb"], reverse=True)[:3]
+    except Exception:
+        pass
+    try:
+        import datetime as _dt
+        boot = _dt.datetime.fromtimestamp(psutil.boot_time())
+        delta = _dt.datetime.now() - boot
+        days, rem = divmod(int(delta.total_seconds()), 86400)
+        hrs, rem = divmod(rem, 3600)
+        mins = rem // 60
+        uptime_str = (f"{days}d {hrs}h" if days else f"{hrs}h {mins}m") if (days or hrs or mins) else "just booted"
+    except Exception:
+        pass
+    try:
+        du = psutil.disk_usage('C:')
+        free_gb = round(du.free / (1024 ** 3), 1)
+    except Exception:
+        pass
+    advice = []
+    try:
+        if top_mem and top_mem[0]["mem_mb"] > 800:
+            advice.append(f"{top_mem[0]['name']} is holding {top_mem[0]['mem_mb'] / 1024:.1f} GB — say 'close {top_mem[0]['name']}' to free it")
+        if disk > 90:
+            advice.append("disk is nearly full — say 'clean temp files' to reclaim space")
+        if not ping_ok:
+            pass  # already warned above
+    except Exception:
+        pass
+
     report_text = f"System health is {status} (Score: {health_score}/100). "
     if warnings:
-        report_text += "Warnings detected: " + ", ".join(warnings)
+        report_text += "Warnings detected: " + ", ".join(warnings) + ". "
     else:
-        report_text += "All hardware metrics are within nominal ranges."
-        
+        report_text += "All hardware metrics are within nominal ranges. "
+    if top_cpu:
+        report_text += "Busiest CPU: " + ", ".join(f"{p['name']} ({p['cpu']:.0f}%)" for p in top_cpu) + ". "
+    if top_mem:
+        report_text += "Heaviest memory: " + ", ".join(f"{p['name']} ({p['mem_mb'] / 1024:.1f} GB)" for p in top_mem) + ". "
+    if advice:
+        report_text += " ".join(advice) + "."
+
     return {
         "status": "success",
-        "message": report_text,
+        "message": report_text.strip(),
         "report": {
             "status": status,
             "score": health_score,
             "cpu": f"{cpu}%",
             "memory": f"{memory}%",
             "disk": f"{disk}%",
+            "disk_free_gb": free_gb,
             "battery": battery_msg,
             "ping": f"{ping_time}ms" if ping_ok else "Offline",
+            "uptime": uptime_str,
+            "top_cpu": [{"name": p["name"], "cpu": round(p["cpu"], 1)} for p in top_cpu],
+            "top_memory": [{"name": p["name"], "gb": round(p["mem_mb"] / 1024, 2)} for p in top_mem],
+            "advice": advice,
             "warnings": warnings if warnings else ["All systems nominal."]
         }
     }
+
+
+def empty_recycle_bin() -> dict:
+    """Empty the Windows Recycle Bin (no confirmation UI). Reports count+size."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _SHQUERYRBINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("i64Size", ctypes.c_int64),
+                        ("i64NumItems", ctypes.c_int64)]
+
+        shell32 = ctypes.windll.shell32
+        info = _SHQUERYRBINFO()
+        info.cbSize = ctypes.sizeof(_SHQUERYRBINFO)
+        before_items, before_size = 0, 0
+        try:
+            if shell32.SHQueryRecycleBinW(None, ctypes.byref(info)) == 0:
+                before_items, before_size = int(info.i64NumItems), int(info.i64Size)
+        except Exception:
+            pass
+        # 1 = no confirmation, 2 = no progress UI, 4 = no sound
+        rc = shell32.SHEmptyRecycleBinW(None, None, 1 | 2 | 4)
+        if rc != 0:
+            return {"status": "error", "message": f"Couldn't empty the Recycle Bin (error {rc})."}
+        if before_items == 0:
+            return {"status": "success", "message": "Recycle Bin was already empty — nothing to clear.",
+                    "items": 0, "freed_bytes": 0}
+        mb = before_size / (1024 * 1024)
+        size_str = f"{mb:.1f} MB" if mb < 1024 else f"{mb / 1024:.2f} GB"
+        return {"status": "success",
+                "message": f"Recycle Bin emptied — {before_items} item(s), {size_str} reclaimed.",
+                "items": before_items, "freed_bytes": before_size}
+    except Exception as e:
+        return {"status": "error", "message": f"Couldn't empty the Recycle Bin: {str(e)}"}
+
+
+def clean_temp_files() -> dict:
+    """Delete stale files from user + Windows temp folders. Reports freed space."""
+    import tempfile as _tf
+    freed, removed, skipped = 0, 0, 0
+    targets = []
+    try:
+        for key in ("TEMP", "TMP"):
+            val = os.environ.get(key, "")
+            if val and os.path.isdir(val):
+                targets.append(val)
+        win_temp = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp")
+        if os.path.isdir(win_temp):
+            targets.append(win_temp)
+    except Exception:
+        pass
+    seen = set()
+    for root in targets:
+        norm = os.path.normcase(os.path.abspath(root))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        # Safety: only touch real temp dirs, never walk out of them.
+        for dirpath, _dirnames, filenames in os.walk(norm):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                    os.remove(fp)
+                    freed += sz
+                    removed += 1
+                except (OSError, PermissionError):
+                    skipped += 1
+                except Exception:
+                    skipped += 1
+            # Keep walking (locked files are skipped individually above).
+    try:
+        gb = freed / (1024 ** 3)
+        size_str = f"{gb:.2f} GB" if gb >= 1 else f"{freed / (1024 ** 2):.1f} MB" if freed >= 1024 * 1024 else f"{freed // 1024} KB"
+    except Exception:
+        size_str = "some space"
+    if removed == 0:
+        return {"status": "success",
+                "message": "Temp folders are already clean — nothing to remove.",
+                "removed": 0, "freed_bytes": 0}
+    return {"status": "success",
+            "message": f"Cleaned {removed} temp file(s), freeing {size_str}."
+                       + (f" ({skipped} in-use files skipped.)" if skipped else ""),
+            "removed": removed, "freed_bytes": freed, "skipped": skipped}
 
 def adjust_volume(action: str) -> dict:
     """Adjust or mute the system volume using simulated keypresses."""
@@ -665,12 +923,34 @@ def media_control(action: str) -> dict:
         return {"status": "error", "message": f"Failed to control media: {str(e)}"}
 
 def search_web(query: str) -> dict:
-    """Search Google for a query in the default browser."""
+    """Open Google results AND speak a one-paragraph instant answer.
+
+    The browser still opens for depth, but Jarvis now reads out the
+    short answer (DuckDuckGo instant answers, keyless) when one exists —
+    so "who won..." / "capital of..." get answered aloud, not just shown.
+    """
     import urllib.parse
     try:
         url = f"https://www.google.com/search?q={urllib.parse.quote(query)}"
-        webbrowser.open(url)
-        return {"status": "success", "message": f"I have searched the web for '{query}', sir."}
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        answer = ""
+        try:
+            from backend.tools.knowledge import instant_answer
+            res = instant_answer(query)
+            if res.get("status") == "success" and res.get("answer"):
+                answer = res["answer"]
+        except Exception:
+            answer = ""
+        if answer:
+            return {"status": "success",
+                    "message": f"Here's what I found on '{query}': {answer} I've opened the full results in your browser too.",
+                    "answer": answer, "query": query}
+        return {"status": "success",
+                "message": f"I've opened Google results for '{query}' in your browser.",
+                "query": query}
     except Exception as e:
         return {"status": "error", "message": f"Failed to search web: {str(e)}"}
 
@@ -735,6 +1015,111 @@ def launch_any_app(app_name: str) -> dict:
             return {"status": "success", "message": f"Launched {app_name}, sir."}
         except Exception as e:
             return {"status": "error", "message": f"Failed to launch {app_name}: {str(e)}"}
+
+    # 3. Search Start Menu shortcuts (.lnk files) and Desktop
+    try:
+        import glob as _glob
+        user_profile = os.environ.get("USERPROFILE", "")
+        appdata = os.environ.get("APPDATA", "")
+        programdata = os.environ.get("PROGRAMDATA", "C:\\ProgramData")
+        search_dirs = []
+        if user_profile:
+            search_dirs.append(os.path.join(
+                user_profile, "AppData", "Roaming", "Microsoft",
+                "Windows", "Start Menu", "Programs"))
+        if appdata:
+            search_dirs.append(os.path.join(
+                appdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+        search_dirs.append(os.path.join(
+            programdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+        needle = re.sub(r"[^a-z0-9]+", "", app_name_lower)
+        for directory in search_dirs:
+            pattern = os.path.join(directory, "**", "*.lnk")
+            try:
+                shortcuts = _glob.glob(pattern, recursive=True)
+            except Exception:
+                continue
+            for shortcut in shortcuts:
+                base = os.path.splitext(os.path.basename(shortcut))[0]
+                flat = re.sub(r"[^a-z0-9]+", "", base.lower())
+                if needle and (needle in flat or flat in needle):
+                    try:
+                        os.startfile(shortcut)
+                        return {"status": "success",
+                                "message": f"Launched {base}, sir."}
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # 4. Anything on PATH (chrome, code, spotify, ...)
+    try:
+        import shutil as _shutil
+        exe = _shutil.which(app_name_lower) or _shutil.which(app_name.strip())
+        if exe:
+            subprocess.Popen([exe], shell=False,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return {"status": "success",
+                    "message": f"Launched {app_name}, sir."}
+    except Exception:
+        pass
+
+    return {"status": "error",
+            "message": f"I couldn't find an app called '{app_name}', sir. "
+                       f"Try the exact name as it appears in your Start Menu."}
+
+
+def open_folder(target: str) -> dict:
+    """Open a well-known folder (Downloads, Documents, Desktop, ...) or an
+    explicit path in File Explorer. Never executes anything — folders only."""
+    try:
+        name = (target or "").strip().strip("\"'")
+        lowered = name.lower()
+        profile = os.environ.get("USERPROFILE", "") or os.path.expanduser("~")
+
+        aliases = {
+            "downloads": os.path.join(profile, "Downloads"),
+            "download": os.path.join(profile, "Downloads"),
+            "documents": os.path.join(profile, "Documents"),
+            "document": os.path.join(profile, "Documents"),
+            "desktop": os.path.join(profile, "Desktop"),
+            "pictures": os.path.join(profile, "Pictures"),
+            "picture": os.path.join(profile, "Pictures"),
+            "photos": os.path.join(profile, "Pictures"),
+            "music": os.path.join(profile, "Music"),
+            "videos": os.path.join(profile, "Videos"),
+            "video": os.path.join(profile, "Videos"),
+            "home": profile,
+            "profile": profile,
+            "user": profile,
+            "workspace": WORK_DIR,
+            "work files": WORK_DIR,
+            "workfiles": WORK_DIR,
+            "jarvis": os.path.abspath(os.path.join(os.path.dirname(__file__))),
+            "project": os.path.abspath(os.path.join(os.path.dirname(__file__))),
+        }
+        # "my downloads folder" / "the downloads" -> "downloads"
+        for key in sorted(aliases, key=len, reverse=True):
+            if key in lowered:
+                path = aliases[key]
+                label = key
+                break
+        else:
+            path = os.path.abspath(os.path.expanduser(name)) if name else profile
+            label = path
+
+        if not os.path.isdir(path):
+            return {"status": "error",
+                    "message": f"I couldn't find the folder '{target}', sir. "
+                               f"Try Downloads, Documents, Desktop, Pictures, Music, or Videos."}
+        os.startfile(path)
+        shown = label if label in aliases else path
+        return {"status": "success",
+                "message": f"Opening your {shown} folder now, sir.",
+                "path": path}
+    except Exception as e:
+        return {"status": "error", "message": f"Couldn't open that folder, sir: {str(e)}"}
     
     # 3. Search Start Menu shortcuts (.lnk files)
     search_dirs = []
@@ -1051,45 +1436,105 @@ def get_network_info() -> dict:
         return {"status": "error", "message": f"Failed to get network info: {str(e)}"}
 
 
-def get_weather(city: str) -> dict:
-    """Get current weather for a city using the free wttr.in JSON API (no API key required)."""
+_DAY_WORDS = ("today", "tomorrow", "day after tomorrow")
+
+
+def _rain_verdict(chances: list) -> str:
+    """One-line umbrella advice from hourly rain chances (0-100)."""
+    try:
+        peak = max([int(c) for c in chances] or [0])
+    except (ValueError, TypeError):
+        return ""
+    if peak >= 60:
+        return f"Rain is likely (up to {peak}%) — carry an umbrella."
+    if peak >= 30:
+        return f"Some chance of rain (up to {peak}%) — an umbrella is worth it."
+    return "No meaningful rain expected."
+
+
+def get_weather(city: str, day: int = 0) -> dict:
+    """Current + 3-day forecast via wttr.in (free, no key).
+
+    day: 0 = today, 1 = tomorrow, 2 = day after. Returns the day's
+    high/low, dominant conditions, rain verdict, plus today's sunrise/
+    sunset and current conditions. Never raises.
+    """
     import urllib.request
     import urllib.parse
     try:
-        city_encoded = urllib.parse.quote(city)
+        try:
+            day = max(0, min(2, int(day)))
+        except (TypeError, ValueError):
+            day = 0
+        city_encoded = urllib.parse.quote((city or "").strip() or "auto")
         url = f"https://wttr.in/{city_encoded}?format=j1"
         req = urllib.request.Request(url, headers={"User-Agent": "JARVIS/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = __import__('json').loads(r.read().decode('utf-8'))
 
-        current = data['current_condition'][0]
-        temp_c = current['temp_C']
-        temp_f = current['temp_F']
-        feels_c = current['FeelsLikeC']
-        humidity = current['humidity']
-        desc = current['weatherDesc'][0]['value']
-        wind_kmph = current['windspeedKmph']
-        area = data.get('nearest_area', [{}])[0]
-        area_name = area.get('areaName', [{}])[0].get('value', city)
-        country = area.get('country', [{}])[0].get('value', '')
-
+        area = (data.get('nearest_area') or [{}])[0]
+        area_name = ((area.get('areaName') or [{}])[0].get('value') or city or "your area")
+        country = ((area.get('country') or [{}])[0].get('value') or "")
         location_str = f"{area_name}, {country}" if country else area_name
-        msg = (f"Weather in {location_str}: {desc}. "
-               f"Temperature: {temp_c}°C ({temp_f}°F), feels like {feels_c}°C. "
-               f"Humidity: {humidity}%. Wind: {wind_kmph} km/h.")
-        return {
-            "status": "success",
-            "message": msg,
-            "weather": {
-                "location": location_str,
-                "description": desc,
-                "temp_c": temp_c,
-                "temp_f": temp_f,
-                "feels_like_c": feels_c,
-                "humidity": humidity,
-                "wind_kmph": wind_kmph
-            }
-        }
+
+        days = data.get('weather') or []
+        if not days:
+            raise ValueError("no forecast data")
+        target = days[min(day, len(days) - 1)]
+        day_label = _DAY_WORDS[min(day, len(days) - 1)] if len(days) > 1 else "today"
+
+        max_c, min_c = target.get('maxtempC', '?'), target.get('mintempC', '?')
+        hourly = target.get('hourly') or []
+        chances, descs = [], []
+        for h in hourly:
+            try:
+                chances.append(int(h.get('chanceofrain', 0)))
+            except (ValueError, TypeError):
+                pass
+            d = ((h.get('weatherDesc') or [{}])[0].get('value') or "").strip()
+            if d:
+                descs.append(d)
+        # Dominant description = most common across the day's slots.
+        dominant = ""
+        if descs:
+            dominant = max(set(descs), key=descs.count)
+        verdict = _rain_verdict(chances)
+
+        astro = (target.get('astronomy') or [{}])[0]
+        sunrise, sunset = astro.get('sunrise', ''), astro.get('sunset', '')
+
+        if day == 0:
+            current = (data.get('current_condition') or [{}])[0]
+            temp_c = current.get('temp_C', '?')
+            feels_c = current.get('FeelsLikeC', '?')
+            humidity = current.get('humidity', '?')
+            wind_kmph = current.get('windspeedKmph', '?')
+            now_desc = ((current.get('weatherDesc') or [{}])[0].get('value') or dominant or "").strip()
+            msg = (f"Weather in {location_str} right now: {now_desc}, {temp_c}°C (feels {feels_c}°C). "
+                   f"Today's range {min_c}–{max_c}°C, humidity {humidity}%, wind {wind_kmph} km/h. {verdict}")
+            if sunrise and sunset:
+                msg += f" Sunrise {sunrise}, sunset {sunset}."
+            payload = {"location": location_str, "description": now_desc,
+                       "temp_c": temp_c, "feels_like_c": feels_c,
+                       "humidity": humidity, "wind_kmph": wind_kmph,
+                       "today_high_c": max_c, "today_low_c": min_c,
+                       "rain_verdict": verdict}
+        else:
+            msg = (f"{day_label.capitalize()} in {location_str}: {dominant or 'mixed skies'}, "
+                   f"high {max_c}°C, low {min_c}°C. {verdict}")
+            payload = {"location": location_str, "description": dominant,
+                       "day": day_label, "high_c": max_c, "low_c": min_c,
+                       "rain_verdict": verdict}
+        # Attach the full 3-day outlook for follow-ups ("and tomorrow?").
+        try:
+            payload["forecast"] = [
+                {"day": _DAY_WORDS[i] if i < len(_DAY_WORDS) else f"day+{i}",
+                 "high_c": d.get('maxtempC'), "low_c": d.get('mintempC')}
+                for i, d in enumerate(days[:3])
+            ]
+        except Exception:
+            pass
+        return {"status": "success", "message": msg.strip(), "weather": payload}
     except Exception as e:
         return {"status": "error", "message": f"Couldn't retrieve weather for '{city}', sir. Check the city name or your connection. ({str(e)})"}
 

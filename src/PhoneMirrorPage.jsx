@@ -196,9 +196,25 @@ export default function PhoneMirrorPage({
             <p className="panel-label"><span>Assistant</span><span>{messages.length} entries</span></p>
             <div className="chat-log" style={{ flex: 1 }}>
               {messages.map((m, i) => (
-                <div key={i} className={`bubble ${m.role === 'user' ? 'user' : 'jarvis'}`}>
+                <div key={i} className={`bubble ${m.role === 'user' ? 'user' : 'jarvis'}${m.thinking ? ' thinking' : ''}${m.typing ? ' typing' : ''}`}>
                   <span className="who">{m.role === 'user' ? 'You' : 'Jarvis'}</span>
-                  {m.text}
+                  {m.thinking ? (
+                    <span className="thinking-row" aria-live="polite">
+                      <span className="thinking-spinner" aria-hidden="true" />
+                      <span className="thinking-stage">
+                        {m.lang === 'mr'
+                          ? (m.stage === 'reading' ? 'वाचत आहे' : m.stage === 'thinking' ? 'विचार करत आहे' : 'लिहित आहे')
+                          : m.lang === 'hi'
+                          ? (m.stage === 'reading' ? 'पढ़ रहा हूँ' : m.stage === 'thinking' ? 'सोच रहा हूँ' : 'लिख रहा हूँ')
+                          : (m.stage === 'reading' ? 'Reading prompt' : m.stage === 'thinking' ? 'Thinking' : 'Writing answer')}
+                      </span>
+                      <span className="thinking-dots" aria-hidden="true"><span /><span /><span /></span>
+                      {m.detail ? <span className="thinking-detail">{m.detail}</span> : null}
+                      {m.text ? <span className="thinking-partial">{m.text}</span> : null}
+                    </span>
+                  ) : (
+                    <span className="reply-text">{m.text}{m.typing ? <span className="typing-caret" aria-hidden="true" /> : null}</span>
+                  )}
                 </div>
               ))}
               <div ref={chatEndRef} />

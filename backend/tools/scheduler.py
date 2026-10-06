@@ -194,6 +194,109 @@ def describe_when(when: datetime) -> str:
     return f"{local.strftime('%A')} at {time_part}"
 
 
+def describe_when_auto(text: str, when: datetime) -> str:
+    """describe_when, but in Hindi/Marathi when the user's text is."""
+    try:
+        from backend.agent import marathi as _mmod
+        if _mmod.is_marathi(text):
+            mr = _mmod.describe_when_marathi(when)
+            if mr:
+                return mr
+    except Exception:
+        pass
+    try:
+        from backend.agent import hindi as _hmod
+        if _hmod.is_hindi(text):
+            hi = _hmod.describe_when_hindi(when)
+            if hi:
+                return hi
+    except Exception:
+        pass
+    return describe_when(when)
+
+
+# ── Hindi time expressions ("10 minute me", "kal subah 9 baje") ──────────────
+_HI_NUM = {"ek": 1, "do": 2, "teen": 3, "chaar": 4, "char": 4, "paanch": 5,
+           "panch": 5, "che": 6, "chhah": 6, "saat": 7, "aath": 8, "aath": 8,
+           "nau": 9, "nau": 9, "das": 10, "gyarah": 11, "barah": 12}
+_HI_REL_RE = re.compile(
+    r"\b(\d+|[a-zA-Z]+)\s*(seconds?|mints?|minutes?|ghante?|ghanta|hours?)\s*"
+    r"(me|mein|baad|ke\s*baad)\b", re.I)
+_HI_HALF_RE = re.compile(r"\baadh[ae]\s+ghante?\s*(me|mein|baad|ke\s*baad)\b", re.I)
+_HI_CLOCK_RE = re.compile(
+    r"(?:\b(aaj|kal|parson)\b)?\s*(?:\b(subah|savere|dopahar|shaam|raat|raatri)\b)?\s*"
+    r"(?:\bke\b\s*)?(\d{1,2})(?::(\d{2}))?\s*(baje|bajje)\b", re.I)
+
+
+def _hi_amount(token: str) -> Optional[int]:
+    token = (token or "").strip().lower()
+    if token.isdigit():
+        return int(token)
+    return _HI_NUM.get(token)
+
+
+def parse_when_hindi(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Parse Hindi due times. Returns {"ok", "when", "span"} like parse_when."""
+    now = now or _now()
+    raw = (text or "").strip()
+    if not raw:
+        return {"ok": False, "message": "no time given"}
+
+    half = _HI_HALF_RE.search(raw)
+    if half:
+        return {"ok": True, "when": now + timedelta(minutes=30), "span": half.span()}
+
+    rel = _HI_REL_RE.search(raw)
+    if rel:
+        amount = _hi_amount(rel.group(1))
+        unit = (rel.group(2) or "").lower()
+        if amount is not None and amount > 0:
+            if unit.startswith("ghant") or unit.startswith("hour"):
+                delta = timedelta(hours=amount)
+            elif unit.startswith("sec"):
+                delta = timedelta(seconds=amount)
+            else:
+                delta = timedelta(minutes=amount)
+            return {"ok": True, "when": now + delta, "span": rel.span()}
+
+    clock = _HI_CLOCK_RE.search(raw)
+    if clock:
+        day_word = (clock.group(1) or "").lower()
+        part = (clock.group(2) or "").lower()
+        hour = int(clock.group(3))
+        minute = int(clock.group(4) or 0)
+        if hour > 24 or minute > 59:
+            return {"ok": False, "message": "bad time"}
+        if part in ("shaam", "raat", "raatri", "dopahar") and hour < 12:
+            hour += 12
+        if hour == 24:
+            hour = 0
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if day_word == "parson":
+            candidate = (now + timedelta(days=2)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+        elif day_word == "kal":
+            if candidate <= now + timedelta(minutes=1):
+                candidate += timedelta(days=1)
+            elif candidate.date() <= now.date():
+                candidate += timedelta(days=1)
+        elif candidate <= now:
+            candidate += timedelta(days=1)
+        if candidate - now > timedelta(days=366):
+            return {"ok": False, "message": "that is more than a year away"}
+        return {"ok": True, "when": candidate, "span": clock.span()}
+
+    return {"ok": False, "message": "no time found"}
+
+
+def _looks_hindi_time(text: str) -> bool:
+    t = (text or "").casefold()
+    if re.search(r"[\u0900-\u097F]", text or ""):
+        return True
+    return bool(re.search(
+        r"\b(baje|bajje|yaad dila|yaad dilao|aadhe|subah|savere|dopahar|shaam|raat|aaj|kal|parson|roz|ghante|ghanta|minute me|minute baad)\b", t))
+
+
 # ── reminder commands (normal mode) ───────────────────────────────────────────
 _REMIND_LEAD = re.compile(
     r"^\s*(?:please\s+)?(?:set\s+(?:a\s+|an\s+)?|add\s+(?:a\s+|an\s+)?|create\s+(?:a\s+|an\s+)?)?"
@@ -201,29 +304,294 @@ _REMIND_LEAD = re.compile(
 _CONNECTOR_RE = re.compile(r"^(?:to|about|that|of)\b\s*", re.I)
 
 
-def parse_reminder(text: str) -> Optional[Dict[str, Any]]:
-    """Parse 'remind me ...' — returns {text, when} or None (not a reminder)."""
+_REPEAT_RES_EN = (
+    (re.compile(r"\bevery\s+weekday\b|\bweekdays\b|\bevery\s+morning\b", re.I), "weekdays", "every weekday"),
+    (re.compile(r"\bevery\s+day\b|\bdaily\b|\beach\s+day\b", re.I), "daily", "every day"),
+    (re.compile(r"\bevery\s+week\b|\bweekly\b", re.I), "weekly", "every week"),
+)
+# Hindi repeats ("roz", "har din") only apply to Hindi text — bare "roz"
+# would otherwise eat the English name "Roz" out of reminder text.
+_REPEAT_RES_HI = (
+    (re.compile(r"\broz\b|\bhar\s+din\b|\brozana\b|रोज़|रोज|हर दिन", re.I), "daily", "रोज़"),
+    (re.compile(r"\bhar\s+hafte\b|हर हफ्ते", re.I), "weekly", "हर हफ्ते"),
+)
+
+
+def _detect_repeat(body: str) -> tuple:
+    """Return (repeat_code, repeat_label, body_without_repeat)."""
+    for rx, code, label in _REPEAT_RES_EN:
+        if rx.search(body):
+            return code, label, rx.sub(" ", body).strip()
+    if _marathi_score(body) >= 2:
+        for rx, code, label in (
+                (re.compile(r"\bdarroj\b|दररोज", re.I), "daily", "रोज"),
+                (re.compile(r"\bdar\s+aathvad[a-z]*|दर\s+आठवड्याला", re.I), "weekly", "दर आठवड्याला")):
+            if rx.search(body):
+                return code, label, rx.sub(" ", body).strip()
+    if _hindi_score(body) >= 2:
+        for rx, code, label in _REPEAT_RES_HI:
+            if rx.search(body):
+                return code, label, rx.sub(" ", body).strip()
+    return "", "", body
+
+
+_HI_SCORE_RES = (
+    re.compile(r"[\u0900-\u097F]"),
+    re.compile(r"\b(baje|bajje|subah|savere|dopahar|shaam|raat|aaj|kal|parson|roz|rozana|ghante|ghanta|yaad|aadhe|har\s+din|har\s+hafte|minute\s+me|minute\s+baad|chutkula|sunao)\b", re.I),
+)
+
+
+def _hindi_score(text: str) -> int:
+    """Hindi confidence for scheduler paths: Devanagari (without a Marathi
+    marker win) = certain (99), otherwise the count of distinct Hinglish
+    time markers. Scheduling decisions need >= 2 so English names ("Roz",
+    "Kal") never misfire."""
+    try:
+        t = text or ""
+        if _HI_SCORE_RES[0].search(t):
+            try:
+                from backend.agent.lang_detect import prefer_marathi
+                if prefer_marathi(t):
+                    return 0
+            except Exception:
+                pass
+            return 99
+        found = set()
+        for m in _HI_SCORE_RES[1].finditer(t):
+            found.add(m.group(1).casefold() if m.lastindex else m.group(0).casefold())
+        return len(found)
+    except Exception:
+        return 0
+
+
+_MR_SCORE_RES = (
+    re.compile(r"\b(vajta|vajle|sakali|dupari|sandhyakali|ratri|udya|parva|aathvan|darroj|minit\w*|tas\w*|aaj\s+sakali)\b", re.I),
+)
+
+
+def _marathi_score(text: str) -> int:
+    """Marathi confidence, same contract as _hindi_score."""
+    try:
+        t = text or ""
+        if _HI_SCORE_RES[0].search(t):
+            try:
+                from backend.agent.lang_detect import prefer_marathi
+                return 99 if prefer_marathi(t) else 0
+            except Exception:
+                return 0
+        found = {m.group(0).casefold() for m in _MR_SCORE_RES[0].finditer(t)}
+        return len(found)
+    except Exception:
+        return 0
+
+
+def _indic_score(text: str) -> int:
+    """Max of Hindi/Marathi scheduling confidence."""
+    try:
+        return max(_hindi_score(text), _marathi_score(text))
+    except Exception:
+        return 0
+
+
+_MR_REL_RE = re.compile(
+    r"\b(\d+|[a-zA-Z]+)\s*(minit\w*|seconds?|tas\w*|hours?)\s*"
+    r"(nantar|ne|madhye|me)\b", re.I)
+_MR_REL_FUSED_RE = re.compile(r"\b(\d+)\s*(minitanni|minitat|tasant|tasanni)\b", re.I)
+_MR_CLOCK_RE = re.compile(
+    r"(?:\b(aaj|udya|parva|आज|उद्या|परवा)\b)?\s*"
+    r"(?:\b(sakali|dupari|sandhyakali|ratri|सकाळी|दुपारी|संध्याकाळी|रात्री)\b)?\s*"
+    r"(\d{1,2})(?::(\d{2}))?\s*(vajta|vajle|वाजता)\b", re.I)
+
+_MR_NUM = {"ek": 1, "don": 2, "teen": 3, "chaar": 4, "paach": 5,
+           "saha": 6, "saat": 7, "aath": 8, "nau": 9, "dha": 10}
+
+
+def parse_when_marathi(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Parse Marathi due times. Returns {"ok", "when", "span"}."""
+    now = now or _now()
     raw = (text or "").strip()
-    if not re.search(r"\bremind\s+me\b|\bset\s+(?:a\s+)?reminder\b|\badd\s+(?:a\s+)?reminder\b", raw, re.I):
+    if not raw:
+        return {"ok": False, "message": "no time given"}
+
+    fused = _MR_REL_FUSED_RE.search(raw)
+    if fused:
+        amount = int(fused.group(1))
+        unit = fused.group(2).lower()
+        delta = timedelta(hours=amount) if unit.startswith("tas") else timedelta(minutes=amount)
+        return {"ok": True, "when": now + delta, "span": fused.span()}
+
+    rel = _MR_REL_RE.search(raw)
+    if rel:
+        tok = (rel.group(1) or "").lower()
+        amount = int(tok) if tok.isdigit() else _MR_NUM.get(tok)
+        unit = (rel.group(2) or "").lower()
+        if amount is not None and amount > 0:
+            if unit.startswith("tas") or unit.startswith("hour"):
+                delta = timedelta(hours=amount)
+            elif unit.startswith("sec"):
+                delta = timedelta(seconds=amount)
+            else:
+                delta = timedelta(minutes=amount)
+            return {"ok": True, "when": now + delta, "span": rel.span()}
+
+    clock = _MR_CLOCK_RE.search(raw)
+    if clock:
+        day_word = (clock.group(1) or "").lower()
+        part = (clock.group(2) or "").lower()
+        hour = int(clock.group(3))
+        minute = int(clock.group(4) or 0)
+        if hour > 24 or minute > 59:
+            return {"ok": False, "message": "bad time"}
+        if part in ("sandhyakali", "ratri", "dupari", "संध्याकाळी", "रात्री", "दुपारी") and hour < 12:
+            hour += 12
+        if hour == 24:
+            hour = 0
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if day_word in ("parva", "परवा"):
+            candidate = (now + timedelta(days=2)).replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+        elif day_word in ("udya", "उद्या"):
+            if candidate <= now + timedelta(minutes=1):
+                candidate += timedelta(days=1)
+            elif candidate.date() <= now.date():
+                candidate += timedelta(days=1)
+        elif candidate <= now:
+            candidate += timedelta(days=1)
+        if candidate - now > timedelta(days=366):
+            return {"ok": False, "message": "that is more than a year away"}
+        return {"ok": True, "when": candidate, "span": clock.span()}
+
+    return {"ok": False, "message": "no time found"}
+
+
+def _next_repeat_due(repeat: str, from_dt: datetime) -> Optional[datetime]:
+    try:
+        if repeat == "daily":
+            return from_dt + timedelta(days=1)
+        if repeat == "weekly":
+            return from_dt + timedelta(days=7)
+        if repeat == "weekdays":
+            nxt = from_dt + timedelta(days=1)
+            while nxt.weekday() >= 5:  # skip Sat/Sun
+                nxt += timedelta(days=1)
+            return nxt
+    except Exception:
+        pass
+    return None
+
+
+_HI_REMIND_TRIG = re.compile(
+    r"\b(yaad\s+dila\w*|yaad\s+kara\w*|याद\s+दिला\w*|याद\s+करा\w*|"
+    r"reminder\s+laga\w*|रिमाइंडर\s+लगा\w*)\b", re.I)
+_HI_CONN_LEAD = re.compile(r"^(?:ke\s+liye|ki|ko|ka)\b\s*", re.I)
+_HI_CONN_TAIL = re.compile(r"\s*\b(?:ke\s+liye|ko)\s*$", re.I)
+
+
+def _is_hindi_reminder(raw: str) -> bool:
+    if _HI_REMIND_TRIG.search(raw or ""):
+        return True
+    return _hindi_score(raw) >= 2 and bool(
+        re.search(r"\byaad\b|याद", raw or "", re.I))
+
+
+_MR_REMIND_TRIG = re.compile(
+    r"\b(aathvan\s+karun\s+de\w*|aathvan\s+kara\w*|आठवण\s+करून\s+दे\w*|"
+    r"आठवण\s+करा\w*|reminder\s+lava\w*|रिमाइंडर\s+लावा\w*)\b", re.I)
+# Trailing "chi/cha" is the Marathi genitive ("gym chi aathvan" = gym's
+# reminder) — grammar, not content. Standalone words only, so "Ranchi"
+# can never be damaged (its "chi" isn't space-separated).
+_MR_CONN_LEAD = re.compile(r"^(?:sathi|साठी)\b\s*", re.I)
+_MR_CONN_TAIL = re.compile(r"\s*\b(?:sathi|साठी|chi|che|cha|ची|चे|चा)\s*$", re.I)
+
+
+def _is_marathi_reminder(raw: str) -> bool:
+    if _MR_REMIND_TRIG.search(raw or ""):
+        return True
+    return _marathi_score(raw) >= 2 and bool(
+        re.search(r"\baathvan\b|आठवण", raw or "", re.I))
+
+
+def parse_reminder(text: str) -> Optional[Dict[str, Any]]:
+    """Parse reminders (English + Hindi + Marathi) — {text, when, repeat?}."""
+    raw = (text or "").strip()
+    mr_mode = _is_marathi_reminder(raw)
+    hi_mode = (not mr_mode) and _is_hindi_reminder(raw)
+    if not hi_mode and not mr_mode and not re.search(
+            r"\bremind\s+me\b|\bset\s+(?:a\s+)?reminder\b|\badd\s+(?:a\s+)?reminder\b",
+            raw, re.I):
         return None
+    lang = "mr" if mr_mode else ("hi" if hi_mode else "en")
     body = _REMIND_LEAD.sub("", raw).strip()
     body = re.sub(r"^(?:a\s+reminder\s+(?:to|about|that|for)\s+|reminder\s*:\s*)", "", body, flags=re.I).strip()
+    if hi_mode:
+        # "mujhe X yaad dilao" = "remind ME X" — mujhe is grammar, not content.
+        body = re.sub(r"^(?:mujhe|mujhko|मुझे)\b\s*", "", body, flags=re.I).strip()
+        body = _HI_REMIND_TRIG.sub(" ", body).strip()
+    if mr_mode:
+        # "mala X chi aathvan karun de" — mala is grammar, not content.
+        body = re.sub(r"^(?:mala|मला)\b\s*", "", body, flags=re.I).strip()
+        body = _MR_REMIND_TRIG.sub(" ", body).strip()
     if not body:
-        return {"error": "Please tell me what to remind you about, sir. For example: remind me in 10 minutes to call mom."}
+        return {"error": (
+            "सांगा, कशाबद्दल आठवण करून देऊ? जसं: उद्या सकाळी 9 वाजता gym आठवण करून दे।"
+            if mr_mode else
+            "बताइए, किस बारे में याद दिलाऊँ? जैसे: कल सुबह 9 बजे gym याद दिलाओ।"
+            if hi_mode else
+            "Please tell me what to remind you about, sir. For example: remind me in 10 minutes to call mom.")}
+    repeat, repeat_label, body = _detect_repeat(body)
+    # Score the ORIGINAL text: repeat-stripping above may have eaten the
+    # very markers ("roz", "darroj") the fallback check looks for.
+    _raw_hi = _hindi_score(raw) >= 2
+    _raw_mr = _marathi_score(raw) >= 2
     parsed = parse_when(body)
+    if not parsed.get("ok") and (hi_mode or _raw_hi):
+        hi_mode = True
+        lang = "hi"
+        parsed = parse_when_hindi(body)
+    if not parsed.get("ok") and (mr_mode or _raw_mr):
+        mr_mode = True
+        lang = "mr"
+        parsed = parse_when_marathi(body)
     if not parsed.get("ok"):
-        return {"error": "When should I remind you, sir? For example: remind me in 10 minutes to stretch."}
+        if mr_mode:
+            hint = " — जसं: रोज सकाळी 9 वाजता gym आठवण करून दे" if repeat else ""
+            return {"error": f"कधी आठवण करून देऊ{((' ' + repeat_label) if repeat else '')}?{hint}"}
+        if hi_mode:
+            hint = " — जैसे: रोज़ सुबह 9 बजे gym याद दिलाओ" if repeat else ""
+            return {"error": f"कब याद दिलाऊँ{((' ' + repeat_label) if repeat else '')}?{hint}"}
+        hint = " — e.g. 'remind me every day at 9am to stretch'" if repeat else ""
+        return {"error": f"When should I remind you{(' ' + repeat_label) if repeat else ''}, sir?{hint}"}
     reminder_text = _CONNECTOR_RE.sub("", _strip_span(body, parsed.get("span"))).strip(" .,-:")
     reminder_text = _CONNECTOR_RE.sub("", reminder_text).strip()
+    if hi_mode or mr_mode:
+        reminder_text = (_MR_CONN_LEAD if mr_mode else _HI_CONN_LEAD).sub("", reminder_text).strip()
+        reminder_text = (_MR_CONN_TAIL if mr_mode else _HI_CONN_TAIL).sub("", reminder_text).strip()
+        reminder_text = (_MR_REMIND_TRIG if mr_mode else _HI_REMIND_TRIG).sub(" ", reminder_text).strip(" .,-:")
+        reminder_text = re.sub(r"\s+", " ", reminder_text).strip()
+    # The repeat phrase must not leak into the reminder text itself.
+    if repeat:
+        _, _, reminder_text = _detect_repeat(reminder_text)
+        reminder_text = _CONNECTOR_RE.sub("", reminder_text.strip(" .,-:")).strip()
+        if hi_mode or mr_mode:
+            reminder_text = (_MR_CONN_TAIL if mr_mode else _HI_CONN_TAIL).sub("", reminder_text).strip()
     if not reminder_text:
-        return {"error": "Please tell me what to remind you about, sir."}
-    return {"text": reminder_text, "when": parsed["when"]}
+        return {"error": ("सांगा, कशाबद्दल आठवण करून देऊ?" if mr_mode
+                          else "बताइए, किस बारे में याद दिलाऊँ?" if hi_mode
+                          else "Please tell me what to remind you about, sir.")}
+    out = {"text": reminder_text, "when": parsed["when"]}
+    if repeat:
+        out["repeat"] = repeat
+        out["repeat_label"] = repeat_label
+    return out
 
 
-def add_reminder(text: str, when: datetime) -> Dict[str, Any]:
+def add_reminder(text: str, when: datetime, repeat: str = "") -> Dict[str, Any]:
     try:
         from backend.agent.phase1_runtime import runtime
-        return runtime.reminders.add(text, due_at=when.isoformat())
+        kwargs = {"due_at": when.isoformat()}
+        if repeat in ("daily", "weekdays", "weekly"):
+            kwargs["repeat"] = repeat
+        return runtime.reminders.add(text, **kwargs)
     except Exception as exc:
         return {"status": "error", "message": str(exc)[:160]}
 
@@ -236,15 +604,43 @@ def list_reminders() -> List[Dict[str, Any]]:
         return []
 
 
+# "the one I just created", "the last one", "the latest" — all mean the
+# most recent item. list_reminders() is newest-first, so [0] is the target.
+_RECENCY_RE = re.compile(
+    r"\bjust\s+(created|made|added|set)|most\s+recent|\blatest\b|\blast\b|"
+    r"that\s+one|this\s+one\b", re.I)
+
+
+def _is_recency_fragment(fragment: str) -> bool:
+    return bool(_RECENCY_RE.search(fragment or ""))
+
+
 def cancel_reminder(fragment: str) -> Dict[str, Any]:
-    fragment = (fragment or "").strip().casefold()
-    if not fragment:
-        return {"status": "error", "message": "Which reminder should I cancel, sir?"}
+    fragment = (fragment or "").strip()
+    folded = fragment.casefold()
     try:
         from backend.agent.phase1_runtime import runtime
-        matches = [r for r in runtime.reminders.list()
-                   if fragment in str(r.get("text") or "").casefold()
-                   or fragment == str(r.get("id") or "").casefold()]
+        items = runtime.reminders.list()
+        if not items:
+            return {"status": "error", "message": "No active reminders, sir."}
+        if not folded:
+            if len(items) == 1:
+                runtime.reminders.remove(items[0]["id"])
+                return {"status": "success",
+                        "message": f"Cancelled, sir: '{items[0].get('text', '')[:120]}'.",
+                        "reminder": items[0]}
+            options = "; ".join(f"'{m.get('text', '')[:60]}'" for m in items[:5])
+            return {"status": "error",
+                    "message": f"Which one, sir? {options}."}
+        if _is_recency_fragment(fragment):
+            latest = items[0]
+            runtime.reminders.remove(latest["id"])
+            return {"status": "success",
+                    "message": f"Cancelled the latest, sir: '{latest.get('text', '')[:120]}'.",
+                    "reminder": latest}
+        matches = [r for r in items
+                   if folded in str(r.get("text") or "").casefold()
+                   or folded == str(r.get("id") or "").casefold()]
         if not matches:
             return {"status": "error",
                     "message": "I found no reminder matching that, sir."}
@@ -276,6 +672,20 @@ def fire_due_reminders(on_fire: Callable[[Dict[str, Any]], None]) -> int:
                 on_fire({"kind": "reminder", "text": str(live.get("text") or ""),
                          "reminder": live})
                 fired += 1
+                # Recurring reminders re-arm themselves for the next cycle
+                # (same stable text, new due date) instead of dying silently.
+                try:
+                    rep = str(live.get("repeat") or "").strip().lower()
+                    if rep in ("daily", "weekdays", "weekly"):
+                        cur = live.get("due_at") or live.get("snoozed_until") or ""
+                        base = datetime.fromisoformat(str(cur).replace("Z", "+00:00"))
+                        nxt = _next_repeat_due(rep, base)
+                        if nxt is not None:
+                            runtime.reminders.add(str(live.get("text") or ""),
+                                                  due_at=nxt.isoformat(),
+                                                  repeat=rep)
+                except Exception:
+                    pass
             except Exception:
                 continue
     except Exception:
@@ -377,12 +787,13 @@ def list_scheduled(include_done: bool = False) -> List[Dict[str, Any]]:
 
 
 def cancel_scheduled(fragment: str) -> Dict[str, Any]:
-    fragment = (fragment or "").strip().casefold()
+    fragment = (fragment or "").strip()
+    folded = fragment.casefold()
     jobs = _load_jobs()
-    if not fragment:
-        pending = [j for j in jobs if j.get("status") == "pending"]
-        if not pending:
-            return {"status": "error", "message": "No scheduled messages to cancel, sir."}
+    pending = [j for j in jobs if j.get("status") == "pending"]
+    if not pending:
+        return {"status": "error", "message": "No scheduled messages to cancel, sir."}
+    if not folded:
         if len(pending) == 1:
             pending[0]["status"] = "cancelled"
             _save_jobs(jobs)
@@ -391,10 +802,17 @@ def cancel_scheduled(fragment: str) -> Dict[str, Any]:
         options = "; ".join(f"to {j.get('contact')}" for j in pending[:5])
         return {"status": "error",
                 "message": f"Multiple scheduled messages, sir: {options}. Say which one to cancel."}
-    matches = [j for j in jobs if j.get("status") == "pending" and
-               (fragment in str(j.get("contact") or "").casefold()
-                or fragment in str(j.get("message") or "").casefold()
-                or fragment == str(j.get("id") or "").casefold())]
+    if _is_recency_fragment(fragment):
+        latest = max(pending, key=lambda j: str(j.get("created_at") or ""))
+        latest["status"] = "cancelled"
+        _save_jobs(jobs)
+        return {"status": "success",
+                "message": f"Cancelled the latest scheduled WhatsApp to {latest.get('contact')}, sir.",
+                "job": latest}
+    matches = [j for j in pending if
+               folded in str(j.get("contact") or "").casefold()
+               or folded in str(j.get("message") or "").casefold()
+               or folded == str(j.get("id") or "").casefold()]
     if not matches:
         return {"status": "error", "message": "No scheduled message matches that, sir."}
     if len(matches) > 1:
@@ -406,6 +824,86 @@ def cancel_scheduled(fragment: str) -> Dict[str, Any]:
     return {"status": "success",
             "message": f"Cancelled the scheduled WhatsApp to {matches[0].get('contact')}, sir.",
             "job": matches[0]}
+
+
+def delete_notification(fragment: str) -> Dict[str, Any]:
+    """Delete a Notification Center entry by text fragment, or the latest one
+    for recency fragments ('just created', 'last', ...)."""
+    from backend.agent import notifications as _nc
+    fragment = (fragment or "").strip()
+    folded = fragment.casefold()
+    items = _nc.list_notifications()
+    if not items:
+        return {"status": "error", "message": "No notifications to delete, sir."}
+    if not folded or _is_recency_fragment(fragment):
+        latest = items[0]  # list_notifications() is newest-first
+        result = _nc.delete(latest.get("id", ""))
+        if result.get("status") == "success":
+            label = latest.get("title") or latest.get("body") or "notification"
+            return {"status": "success",
+                    "message": f"Deleted the latest notification, sir: '{str(label)[:120]}'."}
+        return result
+    matches = [n for n in items
+               if folded in str(n.get("title") or "").casefold()
+               or folded in str(n.get("body") or "").casefold()
+               or folded == str(n.get("id") or "").casefold()]
+    if not matches:
+        return {"status": "error",
+                "message": "I found no notification matching that, sir."}
+    if len(matches) > 1:
+        options = "; ".join(
+            f"'{str(m.get('title') or m.get('body') or '')[:60]}'" for m in matches[:5])
+        return {"status": "error",
+                "message": f"Multiple match, sir: {options}. Please be more specific."}
+    result = _nc.delete(matches[0].get("id", ""))
+    if result.get("status") == "success":
+        label = matches[0].get("title") or matches[0].get("body") or "notification"
+        return {"status": "success",
+                "message": f"Deleted, sir: '{str(label)[:120]}'."}
+    return result
+
+
+def delete_note(fragment: str) -> Dict[str, Any]:
+    """Delete a Notes-panel entry by text fragment, or the latest note."""
+    import json as _json
+    import os as _os
+    notes_path = _os.path.abspath(_os.path.join(
+        _os.path.dirname(__file__), "..", "..", "notes.json"))
+    try:
+        with open(notes_path, "r", encoding="utf-8") as fh:
+            notes = _json.load(fh)
+        notes = notes if isinstance(notes, list) else []
+    except (OSError, ValueError):
+        notes = []
+    if not notes:
+        return {"status": "error", "message": "No notes to delete, sir."}
+    fragment = (fragment or "").strip()
+    folded = fragment.casefold()
+    if not folded or _is_recency_fragment(fragment):
+        latest = notes[-1]
+        kept = notes[:-1]
+    else:
+        matches = [n for n in notes
+                   if folded in str(n.get("text") or "").casefold()]
+        if not matches:
+            return {"status": "error",
+                    "message": "I found no note matching that, sir."}
+        if len(matches) > 1:
+            options = "; ".join(
+                f"'{str(m.get('text') or '')[:60]}'" for m in matches[:5])
+            return {"status": "error",
+                    "message": f"Multiple match, sir: {options}. Please be more specific."}
+        latest = matches[0]
+        kept = [n for n in notes if n is not latest]
+    try:
+        tmp = notes_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(kept, fh, indent=2, ensure_ascii=False)
+        _os.replace(tmp, notes_path)
+    except OSError as exc:
+        return {"status": "error", "message": f"Couldn't save notes, sir: {exc}"}
+    return {"status": "success",
+            "message": f"Deleted the note, sir: '{str(latest.get('text') or '')[:120]}'."}
 
 
 def _mark_job(job_id: str, status: str, result: str = "") -> None:
@@ -605,9 +1103,37 @@ def handle_schedule_command(text: str) -> Optional[Dict[str, Any]]:
         return None
     lowered = raw.casefold()
 
-    # -- list / cancel reminders --
+    # -- delete a Notification Center entry ("delete the notification ...") --
+    notif_del = re.match(
+        r"^\s*(?:please\s+)?(?:cancel|delete|remove|dismiss|clear)\s+"
+        r"(?:the\s+|my\s+|that\s+)?notifications?\s*(.*)$", raw, re.I)
+    if notif_del:
+        raw_frag = (notif_del.group(1) or "").strip()
+        if _is_recency_fragment(raw_frag):
+            raw_frag = "latest"
+        else:
+            raw_frag = re.sub(r"^(?:i\s+)?just\s+created\.?\s*(?:about\s+)?", "",
+                              raw_frag, flags=re.I).strip()
+        result = delete_notification(raw_frag)
+        return _response(result.get("message", ""),
+                         f"NOTIFICATION delete: {result.get('status')}", result)
+
+    # -- delete a Notes-panel entry ("delete the note ...") --
+    note_del = re.match(
+        r"^\s*(?:please\s+)?(?:delete|remove)\s+"
+        r"(?:the\s+|my\s+|that\s+)?notes?\s*(.*)$", raw, re.I)
+    if note_del:
+        raw_frag = (note_del.group(1) or "").strip()
+        if _is_recency_fragment(raw_frag):
+            raw_frag = "latest"
+        result = delete_note(raw_frag)
+        return _response(result.get("message", ""),
+                         f"NOTE delete: {result.get('status')}", result)
+
+    # -- list / cancel reminders (English + Hindi) --
     if re.match(r"^\s*(?:please\s+)?(?:list|show)\s+(?:all\s+)?(?:my\s+)?reminders?\s*$", raw, re.I) or \
-            re.match(r"^\s*what\s+are\s+my\s+reminders?\s*\??\s*$", raw, re.I):
+            re.match(r"^\s*what\s+are\s+my\s+reminders?\s*\??\s*$", raw, re.I) or \
+            re.search(r"(mere|मेरे)\s+(saare\s+|सारे\s+)?reminders?\s+(batao|dikhao|दिखाओ|बताओ)", raw, re.I):
         items = list_reminders()
         if not items:
             return _response("No active reminders, sir.", "REMINDERS: none active")
@@ -615,10 +1141,12 @@ def handle_schedule_command(text: str) -> Optional[Dict[str, Any]]:
         for item in items[:10]:
             try:
                 when = datetime.fromisoformat(str(item.get("due_at", "")))
-                when_s = describe_when(when)
+                when_s = describe_when_auto(raw, when)
             except (ValueError, TypeError):
                 when_s = "unscheduled"
-            lines.append(f"'{item.get('text', '')[:80]}' — {when_s}")
+            rep = str(item.get("repeat") or "").strip()
+            rep_say = f" (repeats {rep})" if rep in ("daily", "weekdays", "weekly") else ""
+            lines.append(f"'{item.get('text', '')[:80]}' — {when_s}{rep_say}")
         return _response(f"{len(items)} reminder(s), sir: " + "; ".join(lines) + ".",
                          f"REMINDERS listed: {len(items)}", {"reminders": items})
     cancel_rem = re.match(r"^\s*(?:please\s+)?(?:cancel|delete|remove)\s+(?:the\s+|my\s+)?reminder\s*(.*)$", raw, re.I)
@@ -647,20 +1175,51 @@ def handle_schedule_command(text: str) -> Optional[Dict[str, Any]]:
         result = cancel_scheduled(fragment)
         return _response(result.get("message", ""), f"SCHEDULED WA cancel: {result.get('status')}", result)
 
-    # -- new reminder --
-    if re.search(r"\bremind\s+me\b|\bset\s+(?:a\s+)?reminder\b|\badd\s+(?:a\s+)?reminder\b", lowered):
+    # -- new reminder (English + Hindi + Marathi) --
+    if re.search(r"\bremind\s+me\b|\bset\s+(?:a\s+)?reminder\b|\badd\s+(?:a\s+)?reminder\b", lowered) \
+            or _is_hindi_reminder(raw) or _is_marathi_reminder(raw):
         parsed = parse_reminder(raw)
         if parsed is None:
             return None
         if "error" in parsed:
             return _response(parsed["error"], f"REMINDER parse failed: {parsed['error']}")
-        saved = add_reminder(parsed["text"], parsed["when"])
+        saved = add_reminder(parsed["text"], parsed["when"],
+                               repeat=parsed.get("repeat", ""))
+        try:
+            from backend.agent import marathi as _mmod
+            _mr_err = _mmod.is_marathi(raw)
+        except Exception:
+            _mr_err = False
         if saved.get("status") != "success":
-            return _response("I could not save that reminder, sir.",
-                             f"REMINDER ERROR: {saved.get('message')}")
-        when_s = describe_when(parsed["when"])
-        return _response(f"Reminder set for {when_s}, sir: {parsed['text'][:160]}.",
-                         f"REMINDER SET: '{parsed['text'][:80]}' for {when_s}",
+            try:
+                from backend.agent import hindi as _hmod
+                _hi_err = (not _mr_err) and _hmod.is_hindi(raw)
+            except Exception:
+                _hi_err = False
+            _err_say = ("आठवण जतन करता आली नाही।" if _mr_err
+                        else "याददाश्त सहेज न सका।" if _hi_err
+                        else "I could not save that reminder, sir.")
+            return _response(_err_say, f"REMINDER ERROR: {saved.get('message')}")
+        try:
+            from backend.agent import hindi as _hmod
+            _hi_conf = (not _mr_err) and _hmod.is_hindi(raw)
+        except Exception:
+            _hi_conf = False
+        when_s = describe_when_auto(raw, parsed["when"])
+        rep_label = parsed.get("repeat_label", "")
+        if _mr_err:
+            rep_say = f", {rep_label} पुन्हा सांगेन" if rep_label else ""
+            return _response(f"{when_s} आठवण करून देईन{rep_say}: {parsed['text'][:160]}।",
+                             f"REMINDER SET: '{parsed['text'][:80]}' for {when_s}{rep_say}",
+                             {"reminder": saved.get("reminder")})
+        if _hi_conf:
+            rep_say = f", {rep_label} दोहराऊँगा" if rep_label else ""
+            return _response(f"{when_s} याद दिलाऊँगा{rep_say}: {parsed['text'][:160]}।",
+                             f"REMINDER SET: '{parsed['text'][:80]}' for {when_s}{rep_say}",
+                             {"reminder": saved.get("reminder")})
+        rep_say = f", repeating {rep_label}" if rep_label else ""
+        return _response(f"Reminder set for {when_s}{rep_say}, sir: {parsed['text'][:160]}.",
+                         f"REMINDER SET: '{parsed['text'][:80]}' for {when_s}{rep_say}",
                          {"reminder": saved.get("reminder")})
 
     # -- reschedule scheduled whatsapp ("reschedule/move/postpone X to <time>") --

@@ -28,6 +28,7 @@ class TTSRequest:
     interrupt_current: bool = True
     callback: Optional[Callable] = None
     metadata: dict = None
+    voice_id: Optional[str] = None  # SAPI voice to use for this utterance (None = current)
 
 
 class VoiceSystem:
@@ -59,28 +60,53 @@ class VoiceSystem:
         # speech is interrupted. Toasts/notifications are unaffected.
         self._muted = False
         self._active_lang = "en"
-        
-        # Initialize Windows SAPI
-        self._init_sapi()
-    
-    def _init_sapi(self):
-        """Initialize Windows SAPI voice. JARVIS is male, so the default
-        voice is forced to a male English voice (David/Mark/...) instead of
-        the Windows default (usually Zira, female). Never raises."""
+        # Dedup: identical TTS text re-queued within a few seconds (double
+        # /api/command fetch, restart + scheduled Gmail cycle racing, etc.)
+        # is dropped instead of being spoken twice ~30s apart.
+        self._last_speak_text = ""
+        self._last_speak_at = 0.0
+        self._queued_texts: set = set()
+
+        # ── COM threading model ──────────────────────────────────────
+        # SAPI.SpVoice is a single-threaded COM object. Touching it from
+        # any thread but its creator is an access violation waiting to
+        # happen (exit code 3221225477) — so EVERY COM call happens on the
+        # worker thread and nowhere else. Other threads only enqueue data:
+        # voice/rate/volume wishes are stored as pendings, interrupts as an
+        # event. The worker applies them on its own thread.
+        self._sapi_voice = None
+        self._sapi_available = False
+        self._voices: list = []
+        self._sapi_ready = threading.Event()
+        self._interrupt_event = threading.Event()
+        self._active_voice_id = ""
+        self._pending_voice_id: Optional[str] = None
+        self._pending_rate: Optional[int] = -1
+        self._pending_volume: Optional[int] = None
+
+    # SAPI flags / RunningState values (avoid importing win32 constants).
+    _SVS_ASYNC = 1
+    _SVS_PURGE = 2
+    _SPRS_IS_SPEAKING = 2
+
+    def _init_sapi_on_worker(self):
+        """Create and configure SAPI. Runs ONLY on the worker thread."""
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
         try:
             import win32com.client
-            self._sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
-            self._sapi_available = True
-
-            # Get available voices (with gender when SAPI exposes it)
-            self._voices = []
-            for voice in self._sapi_voice.GetVoices():
+            sapi = win32com.client.Dispatch("SAPI.SpVoice")
+            voices = []
+            for voice in sapi.GetVoices():
                 try:
                     gender = voice.GetAttribute("Gender")
                 except Exception:
                     gender = ""
                 try:
-                    self._voices.append({
+                    voices.append({
                         "id": voice.Id,
                         "name": voice.GetDescription(),
                         "language": voice.GetAttribute("Language"),
@@ -88,15 +114,36 @@ class VoiceSystem:
                     })
                 except Exception:
                     pass
+            self._sapi_voice = sapi
+            self._sapi_available = True
+            self._voices = voices
+            # JARVIS is male: default to a male English voice (David/...),
+            # never the Windows default (usually Zira, female).
             self._select_default_male_voice()
+            # Slightly slower than the SAPI default — measured gravitas.
+            try:
+                sapi.Rate = -1
+            except Exception:
+                pass
+            self._pending_rate = None
         except Exception as e:
             print(f"[VoiceSystem] SAPI initialization failed: {e}")
             self._sapi_voice = None
             self._sapi_available = False
             self._voices = []
+        finally:
+            self._sapi_ready.set()
+    
+    def _init_sapi(self):
+        """Legacy entry point — COM is now created on the worker thread via
+        _init_sapi_on_worker(). Kept so external callers never break; it
+        simply reports readiness without touching COM itself."""
+        return self._sapi_available
 
     def _select_default_male_voice(self):
-        """Point SAPI at the most masculine English voice available."""
+        """Point SAPI at the most masculine English voice available.
+
+        WORKER THREAD ONLY — touches COM."""
         try:
             if not getattr(self, "_sapi_available", False) or self._sapi_voice is None:
                 return False
@@ -104,15 +151,48 @@ class VoiceSystem:
             choice = select_voice_for_lang(getattr(self, "_voices", []), "en")
             if choice is None:
                 return False
-            for installed in self._sapi_voice.GetVoices():
-                if installed.Id == choice.get("id"):
-                    self._sapi_voice.Voice = installed
-                    self._active_lang = "en"
-                    print(f"[VoiceSystem] Default voice: {choice.get('name')}")
-                    return True
+            if self._apply_voice_id(choice.get("id")):
+                print(f"[VoiceSystem] Default voice: {choice.get('name')}")
+                return True
+            return False
         except Exception as exc:
             print(f"[VoiceSystem] Default male voice selection failed: {exc}")
         return False
+
+    def _apply_voice_id(self, voice_id: str) -> bool:
+        """Select a SAPI voice by ID. WORKER THREAD ONLY."""
+        try:
+            if self._sapi_voice is None:
+                return False
+            for installed in self._sapi_voice.GetVoices():
+                if installed.Id == voice_id:
+                    self._sapi_voice.Voice = installed
+                    self._active_voice_id = voice_id
+                    return True
+        except Exception as exc:
+            print(f"[VoiceSystem] Voice switch failed: {exc}")
+        return False
+
+    def _apply_pending_settings(self):
+        """Apply queued voice/rate/volume wishes. WORKER THREAD ONLY."""
+        if self._sapi_voice is None:
+            return
+        if self._pending_rate is not None:
+            try:
+                self._sapi_voice.Rate = max(-10, min(10, int(self._pending_rate)))
+            except Exception:
+                pass
+            self._pending_rate = None
+        if self._pending_volume is not None:
+            try:
+                self._sapi_voice.Volume = max(0, min(100, int(self._pending_volume)))
+            except Exception:
+                pass
+            self._pending_volume = None
+        if self._pending_voice_id:
+            vid = self._pending_voice_id
+            self._pending_voice_id = None
+            self._apply_voice_id(vid)
     
     def start(self):
         """Start the TTS worker thread."""
@@ -132,7 +212,9 @@ class VoiceSystem:
             self._worker_thread.join(timeout=2.0)
     
     def _worker_loop(self):
-        """Main worker loop that processes TTS requests."""
+        """Main worker loop that processes TTS requests. This thread is the
+        SOLE owner of the SAPI COM object — see _init_sapi_on_worker."""
+        self._init_sapi_on_worker()
         while self._running:
             try:
                 # Wait for a request with timeout
@@ -140,59 +222,80 @@ class VoiceSystem:
                     _, _, request = self._tts_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                
-                # Check if we should interrupt current speech
-                if request.interrupt_current:
-                    self.interrupt()
-                
-                # Process the request
+
+                # Process the request (previous utterance is always fully
+                # finished or purged before we get here — the worker is
+                # strictly sequential, so there is nothing to preempt).
                 self._process_request(request)
-                
+
             except Exception as e:
                 print(f"[VoiceSystem] Worker error: {e}")
                 time.sleep(0.1)
-    
+
+    def _speak_sync(self, text: str) -> str:
+        """Speak while polling for completion so interrupts stay prompt.
+
+        WORKER THREAD ONLY. Returns 'done', 'interrupted', or 'error'.
+        Uses async Speak + RunningState polling (no COM event pumping
+        needed) so the worker never blocks uninterruptibly."""
+        try:
+            self._sapi_voice.Speak(text, self._SVS_ASYNC)
+        except Exception as e:
+            print(f"[VoiceSystem] Speak failed: {e}")
+            return "error"
+        while True:
+            if self._interrupt_event.is_set():
+                try:
+                    self._sapi_voice.Speak("", self._SVS_ASYNC | self._SVS_PURGE)
+                except Exception:
+                    pass
+                return "interrupted"
+            try:
+                running = self._sapi_voice.Status.RunningState
+            except Exception:
+                return "error"
+            if running != self._SPRS_IS_SPEAKING:
+                return "done"
+            time.sleep(0.05)
+
     def _process_request(self, request: TTSRequest):
-        """Process a single TTS request."""
+        """Process a single TTS request. WORKER THREAD ONLY."""
+        if not self._sapi_available or self._sapi_voice is None:
+            with self._lock:
+                self._queued_texts.discard(request.text.strip())
+            if request.callback:
+                try:
+                    request.callback(False, "SAPI not available")
+                except Exception:
+                    pass
+            return
+
+        self._interrupt_event.clear()
+        self._apply_pending_settings()
+        if request.voice_id and request.voice_id != self._active_voice_id:
+            self._apply_voice_id(request.voice_id)
+
         with self._lock:
-            if not self._sapi_available or self._sapi_voice is None:
-                if request.callback:
-                    try:
-                        request.callback(False, "SAPI not available")
-                    except Exception:
-                        pass
-                return
-            
             self._state = TTSState.SPEAKING
             self._current_request = request
-            self._stop_event.clear()
-        
-        try:
-            # Speak the text (this blocks until complete or interrupted)
-            # SAPI Speak with SVSFlagsAsync would be non-blocking but harder to interrupt
-            # Using synchronous Speak with interrupt via stop_event
-            self._sapi_voice.Speak(request.text)
-            
-            with self._lock:
-                self._state = TTSState.IDLE
-                self._current_request = None
-            
-            if request.callback:
-                try:
+
+        outcome = self._speak_sync(request.text)
+
+        with self._lock:
+            self._state = TTSState.IDLE if outcome == "done" else TTSState.INTERRUPTED
+            self._current_request = None
+            self._queued_texts.discard(request.text.strip())
+
+        if request.callback:
+            try:
+                if outcome == "done":
                     request.callback(True, "Completed")
-                except Exception:
-                    pass
-                    
-        except Exception as e:
-            print(f"[VoiceSystem] Speech error: {e}")
-            with self._lock:
-                self._state = TTSState.IDLE
-                self._current_request = None
-            if request.callback:
-                try:
-                    request.callback(False, str(e))
-                except Exception:
-                    pass
+                elif outcome == "interrupted":
+                    request.callback(True, "Interrupted")
+                else:
+                    request.callback(False, "Speech error")
+            except Exception:
+                pass
     
     def speak(self, text: str, priority: int = 0, interrupt: bool = True, callback: Optional[Callable] = None, metadata: dict = None, lang: Optional[str] = None) -> bool:
         """
@@ -213,54 +316,92 @@ class VoiceSystem:
         """
         if not text or not text.strip():
             return False
+        clean = text.strip()
+        now = time.time()
         with self._lock:
             if self._muted:
                 return False
+            # Drop exact duplicates re-queued within 30s (double fetch /
+            # restart+scheduled race). Prevents the "same reply spoken twice"
+            # symptom without affecting genuinely new utterances.
+            if clean in self._queued_texts:
+                return False
+            if clean == self._last_speak_text and (now - self._last_speak_at) < 30.0:
+                return False
+            self._queued_texts.add(clean)
+            self._last_speak_text = clean
+            self._last_speak_at = now
+            # Bound the queue: if >8 pending, drop the stalest low-priority
+            # announcement so a burst of mail + reminders can never delay a
+            # live reply by ~30s. Replies use priority >= 0, background
+            # chatter uses negative priority, so the lowest number is the
+            # safest to evict.
+            try:
+                if self._tts_queue.qsize() >= 8:
+                    buf = []
+                    try:
+                        while True:
+                            buf.append(self._tts_queue.get_nowait())
+                    except queue.Empty:
+                        pass
+                    if buf:
+                        buf.sort(key=lambda e: e[0], reverse=True)
+                        evicted = buf.pop(0)
+                        try:
+                            self._queued_texts.discard(evicted[2].text.strip())
+                        except Exception:
+                            pass
+                    for entry in buf:
+                        self._tts_queue.put(entry)
+            except Exception:
+                pass
+        voice_id = None
+        with self._lock:
+            # Pure-python language routing over the CACHED voice list — no
+            # COM touched here (that would be a cross-thread call). The
+            # chosen voice travels with the request; the worker applies it.
             try:
                 from backend.agent.lang_detect import detect_lang, select_voice_for_lang
                 resolved = (lang or "").strip().lower()[:2] or detect_lang(text)
-                if resolved and resolved != getattr(self, "_active_lang", "en"):
+                if resolved:
                     voice = select_voice_for_lang(getattr(self, "_voices", []), resolved)
-                    if voice is not None and self._sapi_voice is not None:
-                        try:
-                            for installed in self._sapi_voice.GetVoices():
-                                if installed.Id == voice.get("id"):
-                                    self._sapi_voice.Voice = installed
-                                    self._active_lang = resolved
-                                    break
-                        except Exception as exc:
-                            print(f"[VoiceSystem] Voice switch failed: {exc}")
+                    if voice is not None:
+                        voice_id = voice.get("id")
+                        self._active_lang = resolved
             except Exception as exc:
                 print(f"[VoiceSystem] Language routing failed: {exc}")
-        
+
         request = TTSRequest(
             text=text.strip(),
             priority=priority,
             interrupt_current=interrupt,
             callback=callback,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            voice_id=voice_id,
         )
-        
+
+        # A new interrupting request cancels whatever is playing right now.
+        if interrupt:
+            self._interrupt_event.set()
+
         # Use negative priority for max-heap behavior (higher priority = processed first)
         self._tts_queue.put((-priority, next(self._seq), request))
         return True
-    
+
     def interrupt(self) -> bool:
         """
         Interrupt current speech immediately.
-        
+
+        Thread-safe: only sets an event. The worker thread performs the
+        actual SAPI purge on its own (COM-owning) thread.
+
         Returns:
             True if speech was interrupted
         """
         with self._lock:
-            if self._state == TTSState.SPEAKING and self._sapi_voice:
-                try:
-                    self._sapi_voice.Speak("", 1)  # SVSFlagsAsync = 1, empty string stops current
-                    self._state = TTSState.INTERRUPTED
-                    self._current_request = None
-                    return True
-                except Exception as e:
-                    print(f"[VoiceSystem] Interrupt failed: {e}")
+            if self._state == TTSState.SPEAKING:
+                self._interrupt_event.set()
+                return True
         return False
     
     def pause(self) -> bool:
@@ -310,27 +451,29 @@ class VoiceSystem:
         return self._voices
     
     def set_voice(self, voice_id: str) -> bool:
-        """Set the active voice by ID."""
-        if not self._sapi_available or self._sapi_voice is None:
-            return False
+        """Request the active voice by ID. The worker applies it on its own
+        thread before the next utterance (direct COM access from here would
+        be a cross-thread call). Returns False for unknown IDs."""
         try:
-            for voice in self._sapi_voice.GetVoices():
-                if voice.Id == voice_id:
-                    self._sapi_voice.Voice = voice
-                    return True
+            known = {v.get("id") for v in (getattr(self, "_voices", []) or [])
+                     if isinstance(v, dict)}
+            if voice_id in known:
+                with self._lock:
+                    self._pending_voice_id = voice_id
+                return True
         except Exception:
             pass
         return False
-    
+
     def set_rate(self, rate: int):
-        """Set speech rate (-10 to 10)."""
-        if self._sapi_voice:
-            self._sapi_voice.Rate = max(-10, min(10, rate))
-    
+        """Set speech rate (-10 to 10). Applied by the worker thread."""
+        with self._lock:
+            self._pending_rate = max(-10, min(10, rate))
+
     def set_volume(self, volume: int):
-        """Set volume (0 to 100)."""
-        if self._sapi_voice:
-            self._sapi_voice.Volume = max(0, min(100, volume))
+        """Set volume (0 to 100). Applied by the worker thread."""
+        with self._lock:
+            self._pending_volume = max(0, min(100, volume))
 
 
 # Global instance

@@ -31,6 +31,25 @@ HEALTH_CHECK_INTERVAL = 5  # seconds
 HEALTH_CHECK_URL = "http://127.0.0.1:8000/api/status"
 # Number of consecutive HTTP health check failures before triggering recovery
 MAX_CONSECUTIVE_HEALTH_FAILURES = 5
+# Windows fatal codes (unsigned as reported by Popen) + POSIX fatal signals.
+# These kill the process natively — no Python traceback ever exists, so the
+# recovery engine must NOT be fed INFO lines as if they were the error.
+NATIVE_CRASH_CODES = {
+    3221225477, -1073741819,  # STATUS_ACCESS_VIOLATION (segfault)
+    3221226505, -1073740791,  # STATUS_STACK_OVERFLOW
+    3221225786, -1073740940,  # STATUS_HEAP_CORRUPTION
+    3221225495, -1073741801,  # STATUS_ILLEGAL_INSTRUCTION
+    -11,  # SIGSEGV (posix)
+    -6,   # SIGABRT (posix)
+    -4,   # SIGILL (posix)
+}
+NATIVE_CRASH_NAMES = {
+    3221225477: "access violation (0xC0000005)", -1073741819: "access violation (0xC0000005)",
+    3221226505: "stack overflow (0xC00000FD)", -1073740791: "stack overflow (0xC00000FD)",
+    3221225786: "heap corruption (0xC0000374)", -1073740940: "heap corruption (0xC0000374)",
+    3221225495: "illegal instruction (0xC000001D)", -1073741801: "illegal instruction (0xC000001D)",
+    -11: "SIGSEGV", -6: "SIGABRT", -4: "SIGILL",
+}
 # Grace period after start before health checks count (seconds)
 HEALTH_CHECK_GRACE_PERIOD = 15
 
@@ -117,19 +136,35 @@ class JarvisSupervisor:
         return self.process
 
     def check_health(self) -> bool:
-        """Ping HTTP /api/status endpoint."""
+        """Ping HTTP /api/status endpoint.
+
+        Timeout is generous (20s): /api/status is a trivial dict and should
+        answer in <100ms now that /api/command runs in FastAPI's threadpool
+        instead of on the event loop. A genuine timeout therefore means the
+        backend is truly wedged (not just busy answering a slow Gemini call),
+        so it is worth counting toward recovery instead of being dismissed.
+        """
         try:
             req = urllib.request.Request(HEALTH_CHECK_URL, method="GET")
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 return resp.status == 200
         except urllib.error.HTTPError as e:
             log(f"Health check HTTP error: {e.code}")
             return False
         except urllib.error.URLError as e:
-            log(f"Health check URL error: {e.reason}")
+            reason = getattr(e, "reason", e)
+            # Timeout surfaces here as URLError(reason=TimeoutError) — label it
+            # plainly so logs read "timed out after 20s" instead of "unexpected".
+            if "timed out" in str(reason).lower() or "timed out" in str(e).lower():
+                log("Health check timed out after 20s (backend wedged or machine stalled)")
+            else:
+                log(f"Health check URL error: {reason}")
             return False
         except Exception as e:
-            log(f"Health check unexpected error: {e}")
+            if "timed out" in str(e).lower():
+                log("Health check timed out after 20s (backend wedged or machine stalled)")
+            else:
+                log(f"Health check unexpected error: {e}")
             return False
 
     def capture_crash_output(self) -> str:
@@ -200,12 +235,40 @@ class JarvisSupervisor:
                 "repaired_copy": settled["repaired_copy"],
                 "message": settled.get("message", "")}
 
-    def handle_crash(self) -> bool:
+    def handle_crash(self, exit_code=None) -> bool:
         """Capture crash log, call recovery engine, and decide whether to restart."""
         self.recovery_count += 1
         log(f"CRASH DETECTED! (Incident #{self.recovery_count})")
-        
+
         crash_output = self.capture_crash_output()
+
+        # ── Native crash (segfault etc.): no traceback exists by definition.
+        # Do NOT feed INFO lines to the recovery engine as the "error" — just
+        # report, count, and restart (a fresh process usually recovers).
+        if exit_code in NATIVE_CRASH_CODES and "Traceback" not in crash_output:
+            name = NATIVE_CRASH_NAMES.get(exit_code, "native fault")
+            msg = (f"Backend died natively ({name}, exit {exit_code}) — no Python "
+                   f"traceback exists. If faulthandler was enabled, its dump is in "
+                   f"{CRASH_LOG}. Restarting into a fresh process.")
+            log(msg)
+            print("\n" + "!" * 65)
+            print(f" [WATCHDOG] J.A.R.V.I.S. NATIVE CRASH (Incident #{self.recovery_count})")
+            print(f" [WATCHDOG] Cause: {name}, exit code {exit_code}")
+            print("!" * 65 + "\n")
+            try:
+                import crash_report
+                summary_path = crash_report.write_crash_summary(
+                    crash_output,
+                    {"file": "", "line": "", "error": msg},
+                    self.recovery_count)
+                log(f"Crash summary written: {summary_path}")
+            except Exception as e:
+                log(f"Crash summary step failed (non-fatal): {e}")
+            if self.recovery_count > MAX_CRASH_RECOVERIES:
+                log(f"Max recovery limit ({MAX_CRASH_RECOVERIES}) reached. Halting auto-recovery.")
+                return False
+            log("Restarting J.A.R.V.I.S. backend in a fresh process.")
+            return True
 
         # Diagnostic summary
         parsed = recovery_engine.parse_traceback(crash_output)
@@ -382,7 +445,7 @@ class JarvisSupervisor:
                 if ret_code is not None:
                     # Process exited
                     log(f"JARVIS backend terminated unexpectedly with exit code {ret_code}.")
-                    should_restart = self.handle_crash()
+                    should_restart = self.handle_crash(exit_code=ret_code)
                     if should_restart:
                         break  # Break inner loop to restart
                     else:

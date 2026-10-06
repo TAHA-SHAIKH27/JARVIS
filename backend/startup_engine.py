@@ -264,12 +264,16 @@ class StartupEngine:
             }]
         return items
 
-    def fetch_current_local_news(self, limit: int = 2) -> List[Dict[str, str]]:
+    def fetch_current_local_news(self, limit: int = 2, city: str = "") -> List[Dict[str, str]]:
         """
-        Fetch genuinely relevant current updates for Pune, Mohammed Wadi, or Camp.
+        Fetch genuinely relevant current updates for the home city.
         Only reports sourced information; returns transparent notice if unavailable.
         """
-        query = 'Pune OR "Mohammed Wadi" OR "Pune Camp"'
+        city = (city or "").strip() or "Pune"
+        if city.casefold() == "pune":
+            query = 'Pune OR "Mohammed Wadi" OR "Pune Camp"'
+        else:
+            query = city
         encoded_query = urllib.parse.quote(query)
         url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
         items: List[Dict[str, str]] = []
@@ -313,10 +317,12 @@ class StartupEngine:
         tasks_data: Dict[str, Any],
         ai_news: List[Dict[str, str]],
         local_news: List[Dict[str, str]],
+        weather: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Synthesize concise 15–30s spoken briefing dynamically from REAL current data.
-        Does not hardcode text.
+        Synthesize a concise spoken briefing dynamically from REAL current data:
+        system status, live weather for the home city, today's agenda with due
+        times, and top headlines. Does not hardcode text.
         """
         greeting = self.get_greeting()
 
@@ -327,21 +333,53 @@ class StartupEngine:
 
         all_ok = health >= 95 and issues == 0
         if all_ok:
-            status_phrase = f"JARVIS is online. The system audit completed successfully across {files_checked} verified files with {health} percent health."
+            status_phrase = f"All systems online — audit clean across {files_checked} files at {health} percent health."
         else:
-            status_phrase = f"JARVIS is online with warnings. The codebase audit scanned {files_checked} files with {issues} potential issue identified."
+            status_phrase = f"Online with warnings — audit scanned {files_checked} files, {issues} item(s) flagged."
 
-        # Tasks / Reminders
-        rem_count = tasks_data.get("reminders_count", 0)
+        # Weather for the home city (whatever the user set, not hardcoded)
+        weather_phrase = ""
+        try:
+            w = weather or {}
+            loc = w.get("location", "")
+            if w.get("temp_c") not in (None, "?", ""):
+                weather_phrase = (
+                    f"It's {w.get('temp_c')}°C and {w.get('description', 'settled')} in {loc}, "
+                    f"heading to {w.get('today_high_c', '?')}°. {w.get('rain_verdict', '')}".strip())
+            elif w.get("high_c"):
+                weather_phrase = (f"{w.get('day', 'Tomorrow').capitalize()} in {loc}: "
+                                  f"{w.get('description', '')}, high {w.get('high_c')}°. "
+                                  f"{w.get('rain_verdict', '')}".strip())
+        except Exception:
+            weather_phrase = ""
+
+        # Agenda: reminders with due times (up to 3) + todo count
+        agenda_bits: List[str] = []
+        try:
+            from backend.tools.scheduler import describe_when
+            from datetime import datetime as _dt
+            rems = tasks_data.get("reminders") or []
+            for r in rems[:3]:
+                txt = str(r.get("text", "") or "").strip()[:90]
+                if not txt:
+                    continue
+                try:
+                    when_s = describe_when(_dt.fromisoformat(str(r.get("due_at", ""))))
+                except (ValueError, TypeError):
+                    when_s = "unscheduled"
+                rep = str(r.get("repeat") or "").strip()
+                agenda_bits.append(f"'{txt}' {when_s}" + (f", repeats {rep}" if rep else ""))
+        except Exception:
+            pass
         todo_count = tasks_data.get("todos_count", 0)
-        if rem_count == 0 and todo_count == 0:
-            tasks_phrase = "You have no scheduled tasks or reminders due today."
-        elif rem_count > 0:
-            first_rem = tasks_data["reminders"][0].get("text", "reminder")
-            tasks_phrase = f"You have {rem_count} scheduled reminder today: {first_rem}."
+        if agenda_bits:
+            more = f" Plus {todo_count} todo(s)." if todo_count else ""
+            tasks_phrase = "On your agenda: " + "; ".join(agenda_bits) + "." + more
+        elif todo_count:
+            first_todo = (tasks_data.get("todos") or [{}])[0].get("text", "task")
+            tasks_phrase = f"No reminders due — but {todo_count} todo(s) open, starting with: {first_todo}."
         else:
-            first_todo = tasks_data["todos"][0].get("text", "task")
-            tasks_phrase = f"You have {todo_count} active task on your agenda: {first_todo}."
+            tasks_phrase = "Nothing on the agenda — a clear day."
 
         # AI News synthesis (approx 2 key headlines mentioned cleanly)
         ai_news_phrase = ""
@@ -349,24 +387,32 @@ class StartupEngine:
         if valid_ai:
             top_ai = valid_ai[0]
             clean_title = re.sub(r'[\"\']', '', top_ai["title"]).strip()
-            ai_news_phrase = f"In recent AI developments, {top_ai['source']} reports: {clean_title}."
+            ai_news_phrase = f"In AI news, {top_ai['source']} reports: {clean_title}."
         else:
-            ai_news_phrase = "AI research networks are currently steady with no breaking alerts."
+            ai_news_phrase = "AI networks are steady with no breaking alerts."
 
-        # Local News
+        # Local News (labelled with the actual city queried)
+        try:
+            from backend.agent.phase1_memory import get_home_city
+            _city_label = get_home_city() or "Pune"
+        except Exception:
+            _city_label = "Pune"
         local_phrase = ""
         if local_news and len(local_news) > 0:
             top_local = local_news[0]
             clean_local = re.sub(r'[\"\']', '', top_local["title"]).strip()
-            local_phrase = f"Locally in Pune, {top_local['source']} notes: {clean_local}."
+            local_phrase = f"Around {_city_label}, {top_local['source']} notes: {clean_local}."
         else:
-            local_phrase = "Local regional telemetry for Pune reports normal operational parameters."
+            local_phrase = ""
 
-        briefing = (
-            f"{greeting} {status_phrase} {tasks_phrase} "
-            f"{ai_news_phrase} {local_phrase} What shall we work on, sir?"
-        )
-        return briefing
+        parts = [greeting, status_phrase]
+        if weather_phrase:
+            parts.append(weather_phrase)
+        parts += [tasks_phrase, ai_news_phrase]
+        if local_phrase:
+            parts.append(local_phrase)
+        parts.append("What shall we work on?")
+        return " ".join(p.strip() for p in parts if p and p.strip())
 
     def initialize_full_system(self) -> Dict[str, Any]:
         """Perform full verified initialization synchronously and cache state."""
@@ -383,14 +429,21 @@ class StartupEngine:
             # 4. Communications
             comms = self.get_communications_status()
 
+            # Home city drives local news + weather (never hardcoded).
+            try:
+                from backend.agent.phase1_memory import get_home_city
+                _home_city = get_home_city() or "Pune"
+            except Exception:
+                _home_city = "Pune"
+
             # 5. News
             ai_news = self.fetch_current_ai_news(limit=3)
-            local_news = self.fetch_current_local_news(limit=2)
+            local_news = self.fetch_current_local_news(limit=2, city=_home_city)
 
             # 6. Weather
             weather = {}
             try:
-                weather_res = get_weather("Pune")
+                weather_res = get_weather(_home_city)
                 if weather_res.get("status") == "success":
                     weather = weather_res.get("weather", {})
             except Exception:
@@ -398,7 +451,7 @@ class StartupEngine:
 
             # 7. Dynamic Voice Briefing
             briefing_text = self.synthesize_voice_briefing(
-                audit_result, subsystems, tasks_data, ai_news, local_news
+                audit_result, subsystems, tasks_data, ai_news, local_news, weather
             )
 
             # Determine overall system state
@@ -485,9 +538,21 @@ class StartupEngine:
         })
         await asyncio.sleep(0.4)
 
-        # Step 6: Live News & Briefing Data
+        # Step 6: Live News & Briefing Data (home-city aware)
+        try:
+            from backend.agent.phase1_memory import get_home_city
+            _stream_city = get_home_city() or "Pune"
+        except Exception:
+            _stream_city = "Pune"
         ai_news = await loop.run_in_executor(None, self.fetch_current_ai_news, 3)
-        local_news = await loop.run_in_executor(None, self.fetch_current_local_news, 2)
+        local_news = await loop.run_in_executor(
+            None, self.fetch_current_local_news, 2, _stream_city)
+        try:
+            from system_ops import get_weather as _brief_weather
+            _wres = await loop.run_in_executor(None, _brief_weather, _stream_city)
+            _stream_weather = _wres.get("weather", {}) if _wres.get("status") == "success" else {}
+        except Exception:
+            _stream_weather = {}
         tasks_data = self.get_real_reminders_and_tasks()
         comms = self.get_communications_status()
 
@@ -500,7 +565,7 @@ class StartupEngine:
 
         # Step 7: Dynamic Voice Briefing Synthesis
         briefing_text = self.synthesize_voice_briefing(
-            audit_res, subsystems, tasks_data, ai_news, local_news
+            audit_res, subsystems, tasks_data, ai_news, local_news, _stream_weather
         )
 
         yield format_sse("BRIEFING_READY", {

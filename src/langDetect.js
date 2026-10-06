@@ -52,18 +52,44 @@ const LANG_NAMES = {
 };
 
 let cachedVoices = [];
-if (typeof window !== 'undefined' && window.speechSynthesis) {
-  const refresh = () => {
-    try {
+function refreshVoices() {
+  try {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
       const v = window.speechSynthesis.getVoices();
       if (v && v.length) cachedVoices = v;
-    } catch { /* ignore */ }
-  };
-  refresh();
+    }
+  } catch { /* ignore */ }
+  return cachedVoices;
+}
+if (typeof window !== 'undefined' && window.speechSynthesis) {
+  refreshVoices();
   try {
-    window.speechSynthesis.onvoiceschanged = refresh;
+    window.speechSynthesis.onvoiceschanged = refreshVoices;
   } catch { /* ignore */ }
 }
+
+// Voices that speak English with a non-native accent (installed with East
+// Asian language packs). They must never be chosen for English — a previous
+// bug let one through when the voice list hadn't finished loading.
+const CJK_LANG_PREFIXES = ['zh', 'ja', 'ko'];
+const CJK_NAME_TOKENS = new Set([
+  'huihui', 'yaoyao', 'kangkang', 'yunjian', 'xiaoxiao', 'xiaomo',
+  'xiaoyi', 'haruka', 'ichiro', 'ayumi', 'sayaka', 'naoya', 'nanami',
+  'jiajia', 'meimei', 'liang', 'keita', 'nozomi',
+]);
+function isCJKVoice(v) {
+  const lang = (v.lang || '').toLowerCase();
+  if (CJK_LANG_PREFIXES.some((p) => lang === p || lang.startsWith(p + '-'))) return true;
+  const tokens = `${v.name || ''}`.toLowerCase().split(/[^a-z]+/);
+  return tokens.some((t) => CJK_NAME_TOKENS.has(t));
+}
+
+// Native English male voices, best first. Checked by name before any
+// locale matching so JARVIS always sounds like a native speaker.
+const PREFERRED_NATIVE_EN = [
+  'microsoft david', 'google uk english male', 'microsoft mark',
+  'microsoft george', 'microsoft daniel', 'google us english', 'daniel',
+];
 
 // JARVIS is male, so within any language tier a male voice always wins.
 // Browser voices rarely expose gender directly — detect it from the voice
@@ -81,7 +107,7 @@ const FEMALE_TOKENS = new Set([
   'sabina', 'heera', 'kanya', 'veena', 'lekha', 'susan', 'karen',
 ]);
 
-function voiceGender(name) {
+export function voiceGender(name) {
   const tokens = `${name || ''}`.toLowerCase().split(/[^a-zàâêëîïôûùçœæñ]+/);
   let male = false, female = false;
   for (const t of tokens) {
@@ -105,23 +131,37 @@ function preferMaleFirst(voices) {
 }
 
 export function pickBrowserVoice(lang) {
+  // The voice list loads asynchronously — re-read it live so we never
+  // speak with the browser default (often a non-native voice) just
+  // because the cache was still empty.
+  if (!cachedVoices.length) refreshVoices();
+  // CJK voices are never eligible for any language JARVIS speaks.
+  const pool = cachedVoices.filter((v) => !isCJKVoice(v));
+  if (!pool.length) return null;
+  if (lang === 'en' || !lang) {
+    const lowered = pool.map((v) => `${v.name || ''}`.toLowerCase());
+    for (const pref of PREFERRED_NATIVE_EN) {
+      const i = lowered.findIndex((n) => n.includes(pref));
+      if (i >= 0) return pool[i];
+    }
+  }
   const tags = LANG_TAGS[lang] || LANG_TAGS.en;
   for (const tag of tags) {
-    const matches = cachedVoices.filter(
+    const matches = pool.filter(
       (x) => (x.lang || '').toLowerCase() === tag.toLowerCase()
     );
     if (matches.length) return preferMaleFirst(matches)[0];
   }
   for (const tag of tags) {
     const short = tag.split('-')[0];
-    const matches = cachedVoices.filter(
+    const matches = pool.filter(
       (x) => (x.lang || '').toLowerCase().startsWith(short)
     );
     if (matches.length) return preferMaleFirst(matches)[0];
   }
   const names = LANG_NAMES[lang] || [];
   for (const n of names) {
-    const matches = cachedVoices.filter(
+    const matches = pool.filter(
       (x) => `${x.name || ''}`.toLowerCase().includes(n)
     );
     if (matches.length) return preferMaleFirst(matches)[0];
@@ -129,9 +169,9 @@ export function pickBrowserVoice(lang) {
   // No voice for this language at all: fall back to any male/neutral
   // English voice rather than an arbitrary (often female) default.
   const enFallback = preferMaleFirst(
-    cachedVoices.filter((x) => (x.lang || '').toLowerCase().startsWith('en'))
+    pool.filter((x) => (x.lang || '').toLowerCase().startsWith('en'))
   );
   if (enFallback.length) return enFallback[0];
-  const anyMale = preferMaleFirst(cachedVoices);
+  const anyMale = preferMaleFirst(pool);
   return anyMale.length ? anyMale[0] : null;
 }

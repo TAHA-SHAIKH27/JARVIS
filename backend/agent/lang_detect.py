@@ -23,8 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 LANGS = ("hi", "mr", "ur", "en", "fr", "es")
 
-# SAPI LCIDs for voice matching.
-SAPI_LCID = {"en": (0x409,), "hi": (0x439,), "mr": (0x44E,),
+# SAPI LCIDs for voice matching (en covers US + Britain so Daniel counts).
+SAPI_LCID = {"en": (0x409, 0x809), "hi": (0x439,), "mr": (0x44E,),
              "ur": (0x448,), "fr": (0x40C, 0xC0C), "es": (0x40A, 0xC0A)}
 
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
@@ -61,10 +61,34 @@ def _hint_lang(hint: str) -> Optional[str]:
     return None
 
 
+def hi_mr_counts(text: str) -> Tuple[int, int]:
+    """(hindi_markers, marathi_markers) in Devanagari text. Never raises."""
+    try:
+        t = text or ""
+        return (sum(1 for m in _HI_MARKERS if m in t),
+                sum(1 for m in _MR_MARKERS if m in t))
+    except Exception:
+        return (0, 0)
+
+
+def prefer_marathi(text: str) -> bool:
+    """True when Marathi markers strictly outnumber Hindi ones.
+
+    Used to pick Marathi (not Hindi) framing for Devanagari text — the
+    two share a script, so a bare script check can't tell them apart.
+    """
+    try:
+        if not _DEVANAGARI_RE.search(text or ""):
+            return False
+        hi, mr = hi_mr_counts(text)
+        return mr > hi
+    except Exception:
+        return False
+
+
 def _script_lang(text: str) -> Optional[str]:
     if _DEVANAGARI_RE.search(text or ""):
-        mr = sum(1 for m in _MR_MARKERS if m in text)
-        hi = sum(1 for m in _HI_MARKERS if m in text)
+        hi, mr = hi_mr_counts(text)
         return "mr" if mr > hi else "hi"
     if _ARABIC_RE.search(text or ""):
         return "ur"

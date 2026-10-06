@@ -35,7 +35,7 @@ import StartupAuditBanner from './StartupAuditBanner';
 
 import ReminderBar from './components/ReminderBar';
 import NotificationCenter from './components/NotificationCenter';
-import { detectLang, pickBrowserVoice } from './langDetect';
+import { detectLang, pickBrowserVoice, voiceGender } from './langDetect';
 
 import { useVoice } from './hooks/useVoice';
 
@@ -192,6 +192,16 @@ export default function App() {
 
   const [notices, setNotices] = useState([])
   const knownNoticeIds = useRef(new Set())
+  // Dismissed toast ids stay hidden even if a later poll still returns them
+  // (e.g. the dismiss POST raced a blocked backend). Without this, a toast
+  // that failed to dismiss server-side pops straight back and looks
+  // "not removable".
+  const dismissedNoticeIds = useRef(new Set())
+  // Guards against double /api/command submits: `busy` state is stale inside
+  // the voice-hook callback ref, so mirror it in a ref + ignore an identical
+  // prompt re-sent within 3s (double-click Send, PTT echo, wake-word echo).
+  const busyRef = useRef(false)
+  const lastSentRef = useRef({ text: '', at: 0 })
 
   // ── Notification Center state (backend is the source of truth) ──
   const [unreadCount, setUnreadCount] = useState(0)
@@ -287,6 +297,277 @@ export default function App() {
   // him instantly via this pattern — no backend round-trip needed.
   const LOCAL_STOP_RE = /^(stop|wait|hold on|halt|quiet|shush|never mind|that'?s enough)$/i
 
+  function claimSendSlot(clean) {
+    const now = Date.now()
+    if (busyRef.current) return false
+    const last = lastSentRef.current
+    if (last.text === clean && (now - last.at) < 3000) return false
+    lastSentRef.current = { text: clean, at: now }
+    busyRef.current = true
+    setBusy(true)
+    return true
+  }
+
+  function releaseSendSlot() {
+    busyRef.current = false
+    setBusy(false)
+  }
+
+  // ── ChatGPT-style thinking bubble (in-transcript progress) ──────────────
+  // A temporary jarvis message { thinking:true, stage, detail } sits at the
+  // end of the transcript while the backend works. Stages mirror ChatGPT:
+  // "Reading prompt" → "Thinking" → "Writing answer". Agent mode reuses the
+  // same bubble but streams live step detail into it.
+  // The bubble speaks the user's language: Devanagari prompt → Hindi labels.
+  // Transcript language: Devanagari prompt → Hindi, unless Marathi
+  // markers win (shared script). Drives thinking-bubble labels.
+  const MR_MARK = ['माझा', 'माझं', 'माझी', 'तुम्ही', 'आम्ही', 'कसे', 'कशी', 'कुठे', 'आहे', 'नाही', 'नको', 'मला', 'तुला', 'होय', 'पाहिजे', 'करतो', 'करते', 'तुझा', 'तुझी', 'काय '];
+  const HI_MARK = ['है', 'हैं', 'नहीं', 'मुझे', 'तुम्हें', 'कैसे', 'कहाँ', 'क्या', 'मेरा', 'मेरी', 'आपका', 'होगा', 'रहा', 'रही'];
+  function textLang(t) {
+    try {
+      const s = t || '';
+      if (!/[ऀ-ॿ]/.test(s)) return 'en';
+      let mr = 0, hi = 0;
+      for (const m of MR_MARK) if (s.includes(m)) mr++;
+      for (const m of HI_MARK) if (s.includes(m)) hi++;
+      return mr > hi ? 'mr' : 'hi';
+    } catch { return 'en'; }
+  }
+  function isHindiText(t) {
+    try { return textLang(t) === 'hi' } catch { return false }
+  }
+  function stageLabel(stage, lang) {
+    if (lang === 'mr') {
+      return stage === 'reading' ? 'वाचत आहे' : stage === 'thinking' ? 'विचार करत आहे' : 'लिहित आहे'
+    }
+    if (lang === 'hi') {
+      return stage === 'reading' ? 'पढ़ रहा हूँ' : stage === 'thinking' ? 'सोच रहा हूँ' : 'लिख रहा हूँ'
+    }
+    return stage === 'reading' ? 'Reading prompt' : stage === 'thinking' ? 'Thinking' : 'Writing answer'
+  }
+  function pushThinking(userText, initialStage = 'reading') {
+    const lang = textLang(userText)
+    setMessages(m => [...m, { role: 'user', text: userText }, { role: 'jarvis', thinking: true, stage: initialStage, detail: '', text: '', lang }])
+    setPrompt('')
+  }
+
+  function pushThinkingNoBubble(initialStage = 'reading', userText = '') {
+    const lang = textLang(userText)
+    setMessages(m => [...m, { role: 'jarvis', thinking: true, stage: initialStage, detail: '', text: '', lang }])
+    setPrompt('')
+  }
+
+  function setThinkingStage(stage, detail) {
+    setMessages(m => {
+      const copy = [...m]
+      const last = copy[copy.length - 1]
+      if (!last || !last.thinking) return m
+      copy[copy.length - 1] = { ...last, stage, ...(detail !== undefined ? { detail } : {}) }
+      return copy
+    })
+  }
+
+  function streamIntoThinking(fullText) {
+    setMessages(m => {
+      const copy = [...m]
+      const last = copy[copy.length - 1]
+      if (!last || !last.thinking) return m
+      copy[copy.length - 1] = { ...last, stage: 'writing', text: fullText }
+      return copy
+    })
+  }
+
+  function resolveThinking(finalText) {
+    setMessages(m => {
+      const copy = [...m]
+      const last = copy[copy.length - 1]
+      if (last && last.thinking) {
+        copy[copy.length - 1] = { role: 'jarvis', text: finalText }
+      } else {
+        copy.push({ role: 'jarvis', text: finalText })
+      }
+      return copy
+    })
+  }
+
+  // Yield one paint frame so "Reading prompt" actually appears while the
+  // payload is prepared (trim + language detect). Every transition after
+  // that is driven by a REAL event — request dispatched, response received,
+  // first stream chunk, SSE step — never by fixed seconds.
+  function paintReadingFrame() {
+    return new Promise((resolve) => {
+      try {
+        requestAnimationFrame(() => resolve())
+      } catch {
+        setTimeout(resolve, 0)
+      }
+    })
+  }
+
+  // ── Human word-by-word typewriter (ChatGPT-style writing) ─────────────
+  // Normal + agentic replies arrive as one JSON string. Instead of dumping
+  // the whole answer at once, we reveal it word-by-word so it reads like
+  // Jarvis is writing/reading it live. Streaming endpoints reuse the same
+  // rhythm via pushStreamChunk() so network chunks never dump mid-sentence.
+  const typewriterRef = useRef(null)
+
+  function stopTypewriter() {
+    const tw = typewriterRef.current
+    if (tw) {
+      try { clearInterval(tw.timer) } catch { }
+      try { tw.resolve && tw.resolve() } catch { }
+      typewriterRef.current = null
+    }
+  }
+
+  function setTypingBubble(shown, done) {
+    setMessages(m => {
+      const copy = [...m]
+      const last = copy[copy.length - 1]
+      if (!last) return m
+      if (last.thinking) {
+        copy[copy.length - 1] = { role: 'jarvis', text: shown, typing: !done }
+      } else if (last.role === 'jarvis') {
+        copy[copy.length - 1] = { ...last, text: shown, typing: !done }
+      } else {
+        copy.push({ role: 'jarvis', text: shown, typing: !done })
+      }
+      return copy
+    })
+  }
+
+  function typewriteReply(fullText) {
+    const full = (fullText || '').toString()
+    stopTypewriter()
+    if (!full) {
+      resolveThinking('')
+      return Promise.resolve()
+    }
+    // Tokenize into words, keeping whitespace so wrapping stays natural.
+    const tokens = full.split(/(\s+)/).filter(t => t.length > 0)
+    // Adaptive pace: short replies feel deliberate, long ones stay snappy.
+    // ~1 word / 45ms for short, up to ~4 words / 28ms for long essays.
+    const words = tokens.filter(t => /\S/.test(t)).length
+    let wordsPerTick = 1
+    let ms = 48
+    if (words > 220) { wordsPerTick = 4; ms = 26 }
+    else if (words > 120) { wordsPerTick = 3; ms = 30 }
+    else if (words > 45) { wordsPerTick = 2; ms = 36 }
+    return new Promise((resolve) => {
+      let shownTokens = 0
+      let shownWords = 0
+      setTypingBubble('', false)
+      const timer = setInterval(() => {
+        // Emit N words (plus their trailing whitespace) per tick.
+        let emitted = 0
+        while (shownTokens < tokens.length && emitted < wordsPerTick) {
+          const tok = tokens[shownTokens]
+          shownTokens += 1
+          if (/\S/.test(tok)) emitted += 1
+          // Consume following whitespace with the word so we never stall
+          // on a lone space token.
+          while (shownTokens < tokens.length && /^\s+$/.test(tokens[shownTokens])) {
+            shownTokens += 1
+          }
+        }
+        shownWords += emitted
+        const shown = tokens.slice(0, shownTokens).join('')
+        const done = shownTokens >= tokens.length
+        setTypingBubble(shown, done)
+        if (done) {
+          clearInterval(timer)
+          if (typewriterRef.current && typewriterRef.current.timer === timer) {
+            typewriterRef.current = null
+          }
+          resolve()
+        }
+      }, ms)
+      typewriterRef.current = { timer, full, resolve }
+    })
+  }
+
+  function completeTypingNow() {
+    const tw = typewriterRef.current
+    if (!tw) return
+    try { clearInterval(tw.timer) } catch { }
+    setTypingBubble(tw.full, true)
+    try { tw.resolve && tw.resolve() } catch { }
+    typewriterRef.current = null
+  }
+
+  // Streaming smoother: network chunks land in bursts — buffer them and
+  // reveal word-by-word through the same typewriter bubble.
+  const smoothStreamRef = useRef(null)
+
+  function startSmoothStream() {
+    try { if (smoothStreamRef.current) clearInterval(smoothStreamRef.current.timer) } catch { }
+    setTypingBubble('', false)
+    const state = { target: '', shown: '', timer: null, done: false }
+    state.timer = setInterval(() => {
+      if (state.shown.length >= state.target.length) {
+        if (state.done) {
+          clearInterval(state.timer)
+          setTypingBubble(state.target, true)
+          if (smoothStreamRef.current === state) smoothStreamRef.current = null
+        }
+        return
+      }
+      // Reveal up to the next word boundary (or a few chars for CJK/no-space text).
+      let next = state.shown.length
+      let wordsOut = 0
+      const t = state.target
+      while (next < t.length && wordsOut < 2) {
+        // Consume non-space run (a word).
+        while (next < t.length && !/\s/.test(t[next])) next += 1
+        // Consume trailing spaces with the word.
+        while (next < t.length && /\s/.test(t[next])) next += 1
+        wordsOut += 1
+        if (next - state.shown.length > 60) break
+      }
+      // Fallback: never stall when there are no spaces at all.
+      if (next <= state.shown.length) next = Math.min(t.length, state.shown.length + 24)
+      state.shown = t.slice(0, next)
+      const finished = state.done && state.shown.length >= state.target.length
+      setTypingBubble(state.shown, finished)
+      if (finished) {
+        clearInterval(state.timer)
+        if (smoothStreamRef.current === state) smoothStreamRef.current = null
+      }
+    }, 42)
+    smoothStreamRef.current = state
+    return state
+  }
+
+  function pushStreamChunk(piece) {
+    const st = smoothStreamRef.current
+    if (!st) return
+    st.target += (piece || '').toString()
+  }
+
+  async function finishSmoothStream() {
+    const st = smoothStreamRef.current
+    if (!st) return ''
+    st.done = true
+    // Wait (bounded) until the revealer catches up with the full target.
+    const t0 = Date.now()
+    while (smoothStreamRef.current === st && Date.now() - t0 < 15000) {
+      if (st.shown.length >= st.target.length) break
+      await new Promise(r => setTimeout(r, 60))
+    }
+    try { clearInterval(st.timer) } catch { }
+    setTypingBubble(st.target, true)
+    if (smoothStreamRef.current === st) smoothStreamRef.current = null
+    return st.target
+  }
+
+  function abortSmoothStream() {
+    try {
+      const st = smoothStreamRef.current
+      if (st) clearInterval(st.timer)
+    } catch { }
+    smoothStreamRef.current = null
+  }
+
   async function runVoiceCommand(text) {
     const clean = (text || '').trim()
     if (!clean) return
@@ -296,7 +577,6 @@ export default function App() {
       await sendInstruct(clean, false)
       return
     }
-    if (busy) return
     // Local instant-stop: bare stop-word while JARVIS speaks silences him
     // immediately (frontend + backend voice) with no backend round-trip.
     if ((ttsSpeaking || isSpeaking) && LOCAL_STOP_RE.test(clean.replace(/[.?!]+$/, ''))) {
@@ -306,8 +586,15 @@ export default function App() {
       setMessages(m => [...m, { role: 'jarvis', text: 'Stopped, sir.' }])
       return
     }
-    setBusy(true)
+    if (!claimSendSlot(clean)) return
+    // Voice path already added the user bubble via onTranscript — only the
+    // thinking bubble goes in here.
+    stopTypewriter()
+    pushThinkingNoBubble('reading', clean)
     try {
+      await paintReadingFrame()
+      // Request is now on the wire — backend is thinking.
+      setThinkingStage('thinking')
       const res = await fetch('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -315,31 +602,36 @@ export default function App() {
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
-        setBusy(false)
+        setThinkingStage('writing')
+        await typewriteReply(err.detail || `Something went wrong on my end (HTTP ${res.status}) — please try again.`)
+        releaseSendSlot()
         return
       }
       const data = await res.json()
-      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
+      // Full reply received — now genuinely writing it out word by word.
+      setThinkingStage('writing')
       speak(data.speak, data.speak_lang || detectLang(data.speak, clean))
+      await typewriteReply(data.speak)
       setLogs(data.logs || [])
       setFileData(data.file_data || null)
       setImageData(data.image_data || null)
       if (data.timer_data) setTimerData(data.timer_data)
       if (data.refresh_files) refreshFiles()
-      const logLines = data.logs || []
 
     } catch {
-      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
+      setThinkingStage('writing')
+      await typewriteReply('I lost connection to the core service — is the backend running?')
     } finally {
-      setBusy(false)
+      stopTypewriter()
+      releaseSendSlot()
     }
   }
 
-  // Wire the execute command ref in the hook so auto-silence PTT can execute commands
+  // Wire the execute command ref in the hook so auto-silence PTT can execute commands.
+  // No dep array: runs every render so the ref never holds a stale `busy` closure.
   useEffect(() => {
     _setExecuteCommand?.(runVoiceCommand);
-  }, [_setExecuteCommand])
+  })
 
   async function togglePushToTalk() {
     if (isPushToTalkActive) {
@@ -402,7 +694,7 @@ export default function App() {
       const res = await fetch('/api/notifications')
       if (!res.ok) return
       const data = await res.json()
-      const items = data.notifications || []
+      const items = (data.notifications || []).filter(n => !dismissedNoticeIds.current.has(n.id))
       const fresh = items.filter(n => !knownNoticeIds.current.has(n.id))
       if (fresh.length) {
         fresh.forEach(n => knownNoticeIds.current.add(n.id))
@@ -501,13 +793,29 @@ export default function App() {
   const centerClearHistory = useCallback(() => notifAction('/api/notifications/clear-history', {}, centerRefreshAfter), [fetchCenter])
 
   async function dismissNotice(id) {
-    setNotices(prev => prev.filter(n => n.id !== id))
+    // Optimistic + sticky: remember locally so a slow/failed POST can never
+    // pop the toast straight back on the next 8s poll.
+    if (id) dismissedNoticeIds.current.add(id)
+    else {
+      try {
+        const res = await fetch('/api/notifications')
+        if (res.ok) {
+          const data = await res.json()
+          ;(data.notifications || []).forEach(n => dismissedNoticeIds.current.add(n.id))
+        }
+      } catch { }
+    }
+    setNotices(prev => (id ? prev.filter(n => n.id !== id) : []))
     try {
-      await fetch('/api/notifications/dismiss', {
+      const res = await fetch('/api/notifications/dismiss', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(id ? { id } : { all: true })
       })
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}))
+        if (typeof data.unread_count === 'number') setUnreadCount(data.unread_count)
+      }
     } catch { }
   }
 
@@ -615,12 +923,27 @@ export default function App() {
     }
     window.speechSynthesis.cancel()
     const utter = new SpeechSynthesisUtterance(text)
-    utter.rate = 1
+    utter.rate = 0.88
     utter.pitch = 0.85
     try {
       utter.lang = SPEAK_LOCALE[resolved] || SPEAK_LOCALE.en
       const voice = pickBrowserVoice(resolved)
-      if (voice) utter.voice = voice
+      if (voice) {
+        utter.voice = voice
+        try { console.log('[JARVIS voice]', voice.name, voice.lang) } catch { }
+        // If the only voice for this language is female, say so plainly
+        // (once per session) instead of mysteriously sounding wrong.
+        try {
+          if (!window.__jarvisVoiceWarned && ['hi', 'mr', 'ur'].includes(resolved)
+              && voiceGender(voice.name) === 'female') {
+            window.__jarvisVoiceWarned = true;
+            console.warn('[JARVIS voice] No male ' + resolved + ' voice is installed — using '
+              + voice.name + '. For a male Hindi voice, install "Microsoft Madhur": '
+              + 'Windows Settings → Time & language → Language → add Hindi, then '
+              + 'Speech → Manage voices → add Hindi. JARVIS will pick it up automatically.');
+          }
+        } catch { }
+      }
     } catch { /* default voice stays */ }
     utter.onstart = () => setIsSpeaking(true)
     utter.onend = () => setIsSpeaking(false)
@@ -656,19 +979,22 @@ export default function App() {
   }
 
   async function runCommand(text) {
-    if (!text.trim() || busy) return
+    const cleanText = (text || '').trim()
+    if (!cleanText) return
     // Handle agent mode toggle
-    if (text.trim().toLowerCase() === 'toggle agent') {
+    if (cleanText.toLowerCase() === 'toggle agent') {
       setAgentMode(!agentMode)
       setMessages(m => [...m, { role: 'jarvis', text: "Agent mode " + (agentMode ? 'deactivated' : 'activated') + ", sir." }])
       setPrompt('')
-      setBusy(false)
       return
     }
-    setMessages(m => [...m, { role: 'user', text }])
-    setPrompt('')
-    setBusy(true)
+    if (!claimSendSlot(cleanText)) return
+    stopTypewriter()
+    pushThinking(text, 'reading')
     try {
+      await paintReadingFrame()
+      // Request is now on the wire — backend is thinking.
+      setThinkingStage('thinking')
       const res = await fetch('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -676,13 +1002,17 @@ export default function App() {
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Command failed, sir.' }])
-        setBusy(false)
+        setThinkingStage('writing')
+        await typewriteReply(err.detail || `Something went wrong on my end (HTTP ${res.status}) — please try again.`)
+        releaseSendSlot()
         return
       }
       const data = await res.json()
-      setMessages(m => [...m, { role: 'jarvis', text: data.speak }])
+      // Full reply received — now genuinely writing it out word by word.
+      setThinkingStage('writing')
+      // Voice + typing start together — like Jarvis reads it aloud while writing.
       speak(data.speak, data.speak_lang || detectLang(data.speak, text))
+      await typewriteReply(data.speak)
       setLogs(data.logs || [])
       setFileData(data.file_data || null)
       setImageData(data.image_data || null)
@@ -699,67 +1029,77 @@ export default function App() {
       const logLines = data.logs || []
 
     } catch {
-      setMessages(m => [...m, { role: 'jarvis', text: 'I lost connection to the core service, sir. Is the backend running?' }])
+      setThinkingStage('writing')
+      await typewriteReply('I lost connection to the core service — is the backend running?')
     } finally {
-      setBusy(false)
+      stopTypewriter()
+      releaseSendSlot()
     }
   }
 
   async function runStreamingChat(text) {
-    if (!text.trim() || busy) return
-    setMessages(m => [...m, { role: 'user', text }, { role: 'jarvis', text: '' }])
-    setPrompt('')
-    setBusy(true)
+    const cleanChat = (text || '').trim()
+    if (!cleanChat || !claimSendSlot(cleanChat)) return
+    stopTypewriter()
+    abortSmoothStream()
+    pushThinking(text, 'reading')
     try {
+      await paintReadingFrame()
+      // Request is now on the wire — backend is thinking.
+      setThinkingStage('thinking')
       const res = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: text })
       })
       if (!res.ok || !res.body) {
-        setMessages(m => {
-          const copy = [...m]
-          copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir.' }
-          return copy
-        })
+        setThinkingStage('writing')
+        await typewriteReply('I lost connection to the core service.')
         return
       }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
-      let full = ''
+      let firstChunk = true
+      startSmoothStream()
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => {
-          const copy = [...m]
-          copy[copy.length - 1] = { role: 'jarvis', text: full }
-          return copy
-        })
+        const piece = decoder.decode(value, { stream: true })
+        if (firstChunk && piece) {
+          firstChunk = false
+          // First bytes arrived — genuinely writing now.
+          setThinkingStage('writing')
+        }
+        // Buffer network bursts, reveal word-by-word like live writing.
+        pushStreamChunk(piece)
       }
+      const full = await finishSmoothStream()
       if (full) speak(full, detectLang(full, text))
+      if (!full) await typewriteReply('I lost connection to the core service.')
     } catch {
-      setMessages(m => {
-        const copy = [...m]
-        copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection to the core service, sir.' }
-        return copy
-      })
+      abortSmoothStream()
+      setThinkingStage('writing')
+      await typewriteReply('I lost connection to the core service.')
     } finally {
-      setBusy(false)
+      abortSmoothStream()
+      stopTypewriter()
+      releaseSendSlot()
     }
   }
 
   async function runAgentMode(text) {
-    if (!text.trim() || busy) return
-    setMessages(m => [...m, { role: 'user', text }])
-    setPrompt('')
-    setBusy(true)
+    const cleanAgent = (text || '').trim()
+    if (!cleanAgent || !claimSendSlot(cleanAgent)) return
+    stopTypewriter()
+    pushThinking(text, 'reading')
+    await paintReadingFrame()
     setAgentEvents([])
     setAgentRunId('')
     setAgentWaitingForHuman(false)
     setAgentQuestion(null)
     setQueuedTasks([])
     setAgentStatus('planning')
+    setThinkingStage('thinking', 'Breaking down your request…')
 
     try {
       const res = await fetch('/api/agent/run', {
@@ -770,9 +1110,9 @@ export default function App() {
 
       if (!res.ok || !res.body) {
         const err = await res.json().catch(() => ({}))
-        setMessages(m => [...m, { role: 'jarvis', text: err.detail || 'Agent failed to start, sir.' }])
+        await typewriteReply(err.detail || 'The agent failed to start — nothing was changed.')
         setAgentStatus('error')
-        setBusy(false)
+        releaseSendSlot()
         return
       }
 
@@ -807,13 +1147,14 @@ export default function App() {
               speak(q)
             }
 
-            // Update agent status
-            if (type === 'planning' || type === 'plan_created' || type === 'plan_validated') setAgentStatus('planning')
-            else if (type === 'step_started' || type === 'tool_started' || type === 'retrying' || type === 'replanning') setAgentStatus('executing')
-            else if (type === 'observing' || type === 'verification_started') setAgentStatus('observing')
-            else if (type === 'human_intervention_required' || type === 'waiting_for_user' || type === 'clarification_required') setAgentStatus('blocked')
-            else if (type === 'step_failed' || type === 'verification_failed' || type === 'task_failed' || type === 'error') setAgentStatus('error')
-            else if (type === 'task_completed' || type === 'task_partial' || type === 'done') setAgentStatus('completed')
+            // Update agent status + mirror live progress into the chat bubble
+            if (type === 'planning' || type === 'plan_created' || type === 'plan_validated') { setAgentStatus('planning'); setThinkingStage('thinking', message || 'Drafting the plan…') }
+            else if (type === 'step_started' || type === 'tool_started' || type === 'retrying' || type === 'replanning') { setAgentStatus('executing'); setThinkingStage('thinking', message || 'Working through the steps…') }
+            else if (type === 'observing' || type === 'verification_started' || type === 'step_completed') { setAgentStatus('observing'); setThinkingStage('thinking', message || 'Checking that step…') }
+            else if (type === 'human_intervention_required' || type === 'waiting_for_user' || type === 'clarification_required') { setAgentStatus('blocked'); setThinkingStage('thinking', message || 'I need you on this one…') }
+            else if (type === 'step_failed' || type === 'verification_failed' || type === 'task_failed' || type === 'error') { setAgentStatus('error'); setThinkingStage('thinking', message || 'Hit a snag — recovering…') }
+            else if (type === 'task_completed' || type === 'task_partial' || type === 'done') { setAgentStatus('completed'); setThinkingStage('writing', 'Wrapping up your answer…') }
+            else if (type === 'final_verification') { setThinkingStage('thinking', 'Verifying the final result…') }
 
             // Accumulate event log
             if (type !== 'done') {
@@ -838,17 +1179,19 @@ export default function App() {
         }
       }
 
-      // Add final JARVIS message
-      const reply = finalSpeak || 'Agent task complete, sir.'
-      setMessages(m => [...m, { role: 'jarvis', text: reply }])
+      // Final answer types out word-by-word like live writing.
+      const reply = finalSpeak || 'Done — that task is complete.'
+      setThinkingStage('writing', 'Writing your answer…')
       speak(reply, detectLang(reply, text))
+      await typewriteReply(reply)
       refreshFiles()
 
     } catch (err) {
-      setMessages(m => [...m, { role: 'jarvis', text: 'Agent connection lost, sir. Is the backend running?' }])
+      await typewriteReply('Lost the agent connection — is the backend still running?')
       setAgentStatus('error')
     } finally {
-      setBusy(false)
+      stopTypewriter()
+      releaseSendSlot()
     }
   }
 
@@ -956,68 +1299,102 @@ export default function App() {
 
   async function runDocumentAnalysis(text, doc) {
     if (busy || !doc) return
-    const questionText = text.trim() || 'Summarize this document for me, sir, and note any key points.'
-    setMessages(m => [...m, { role: 'user', text: questionText, docName: doc.fileName }, { role: 'jarvis', text: '' }])
+    const questionText = text.trim() || 'Summarize this document for me and note any key points.'
+    stopTypewriter()
+    abortSmoothStream()
+    setMessages(m => [...m, { role: 'user', text: questionText, docName: doc.fileName }, { role: 'jarvis', thinking: true, stage: 'reading', detail: textLang(questionText) === 'mr' ? 'तुमचा दस्तऐवज वाचत आहे…' : isHindiText(questionText) ? 'आपका दस्तावेज़ पढ़ रहा हूँ…' : 'Reading your document…', text: '', lang: textLang(questionText) }])
     setPrompt('')
     setPendingDocument(null)
     setBusy(true)
+    busyRef.current = true
     try {
+      await paintReadingFrame()
+      // Upload + backend read underway — thinking until words arrive.
+      setThinkingStage('thinking', 'Working through it…')
       const res = await fetch('/api/document/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ document_text: doc.text, filename: doc.fileName, prompt: questionText })
       })
       if (!res.ok || !res.body) {
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'I lost connection.' }; return copy })
+        setThinkingStage('writing')
+        await typewriteReply('I lost connection while reading that.')
         return
       }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
-      let full = ''
+      let firstDocChunk = true
+      startSmoothStream()
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
+        const piece = decoder.decode(value, { stream: true })
+        // First bytes arrived — genuinely writing now.
+        if (firstDocChunk && piece) { firstDocChunk = false; setThinkingStage('writing', 'Writing up the summary…') }
+        pushStreamChunk(piece)
       }
+      const full = await finishSmoothStream()
       if (full) speak(full, detectLang(full, questionText))
+      if (!full) await typewriteReply('I lost connection while reading that.')
     } catch {
-      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+      abortSmoothStream()
+      setThinkingStage('writing')
+      await typewriteReply('Connection lost while reading that.')
     } finally {
+      abortSmoothStream()
+      stopTypewriter()
+      busyRef.current = false
       setBusy(false)
     }
   }
 
   async function runImageAnalysis(text, image) {
     if (busy || !image) return
-    const questionText = text.trim() || 'Describe this image in detail, sir.'
-    setMessages(m => [...m, { role: 'user', text: questionText, image: image.previewUrl }, { role: 'jarvis', text: '' }])
+    const questionText = text.trim() || 'Describe this image in detail.'
+    stopTypewriter()
+    abortSmoothStream()
+    setMessages(m => [...m, { role: 'user', text: questionText, image: image.previewUrl }, { role: 'jarvis', thinking: true, stage: 'reading', detail: textLang(questionText) === 'mr' ? 'तुमचं चित्र बघत आहे…' : isHindiText(questionText) ? 'आपकी तस्वीर देख रहा हूँ…' : 'Looking at your image…', text: '', lang: textLang(questionText) }])
     setPrompt('')
     setPendingImage(null)
     setBusy(true)
+    busyRef.current = true
     try {
+      await paintReadingFrame()
+      // Upload + vision pass underway — thinking until words arrive.
+      setThinkingStage('thinking', 'Studying the pixels…')
       const res = await fetch('/api/vision/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image_base64: image.base64, mime_type: image.mimeType, prompt: questionText })
       })
       if (!res.ok || !res.body) {
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+        setThinkingStage('writing')
+        await typewriteReply('I lost connection while looking at that.')
         return
       }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
-      let full = ''
+      let firstImgChunk = true
+      startSmoothStream()
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        full += decoder.decode(value, { stream: true })
-        setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: full }; return copy })
+        const piece = decoder.decode(value, { stream: true })
+        // First bytes arrived — genuinely writing now.
+        if (firstImgChunk && piece) { firstImgChunk = false; setThinkingStage('writing', 'Describing what I see…') }
+        pushStreamChunk(piece)
       }
+      const full = await finishSmoothStream()
       if (full) speak(full, detectLang(full, questionText))
+      if (!full) await typewriteReply('I lost connection while looking at that.')
     } catch {
-      setMessages(m => { const copy = [...m]; copy[copy.length - 1] = { role: 'jarvis', text: 'Connection lost.' }; return copy })
+      abortSmoothStream()
+      setThinkingStage('writing')
+      await typewriteReply('Connection lost while looking at that.')
     } finally {
+      abortSmoothStream()
+      stopTypewriter()
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -1208,6 +1585,11 @@ export default function App() {
       {/* â”€â”€ Proactive notifications (Gmail watcher) â”€â”€ */}
       {notices.length > 0 && (
         <div style={{ position: 'fixed', top: 64, right: 16, zIndex: 9999, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 360 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button className="notif-mini-btn" onClick={() => dismissNotice(null)} title="Dismiss all notifications" style={{ background: 'rgba(0,0,0,0.6)' }}>
+              Clear all ({notices.length})
+            </button>
+          </div>
           {notices.map(n => (
             <div key={n.id} className="modal-box" style={{ padding: '10px 12px', borderLeft: '3px solid var(--cyan)', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
               <MessageSquare size={16} style={{ flexShrink: 0, marginTop: 2, color: 'var(--cyan)' }} />
@@ -1215,7 +1597,7 @@ export default function App() {
                 <div style={{ fontWeight: 600, fontSize: 13 }}>{n.title}</div>
                 {n.body && <div style={{ fontSize: 12, opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis' }}>{n.body}</div>}
               </div>
-              <button className="icon-btn" onClick={() => dismissNotice(n.id)} aria-label="Dismiss">
+              <button className="icon-btn" onClick={() => dismissNotice(n.id)} aria-label="Dismiss" title="Dismiss">
                 <X size={14} />
               </button>
             </div>
@@ -1292,13 +1674,30 @@ export default function App() {
             <p className="panel-label"><span>Transcript</span><span>{messages.length} entries</span></p>
             <div className="chat-log">
               {messages.map((m, i) => (
-                <div key={i} className={`bubble ${m.role === 'user' ? 'user' : 'jarvis'}`}>
+                <div
+                  key={i}
+                  className={`bubble ${m.role === 'user' ? 'user' : 'jarvis'}${m.thinking ? ' thinking' : ''}${m.typing ? ' typing' : ''}`}
+                  onClick={() => { if (m.typing) completeTypingNow() }}
+                  title={m.typing ? 'Click to show full reply' : undefined}
+                >
                   <span className="who">{m.role === 'user' ? 'You' : 'Jarvis'}</span>
                   {m.image && <img className="bubble-image" src={m.image} alt="attachment" />}
                   {m.docName && (
                     <span className="bubble-doc-tag"><FileIcon size={12} /> {m.docName}</span>
                   )}
-                  {m.text}
+                  {m.thinking ? (
+                    <span className="thinking-row" aria-live="polite">
+                      <span className="thinking-spinner" aria-hidden="true" />
+                      <span className="thinking-stage">
+                        {stageLabel(m.stage, m.lang)}
+                      </span>
+                      <span className="thinking-dots" aria-hidden="true"><span /><span /><span /></span>
+                      {m.detail ? <span className="thinking-detail">{m.detail}</span> : null}
+                      {m.text ? <span className="thinking-partial">{m.text}</span> : null}
+                    </span>
+                  ) : (
+                    <span className="reply-text">{m.text}{m.typing ? <span className="typing-caret" aria-hidden="true" /> : null}</span>
+                  )}
                 </div>
               ))}
               <div ref={chatEndRef} />
@@ -1549,7 +1948,7 @@ export default function App() {
                 }
               </div>
               {gmailMsg && <div className="save-note" style={{ color: 'var(--cyan)' }}>{gmailMsg}</div>}
-              <p className="oauth-hint">Read-only. Jarvis checks on restart + every 30 min and speaks + toasts VIP/urgent mail. VIP senders list: backend/data/gmail_watch.json</p>
+              <p className="oauth-hint">Read + send. Jarvis checks on restart + every 30 min and speaks + toasts VIP/urgent mail. VIP senders list: backend/data/gmail_watch.json</p>
             </div>
 
             <div className="field">

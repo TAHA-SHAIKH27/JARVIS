@@ -54,14 +54,14 @@ def _offline_command_fallback(prompt: str, exc: BaseException | None = None) -> 
     add_to_history("assistant", combined)
     return [{"type": "speak", "text": combined}, *non_speaks]
 
-# Simple system commands keyword mapping for local offline fallback
+# Human offline smalltalk — warm, brief, natural (shared styler handles variety).
 OFFLINE_RESPONSES = {
-    "hello": "Hello, sir. Systems are online and operating at peak efficiency. What can I do for you today?",
-    "hi": "Hello, sir. I am at your disposal.",
-    "how are you": "All metrics are stable, sir. My core processors are performing optimally. Thank you for asking.",
-    "who are you": "I am J.A.R.V.I.S., your home automation and desktop digital assistant. I am designed to control systems, manage files, and keep you informed.",
-    "status": "All systems nominal, sir. CPU, memory, and disk space are within safe operating limits.",
-    "goodbye": "Goodbye, sir. Standing by on low power mode."
+    "hello": "Hello — good to hear from you. What are we working on?",
+    "hi": "Hey — I'm here and listening. What's the plan?",
+    "how are you": "Running cool and thinking fast, thanks for asking. How can I help?",
+    "who are you": "I'm Jarvis — your desktop right hand. I run apps, files, mail, reminders and research, and I talk you through it all as I go.",
+    "status": "All green on my side — CPU, memory and disk are sitting comfortably. Want the exact numbers?",
+    "goodbye": "I'll be right here whenever you need me.",
 }
 
 # ===== CONVERSATION HISTORY (session, persisted to disk) =====
@@ -165,7 +165,19 @@ def parse_local_command(prompt: str) -> list:
     """Fallback rule-based command interpreter for offline/no-API-key mode."""
     prompt_clean = prompt.lower().strip()
     actions = []
-    
+
+    # 0. Mental math first — "what's 12*8", "18% of 4500" (before "what..."
+    # patterns elsewhere can swallow them).
+    try:
+        from backend.tools.knowledge import quick_math_detect
+        _expr = quick_math_detect(prompt)
+        if _expr:
+            actions.append({"type": "calculate", "expression": _expr})
+            actions.append({"type": "speak", "text": "Crunching that now."})
+            return actions
+    except Exception:
+        pass
+
     # Screenshot Command (PC display — phone screenshot requests are handled
     # in _parse_new_commands, checked below, so exclude anything mentioning "phone")
     if ("screenshot" in prompt_clean or "capture screen" in prompt_clean) and "phone" not in prompt_clean:
@@ -278,6 +290,43 @@ def parse_local_command(prompt: str) -> list:
         actions.append({"type": "speak", "text": f"Saving the image as {save_name} to your desktop, sir."})
         return actions
 
+    # Open a well-known folder (offline fallback)
+    folder_match = re.search(
+        r'(?:open|show|launch)\s+(?:my\s+|the\s+)?'
+        r'(downloads?|documents?|desktop|pictures?|photos?|music|videos?|home|file explorer|explorer)'
+        r'(?:\s+folder)?', prompt_clean)
+    if folder_match:
+        target = folder_match.group(1).strip()
+        if target in ("file explorer", "explorer"):
+            target = "home"
+        actions.append({"type": "open_folder", "folder": target})
+        actions.append({"type": "speak", "text": f"Opening your {target} folder, sir."})
+        return actions
+
+    # "Open X and go to Y" (offline fallback) — app launch + URL navigation.
+    combo_match = re.search(
+        r'(?:open|launch|start)\s+([a-zA-Z0-9_\-\s]{2,30}?)\s+and\s+go\s+(?:to\s+)?(.+)$',
+        prompt_clean)
+    if combo_match:
+        app_name = combo_match.group(1).strip()
+        site = combo_match.group(2).strip()
+        if re.match(r'https?://', site):
+            url = site
+        else:
+            host = site.replace(' ', '')
+            url = f"https://{host}" if ('.' in host or host == 'localhost') else f"https://{host}.com"
+        actions.append({"type": "launch_app", "app_name": app_name})
+        actions.append({"type": "open_url", "url": url})
+        actions.append({"type": "speak", "text": f"Opening {app_name} and heading to {site}, sir."})
+        return actions
+
+    # Mail (offline fallback) — reading needs the Gmail API, so say so
+    # plainly instead of pretending, and never launch Outlook for it.
+    if re.search(r'\b(mail|email|e-mail|inbox|gmail)\b', prompt_clean) and not any(
+            k in prompt_clean for k in ['send', 'compose', 'write', 'whatsapp']):
+        actions.append({"type": "speak", "text": "I read mail directly through the Gmail API, sir — no need to open anything. Reconnect me to the network and ask again."})
+        return actions
+
     # Launch app (offline fallback - only for actual app launches, not research/folder commands)
     launch_match = re.search(r'(?:launch|open|start|run)\s+([a-zA-Z0-9_\-\s]{2,30})$', prompt_clean)
     if launch_match and not any(k in prompt_clean for k in ['website', 'websites', 'folder', 'file', 'word', 'docx', 'search', 'research']):
@@ -289,6 +338,14 @@ def parse_local_command(prompt: str) -> list:
     # 10. Check persistent memory for personal facts/questions (offline fallback)
     try:
         from backend.agent import phase1_memory
+        try:
+            from backend.agent import phase1_runtime as _rt_off
+            _direct = _rt_off.answer_from_memory(prompt)
+            if _direct:
+                actions.append({"type": "speak", "text": _direct})
+                return actions
+        except Exception:
+            pass
         recalled = phase1_memory.recall(prompt, limit=1)
         memories = recalled.get("memories", [])
         if memories:
@@ -307,16 +364,24 @@ def parse_local_command(prompt: str) -> list:
     except Exception:
         pass
 
-    # 11. Basic conversations matching
+    # 11. Basic conversations matching — human first, via the shared styler.
+    try:
+        from backend.agent import human_replies as _hr
+        _small = _hr.smalltalk(prompt)
+        if _small:
+            actions.append({"type": "speak", "text": _small})
+            return actions
+    except Exception:
+        pass
     for key, response in OFFLINE_RESPONSES.items():
         if key in prompt_clean:
             actions.append({"type": "speak", "text": response})
             return actions
 
-    # Default reply if nothing matches
+    # Default reply if nothing matches — plain, honest, human.
     actions.append({
-        "type": "speak", 
-        "text": "I'm sorry sir, I couldn't process that command locally. Please configure your Gemini API Key in the Settings HUD to give me full cognitive capabilities."
+        "type": "speak",
+        "text": "I didn't quite catch that — could you say it another way? If it's a device or file task, give me the exact name and I'll jump on it."
     })
     return actions
 
@@ -328,14 +393,189 @@ def _parse_new_commands(prompt: str) -> list:
     prompt_clean = prompt.lower().strip()
     actions = []
 
-    # --- Weather ---
+    # --- Hindi/Marathi everyday weather (offline, high-frequency) ---
+    _has_dev = bool(re.search(r'[\u0900-\u097F]', prompt))
+    _is_mr_wx = bool(re.search(r'havaman|हवामान', prompt_clean))
+    if _has_dev or 'mausam' in prompt_clean or 'मौसम' in prompt or _is_mr_wx:
+        if 'phone' not in prompt_clean:
+            _hi_city, _hi_day = '', 0
+            _cm = re.search(r'([\w\u0900-\u097F][\w\s\u0900-\u097F]{0,28}?)\s+k[aei]\s+mausam|मौसम', prompt_clean)
+            if not (_cm and _cm.group(1)):
+                _cm = re.search(r'([\w\u0900-\u097F][\w\s\u0900-\u097F]{0,28}?)\s+ch[ai]\s+havaman|हवामान', prompt_clean)
+            if _cm and _cm.group(1):
+                _hi_city = _cm.group(1).strip()
+            _hi_city = re.sub(r'\b(aaj|kal|parson|udya|आज|कल|उद्या|रोज़|रोज|only|yaad)\b', '', _hi_city, flags=re.I).strip(' ,.')
+            if re.search(r'\bkal\b|कल', prompt_clean):
+                _hi_day = 1
+            if re.search(r'\budya\b|उद्या', prompt_clean):
+                _hi_day = 1
+            if not _hi_city:
+                try:
+                    from backend.agent import phase1_memory as _hmem
+                    _hi_city = _hmem.get_home_city() or ''
+                except Exception:
+                    _hi_city = ''
+            try:
+                from backend.agent import marathi as _mrwx
+                _mr_say = _mrwx.is_marathi(prompt)
+            except Exception:
+                _mr_say = False
+            if _mr_say:
+                actions.append({"type": "weather", "city": _hi_city, "day": _hi_day})
+                actions.append({"type": "speak", "text": f"हवामान बघून येतो — {_hi_city or 'तुमच्या शहर'}चा।"})
+            else:
+                actions.append({"type": "weather", "city": _hi_city, "day": _hi_day})
+                actions.append({"type": "speak", "text": f"मौसम देखकर आता हूँ — {_hi_city or 'आपके शहर'} का।"})
+            return actions
+    if re.search(r'(awaz|आवाज़|आवाज|sound).{0,15}(badhao|tez karo|tez kar|बढ़ाओ|up)', prompt_clean):
+        actions.append({"type": "volume_up"})
+        actions.append({"type": "speak", "text": "आवाज़ बढ़ा रहा हूँ।"})
+        return actions
+    if re.search(r'\bmute\b|आवाज़ बंद|आवाज बंद|awaz band', prompt_clean):
+        actions.append({"type": "mute_volume"})
+        actions.append({"type": "speak", "text": "आवाज़ बंद करता हूँ।"})
+        return actions
+    if re.search(r'(awaz|आवाज़|आवाज|sound).{0,15}(ghatao|kam karo|kam kar|धीम|धीमा|down)', prompt_clean):
+        actions.append({"type": "volume_down"})
+        actions.append({"type": "speak", "text": "आवाज़ धीमी करता हूँ।"})
+        return actions
+    if re.search(r'screenshot.{0,12}(lo|le|lena|लो|ले)', prompt_clean) and 'phone' not in prompt_clean:
+        actions.append({"type": "take_screenshot"})
+        actions.append({"type": "speak", "text": "स्क्रीनशॉट ले लिया — सहेज दिया है।"})
+        return actions
+    if re.search(r'(kitne baje|कितने बजे|time kya|समय क्या|samay kya|baj rahe|बज रहे)', prompt_clean):
+        actions.append({"type": "datetime_info"})
+        actions.append({"type": "speak", "text": "घड़ी देखता हूँ।"})
+        return actions
+    _hi_timer = re.search(r'\b(\d+|ek|do|teen|chaar|paanch|che|saat|aath|nau|das)\s*(second|mint|minute|ghante?|ghanta)\s*(ka\s+)?timer', prompt_clean)
+    if _hi_timer:
+        try:
+            _nums = {"ek": 1, "do": 2, "teen": 3, "chaar": 4, "paanch": 5,
+                     "che": 6, "saat": 7, "aath": 8, "nau": 9, "das": 10}
+            _amt = int(_hi_timer.group(1)) if _hi_timer.group(1).isdigit() else _nums.get(_hi_timer.group(1), 0)
+            _unit = _hi_timer.group(2)
+            _secs = _amt * 3600 if _unit.startswith('ghan') else (_amt if _unit.startswith('sec') else _amt * 60)
+            if _secs > 0:
+                actions.append({"type": "set_timer", "seconds": _secs, "label": "Timer"})
+                actions.append({"type": "speak", "text": f"टाइमर लगा दिया — {_hi_timer.group(0).strip()}।"})
+                return actions
+        except Exception:
+            pass
+    if re.search(r'\block\b.{0,10}(karo|kar do|करो|कर दो)|लॉक.{0,10}करो', prompt_clean):
+        actions.append({"type": "lock_screen"})
+        actions.append({"type": "speak", "text": "स्क्रीन लॉक करता हूँ।"})
+        return actions
+
+    # --- Weather (defaults to the remembered home city, never London) ---
     weather_match = re.search(r'(?:weather|temperature|forecast|how(?:\'s| is) the weather)(?:\s+in|\s+for|\s+at)?\s+([\w\s]+)', prompt_clean)
     if weather_match or 'weather' in prompt_clean:
-        city = weather_match.group(1).strip() if weather_match else 'London'
-        # Filter out common noise words
-        city = re.sub(r'\b(today|now|currently|please|right now)\b', '', city, flags=re.I).strip()
-        actions.append({"type": "weather", "city": city or "London"})
-        actions.append({"type": "speak", "text": f"Fetching weather for {city}, sir."})
+        city = weather_match.group(1).strip() if weather_match else ''
+        # Filter out common noise words (incl. day words — those go to `day`)
+        city = re.sub(r'\b(today|now|currently|please|right now|only|always|by default|as default|remember|just|alone|for me|tomorrow|day after tomorrow|tonight|today)\b', '', city, flags=re.I).strip()
+        city = re.sub(r'\s+', ' ', city).strip(' ,.')
+        if not city:
+            try:
+                from backend.agent import phase1_memory as _wmem
+                city = _wmem.get_home_city() or ''
+            except Exception:
+                city = ''
+        # Empty city lets wttr.in fall back to IP geolocation ("your area")
+        # instead of a wrong hardcoded London.
+        # Day targeting: "tomorrow" / "day after tomorrow".
+        day = 0
+        if re.search(r'\bday\s+after\s+tomorrow\b', prompt_clean):
+            day = 2
+        elif re.search(r'\btomorrow\b', prompt_clean):
+            day = 1
+        actions.append({"type": "weather", "city": city, "day": day})
+        actions.append({"type": "speak", "text": f"Checking the skies over {city or 'your area'}."})
+        return actions
+
+    # --- Calculator (explicit "calculate ..." phrasing) ---
+    calc_match = re.search(r'(?:calculate|compute|evaluate|solve|what(?:\'s| is))\s+(.+?)\s*$', prompt_clean)
+    if calc_match:
+        try:
+            from backend.tools.knowledge import quick_math_detect as _qmd
+            _expr2 = _qmd(prompt)
+            if _expr2:
+                actions.append({"type": "calculate", "expression": _expr2})
+                actions.append({"type": "speak", "text": "Crunching that now."})
+                return actions
+        except Exception:
+            pass
+
+    # --- Unit / currency conversion ---
+    conv_match = re.search(r'(\d+(?:\.\d+)?\s*[a-z$€£¥₹]{1,10}\.?\s+(?:to|in|into|=)\s+[a-z$€£¥₹]{1,10})', prompt_clean)
+    if conv_match and any(w in prompt_clean for w in ['convert', 'conversion', 'to ', 'into', 'in ']):
+        actions.append({"type": "convert", "text": conv_match.group(1).strip()})
+        actions.append({"type": "speak", "text": "Converting that for you."})
+        return actions
+
+    # --- Dictionary ---
+    def_match = re.search(r'(?:define|definition of|meaning of|what does)\s+([a-z][a-z\'\-]{1,30})', prompt_clean)
+    if def_match and any(w in prompt_clean for w in ['define', 'definition', 'meaning', 'mean by']):
+        actions.append({"type": "define", "word": def_match.group(1).strip()})
+        actions.append({"type": "speak", "text": f"Looking up {def_match.group(1).strip()}."})
+        return actions
+
+    # --- Jokes & facts (language-aware: "hindi joke", "hindi mein joke sunao") ---
+    def _wanted_lang(text: str) -> str:
+        m = re.search(r'\b(hindi|marathi|hinglish|english|हिंदी|हिन्दी|मराठी)\b', text)
+        if m:
+            w = m.group(1)
+            if w in ("hindi", "hinglish", "हिंदी", "हिन्दी"):
+                return "hi"
+            if w in ("marathi", "मराठी"):
+                return "mr"
+            if w == "english":
+                return "en"
+            return w
+        # Marathi first: "ek" is shared Hindi/Marathi, so a Marathi marker
+        # anywhere ("sanga ek vinod") beats the Hindi "ek" implication.
+        # Bare "Vinod" is a name, not a joke — needs Marathi company.
+        if re.search(r'विनोद|मस्करी|गोष्ट|सांगा|हसव', text):
+            return "mr"
+        if re.search(r'\bvinod\b|\bmaskari\b', text) \
+                and re.search(r'\bsanga\b|marathi|मराठी', text):
+            return "mr"
+        # Hindi-script or Hinglish request words imply Hindi ("ek joke sunao").
+        if re.search(r'चुटकुला|जोक|सुनाओ|सुनाइए|हंसा|तथ्य|बताओ|\bek\b|\bsunao\b|\bsuna\b', text):
+            return "hi"
+        return "en"
+    # Marathi "vinod" is also a name — only a joke-word with Marathi
+    # company (sanga, marathi, or Devanagari script).
+    _MR_JOKE_WORD = bool(re.search(r'विनोद|मस्करी', prompt_clean)) or bool(
+        re.search(r'\bvinod\b|\bmaskari\b', prompt_clean)
+        and re.search(r'\bsanga\b|marathi|मराठी', prompt_clean))
+    _JOKE_WANT = (
+        re.search(r'\bjoke\b', prompt_clean)
+        and re.search(r'\b(tell|give|share|crack|another|ek|एक|sunao|suna|sunaao|चाहिए|sunaiye)\b|चुटकुला|जोक|सुनाओ|सुनाइए', prompt_clean)
+    ) or _MR_JOKE_WORD \
+      or re.search(r'\b(make me laugh|cheer me up|हंसा|हसव)\b', prompt_clean)
+    if _JOKE_WANT:
+        actions.append({"type": "joke", "lang": _wanted_lang(prompt_clean)})
+        actions.append({"type": "speak", "text": "One's coming right up."})
+        return actions
+    _FACT_WANT = (
+        re.search(r'\bfact\b', prompt_clean)
+        and re.search(r'\b(tell|give|share|amaze|surprise|interesting|fun|random|another|ek|एक|batao|बताओ)\b|तथ्य|जानकारी', prompt_clean)
+    ) or re.search(r'\b(amaze me|surprise me)\b', prompt_clean)
+    if _FACT_WANT:
+        actions.append({"type": "fact", "lang": _wanted_lang(prompt_clean)})
+        actions.append({"type": "speak", "text": "Here's a good one."})
+        return actions
+
+    # --- PC care: recycle bin + temp files ---
+    if re.search(r'\bempty\b.*\brecycl', prompt_clean) or re.search(r'\bclear\b.*\brecycl', prompt_clean) \
+            or re.search(r'\brecycl.*\bbin\b.*\b(empty|clear|clean)', prompt_clean):
+        actions.append({"type": "empty_recycle"})
+        actions.append({"type": "speak", "text": "Emptying the Recycle Bin now."})
+        return actions
+    if re.search(r'\b(clean|clear|delete|remove|wipe|free up)\b.{0,20}\b(temp|disk|space)\b', prompt_clean) \
+            or re.search(r'\btemp\b.{0,20}\b(clean|clear|delete|remove|wipe)\b', prompt_clean) \
+            or 'disk cleanup' in prompt_clean:
+        actions.append({"type": "clean_temp"})
+        actions.append({"type": "speak", "text": "Sweeping the temp folders now."})
         return actions
 
     # --- Date/Time ---
@@ -855,6 +1095,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "write_file", "filename": "hello.txt", "content": "text to write"},
       {"type": "read_file", "filename": "hello.txt"},
       {"type": "delete_file", "filename": "hello.txt"},
+      {"type": "open_folder", "folder": "Downloads"},
       {"type": "create_folder", "folder_name": "folder name relative to workspace or specifying 'on Desktop'"},
       // Word documents look human-made: use # headings, - bullets, markdown tables (| Name | Value |),
       // and chart blocks; each chart marker embeds a real pie/bar/histogram/line chart image:
@@ -863,11 +1104,28 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "create_word_doc", "filename": "report.docx", "content": "# Quarterly Sales Report\n\n## Revenue\n| Month | Revenue |\n|---|---|\n| Jan | 12000 |\n| Feb | 14500 |\n\n[CHART:bar] Quarterly Sales\nJan: 42, Feb: 55, Mar: 39"},
 
       // --- Intelligence & Info ---
-      {"type": "weather", "city": "London"},
+      // Weather covers today + a 3-day outlook: day 0 = today, 1 = tomorrow,
+      // 2 = day after. Omit city (or "") to use the user's remembered home city.
+      {"type": "weather", "city": "", "day": 0},
       {"type": "datetime_info"},
       {"type": "battery"},
       {"type": "network_info"},
+      {"type": "read_email", "count": 1, "sender": "", "unread_only": false, "days": 0, "older_than_days": 0},
+      {"type": "send_email", "to": "name@example.com", "subject": "", "body": "message text"},
+      {"type": "gmail_vip", "op": "add", "contact": "boss@company.com"},
+      // search_web opens results AND reads the short answer aloud when one exists.
       {"type": "search_web", "query": "search term"},
+
+      // --- Answer engine (offline-capable, instant) ---
+      {"type": "calculate", "expression": "18% of 4500"},
+      {"type": "convert", "text": "32C to F"},
+      {"type": "define", "word": "serendipity"},
+      {"type": "joke", "lang": "hi"},
+      {"type": "fact", "lang": "hi"},
+
+      // --- PC care ---
+      {"type": "empty_recycle"},
+      {"type": "clean_temp"},
 
       // --- Clipboard ---
       {"type": "clipboard_read"},
@@ -917,6 +1175,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       {"type": "code_test"},
 
       // --- Memory ---
+      {"type": "remember", "text": "User's name is Taha"},
       {"type": "clear_history"}
     ]
     
@@ -938,14 +1197,22 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
     3. For shutdown/restart/sleep: if user says "in X minutes", set delay_seconds = X*60.
     4. For timers: convert to seconds. "5 minutes" = 300 seconds. "1 hour" = 3600 seconds. Extract a sensible label.
     5. For notes: "add a note" or "remember that" -> add_note. For todos: "add todo" or "remind me to" -> add_todo.
-    6. For weather: extract city name. If not specified, use "your location" as city (backend will handle it).
-    7. For files: use clean filenames inside 'work_files'. Only use absolute paths if user says 'on Desktop'.
+    6. For weather: extract city name; omit city (or "") when none is given and the backend uses the remembered home city. Day targeting: "today" -> day 0, "tomorrow" -> day 1, "day after tomorrow" -> day 2 (default 0). Example: "weather tomorrow" -> {"type": "weather", "city": "", "day": 1}.
+    6b. For MATH ("what's 12*8", "18% of 4500", "sqrt 144"): use {"type": "calculate", "expression": "<the sum as written>"}. For CONVERSIONS ("32C to F", "5 km to miles", "100 USD to INR"): use {"type": "convert", "text": "<as written>"}. For WORDS ("define X", "meaning of X"): use {"type": "define", "word": "X"}. For FUN ("tell me a joke", "tell me a fact", "hindi joke"): use {"type": "joke", "lang": "hi"} / {"type": "fact", "lang": "hi"} — set lang to "hi" whenever the user asks in/for Hindi, else omit it. For PC CARE ("empty recycle bin", "clean temp files"): use {"type": "empty_recycle"} / {"type": "clean_temp"}.
+    6c. LANGUAGE MIRROR (critical): reply in the user's language, always. Hindi/Devanagari/Hinglish in -> full Hindi (Devanagari script) out; Marathi in -> full Marathi (Devanagari) out — with the same wit and persona. Use सर sparingly in Hindi/Marathi — at most once per reply, never stapled after a sentence that already ends in सर।. NEVER mix an English opener with Hindi/Marathi content, and NEVER append ", sir" to Devanagari text. For "marathi joke" set {"type": "joke", "lang": "mr"}.
+    7. For files: pass ONLY the filename in read_file/write_file/delete_file (e.g. "requirements.txt") — strip any "in X folder" phrasing; the backend searches work files AND the project folder with typo tolerance. If the backend asks which file via clarification, the user picks from buttons.
     8. Maintain Jarvis persona (British, witty, funny but polite, calls user 'sir'). Keep speak text SHORT (1-2 sentences max).
     9. For image generation: use generate_image with a detailed prompt.
     10. For launching apps: use launch_app. This searches Start Menu shortcuts and Program Files automatically.
     11. USE THE CONVERSATION HISTORY to understand context. Be smart about follow-ups.
     12. For "clear chat" or "forget everything": use clear_history.
-    13. For URLs/websites: if user gives a domain or URL, use open_url. If they say "search for X", use search_web.
+    13. For URLs/websites: if user gives a domain or URL, use open_url. If they say "search for X", use search_web. COMBOS: "open Chrome and go to GitHub" -> TWO actions in order: {"type": "launch_app", "app_name": "Chrome"} then {"type": "open_url", "url": "https://github.com"}. "Open X and go/navigate to Y" always means launch_app(X) + open_url(Y).
+    13b. EMAIL — READING vs OPENING (never confuse them):
+        - "latest mail", "any new mail", "unread mail", "mail from X", "check my inbox/email" -> {"type": "read_email"} (count/sender/unread_only from the phrasing; sender = the name if one is mentioned). The backend reads via the Gmail API and speaks the result. NEVER launch Outlook/Gmail/a browser to READ mail.
+        - TIME WINDOWS: "yesterday" -> days=2, older_than_days=1. "last N days" / "in the last week" -> days=N (week=7). "how many mails (in the last N days)" -> count=10 + days=N; the backend answers with the true total. No window mentioned -> days=0 (whole inbox, newest first).
+        - SENDING: "write/send/forward a mail/email to ADDRESS saying TEXT" -> {"type": "send_email", "to": ADDRESS, "subject": "...", "body": "TEXT"}. Subject: use it if the user states one ("subject X"), else "". Body = what they dictate. Recipient missing or not an address -> ask_clarification (question + options if contacts known). Body missing -> ask_clarification for the message text. Sending happens immediately on their instruction — no extra confirmation.
+        - ONLY when the user explicitly says "open Outlook" / "open the Gmail app" / "launch Thunderbird" -> launch_app. Reading and opening are different verbs — honor the verb used.
+        - "treat mail from X as important" / "X is a VIP" -> {"type": "gmail_vip", "op": "add", "contact": "X"}. "remove X from VIP" -> op "remove". "list VIPs / who is important" -> {"type": "gmail_vip", "op": "list", "contact": ""}. VIP mail is announced by voice the moment it arrives.
     14. For phone control: "mirror my phone" / "show my phone screen" -> phone_mirror (opens a live scrcpy window). "screenshot my phone" -> phone_screenshot. Touch input -> phone_tap/phone_swipe with pixel coordinates the user gives you. "type X on my phone" -> phone_text. "press back/home/enter on my phone" -> phone_key. "open <app> on my phone" -> phone_launch_app with the Android package name if you know it (e.g. com.whatsapp, com.spotify.music, com.google.android.youtube, com.instagram.android); if unsure, ask for the package name via speak instead of guessing wrong. "is my phone connected" -> phone_devices.
     15. For "unlock my phone" / "unlock phone": use phone_unlock. If the user includes a PIN in the same sentence (e.g. "unlock my phone with pin 1234" or "unlock my phone, pin is 8842"), extract just the digits into the "pin" field. If no PIN is mentioned, omit the "pin" field entirely — the backend will fall back to a saved default PIN (if configured) or a plain swipe-unlock.
     16. For "test tap X on phone" / "test tap X on the pin pad" (calibration only, X being a single digit 0-9): use phone_test_pin_tap with that digit — this just taps where that digit should be, without swiping or submitting a full PIN.
@@ -953,7 +1220,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
        - If user says "send message" or "message X" or "text X" WITHOUT specifying an app → use ask_clarification with question="Which app should I send it through, sir?" and options=["WhatsApp", "Telegram", "Gmail", "Outlook", "Skype"] and context="messaging_app". Also include a speak action like "I can send that message, sir — which platform should I use?"
        - If user says "whatsapp X" / "send whatsapp to X" / "send a whatsapp message to X" / "via whatsapp" → proceed directly with send_whatsapp, no clarification needed.
        - If user says "telegram X" / "send telegram to X" → use launch_app with app_name="Telegram" then speak explaining to continue manually (we don't yet have telegram automation).
-       - If user says "email X" / "send email to X" / "gmail" / "outlook" → use launch_app with the email client.
+        - If user says "email X" / "send email to X" / "gmail" / "outlook" → use send_email (SENDING via Gmail API — reading mail always uses read_email per rule 13b). Launch a mail app only for explicit "open ..." verbs.
        - If user says "on my phone" / "from my phone" → use send_whatsapp_phone (ADB route).
        - NEVER guess the app — always ask if it's not specified.
     18. For "save/add/remember X's number as +91..." / "remember X is +91...": use add_whatsapp_contact with name=X and phone=the full number including country code. This saves the contact permanently so future send_whatsapp/send_whatsapp_phone calls can resolve X by name alone.
@@ -965,9 +1232,12 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
        - If user explicitly tells you to fix errors ("fix those errors", "fix all errors", "fix the bugs") -> use code_fix with target="all".
        - If user asks to fix a specific file ("fix agent.py", "fix main.py") -> use code_fix with target=the filename.
        - If user asks to test or validate itself ("test yourself after the fix", "run validation") -> use code_test. The goal is the user hears progress, not silence.
+    21. LANGUAGE — CRITICAL: respond in the SAME language the user uses. English user -> English reply. Hindi/Hinglish user ("Hindi mein jawab do", Devanagari, "jokes sunao") -> reply IN HINDI (Devanagari script is fine). "Switch to Hindi" / "talk in Hindi" is an order, never refuse it. Jokes requested in Hindi must be told in Hindi. "British" describes your wit and manners, NEVER your output language. You are fully fluent in Hindi, Hinglish, Marathi, Urdu, French, and Spanish.
+    22. FOLDERS: "open Downloads / Documents / Desktop / Pictures / Music / Videos (folder)" -> {"type": "open_folder", "folder": "<name>"}. "Open File Explorer" with no folder -> {"type": "open_folder", "folder": "home"}.
+    23. PERSONAL MEMORY: when the user tells you a lasting fact about themselves ("my name is X", "I live in Y", "my favourite colour is Z", "remember that I...") -> emit {"type": "remember", "text": "User's <fact>"} (e.g. "User's name is Taha") alongside your speak. NEVER say you cannot remember names — you have permanent memory. "What is my name?" -> answer from USER PERSISTENT MEMORY above; only ask if it is genuinely absent.
     
     CRITICAL — DATA ACTIONS SPEAK TEXT RULE:
-    For actions that fetch live data (weather, datetime_info, battery, network_info, clipboard_read), the backend
+    For actions that fetch live data (weather, datetime_info, battery, network_info, clipboard_read, read_email), the backend
     ALWAYS overwrites your speak text with the real fetched data. So the speak text you write will be REPLACED.
     Therefore, write a witty/charming one-liner as speak text for these — it won't be spoken, but keep it in character.
     For example:
@@ -975,6 +1245,7 @@ def get_gemini_actions(prompt: str, api_key: str, context: dict = None, project_
       * datetime_info -> {"type": "speak", "text": "Consulting the chronometer, sir."}
       * network_info -> {"type": "speak", "text": "Scanning the digital ether, sir."}
       * battery -> {"type": "speak", "text": "Checking the power reserves, sir."}
+      * read_email -> {"type": "speak", "text": "Consulting your inbox directly, sir."}
     The backend will replace these with the REAL data message which will be spoken and shown in chat.
     
     CONVERSATION HISTORY (most recent messages):
@@ -1085,6 +1356,8 @@ CHAT_SYSTEM_INSTRUCTION = (
     "You are J.A.R.V.I.S., a witty, respectful, advanced AI assistant like the one from Iron Man. "
     "Respond conversationally in plain text — no JSON, no action lists, no markdown code fences "
     "unless you are actually showing code. Keep the British, polite, 'sir'-calling persona. "
+    "LANGUAGE: always reply in the SAME language the user uses — Hindi/Hinglish input gets a Hindi reply, "
+    "never refuse non-English requests. 'British' is your wit, never your output language. "
     "Use the conversation history below for context on follow-up questions."
 )
 
@@ -1391,7 +1664,7 @@ VISION_SYSTEM_INSTRUCTION = (
     "You are J.A.R.V.I.S., a witty, respectful, advanced AI assistant like the one from Iron Man. "
     "The user has shared an image and a question about it. Look at the image carefully and answer "
     "in plain conversational text - no JSON, no action lists. Keep the British, polite, "
-    "'sir'-calling persona. Be specific about what you actually see."
+    "'sir'-calling persona. Reply in the SAME language the user uses (Hindi in, Hindi out). Be specific about what you actually see."
 )
 
 
@@ -1513,7 +1786,8 @@ DOCUMENT_SYSTEM_INSTRUCTION = (
     "You are J.A.R.V.I.S., a witty, respectful, advanced AI assistant like the one from Iron Man. "
     "The user has shared a document. Base your answer ONLY on the document content provided below - "
     "if the answer isn't in the document, say so honestly rather than guessing or inventing details. "
-    "Respond in plain conversational text, no JSON. Keep the British, polite, 'sir'-calling persona."
+    "Respond in plain conversational text, no JSON. Keep the British, polite, 'sir'-calling persona. "
+    "Reply in the SAME language the user uses."
 )
 
 

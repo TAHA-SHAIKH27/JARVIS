@@ -16,6 +16,13 @@ import uuid
 import threading
 import time
 import sys
+import re
+import faulthandler
+
+# Dump a Python traceback to stderr on a segfault/access violation instead
+# of dying silently (exit 3221225477). The watchdog pipes stderr into
+# watchdog_crash.log, so the next native crash arrives with evidence.
+faulthandler.enable()
 
 # Import local helper modules
 from system_ops import (
@@ -48,6 +55,9 @@ from system_ops import (
     get_weather,
     get_datetime_info,
     open_url,
+    open_folder,
+    empty_recycle_bin,
+    clean_temp_files,
 )
 from agent import get_gemini_actions, generate_image_huggingface, conversation_history, stream_chat_response, stream_gemini_actions, stream_image_analysis, stream_document_analysis
 import document_intel
@@ -468,35 +478,47 @@ _NOTIFICATIONS_LOCK = threading.Lock()
 _GMAIL_WORKER_STARTED = False
 
 
-def _push_notification(kind: str, title: str, body: str, speak: str = "") -> Dict[str, Any]:
+def _push_notification(kind: str, title: str, body: str, speak: str = "",
+                       center_id: str = "") -> Dict[str, Any]:
     item = {"id": str(uuid.uuid4()), "kind": kind, "title": title, "body": body,
-            "speak": speak, "dismissed": False, "ts": time.time()}
+            "speak": speak, "dismissed": False, "ts": time.time(),
+            "center_id": center_id}
     with _NOTIFICATIONS_LOCK:
         _NOTIFICATIONS.append(item)
     return item
 
 
-def _announce_mail(message: Dict[str, Any]) -> None:
-    """Speak + queue one important mail. Best-effort only."""
-    speak_text = message.get("speak") or ""
-    title = f"Important mail from {message.get('from_name', 'Unknown sender')}"
-    _push_notification("gmail", title, str(message.get("subject", "")), speak_text)
+def _announce_mail(message: Dict[str, Any], voice: bool = True) -> None:
+    """Queue one mail arrival: toast + Notification Center always, voice only
+    for important mail (or when explicitly asked). Best-effort only."""
+    speak_text = message.get("speak") or message.get("toast") or ""
+    important = bool(message.get("important"))
+    title = (f"Important mail from {message.get('from_name', 'Unknown sender')}"
+             if important else f"New mail from {message.get('from_name', 'Unknown sender')}")
+    mid = str(message.get("id") or "").strip()
+    center_id = f"gmail:{mid}" if mid else str(uuid.uuid4())
+    _push_notification("gmail", title, str(message.get("subject", "")), speak_text,
+                       center_id=center_id)
     try:
         from backend.agent import notifications as _nc
-        mid = str(message.get("id") or "").strip()
-        _nc.upsert_notification(f"gmail:{mid}" if mid else str(uuid.uuid4()),
+        _nc.upsert_notification(center_id,
                                 "gmail", title, str(message.get("subject", "")),
-                                speak_text, priority="important",
+                                speak_text if voice else "",
+                                priority="important" if important else "normal",
                                 ref_type="gmail", ref_id=mid)
     except Exception as exc:
         print(f"[gmail] persist announce failed: {exc}")
-    if not speak_text:
+    if not voice or not message.get("speak"):
         return
     try:
-        voice = get_voice_system()
-        # Priority 5, no interrupt: announcements wait their turn behind any
-        # active reply instead of cutting it off mid-sentence.
-        voice.speak(speak_text, priority=5, interrupt=False)
+        voice_sys = get_voice_system()
+        # Priority -10, no interrupt: announcements truly wait behind any
+        # active reply AND behind any queued reply (PriorityQueue pops the
+        # highest number first, so a low number sorts last). The old value
+        # of 5 did the opposite — it jumped AHEAD of normal replies
+        # (priority 0), delaying answers and sounding like a duplicate TTS
+        # ~30s later.
+        voice_sys.speak(speak_text, priority=-10, interrupt=False)
     except Exception as exc:
         print(f"[gmail] TTS announce failed: {exc}")
 
@@ -513,8 +535,12 @@ def _gmail_check_cycle(reason: str) -> Dict[str, Any]:
         print("[gmail] Not linked — link Gmail in Settings to enable mail announcements.")
         return result
     for message in result.get("announced", []):
-        _announce_mail(message)
+        _announce_mail(message, voice=True)
         print(f"[gmail] Announced ({reason}): {message.get('from_name', '?')} — "
+              f"{str(message.get('subject', ''))[:80]}")
+    for message in result.get("notified", []):
+        _announce_mail(message, voice=False)
+        print(f"[gmail] Toast ({reason}): {message.get('from_name', '?')} — "
               f"{str(message.get('subject', ''))[:80]}")
     return result
 
@@ -607,6 +633,7 @@ class DismissRequest(BaseModel):
 
 @app.post("/api/notifications/dismiss")
 def dismiss_notification(req: DismissRequest):
+    center_ids: list = []
     with _NOTIFICATIONS_LOCK:
         removed = 0
         for item in _NOTIFICATIONS:
@@ -614,9 +641,21 @@ def dismiss_notification(req: DismissRequest):
                 if not item.get("dismissed"):
                     item["dismissed"] = True
                     removed += 1
+                cid = str(item.get("center_id") or "").strip()
+                if cid:
+                    center_ids.append(cid)
     persistent = {"status": "skipped"}
     if req.id:
-        persistent = _do_center_action("dismiss", req.id)
+        # Toast ids are ephemeral uuids; the linked Notification Center id
+        # lives in center_id. Dismiss both so a toast never resurrects via
+        # the Center badge, and dismissing never 404s on a random uuid.
+        if center_ids:
+            outs = [_do_center_action("dismiss", cid) for cid in center_ids]
+            persistent = outs[0] if outs else {"status": "skipped"}
+            if persistent.get("status") != "success":
+                persistent = _do_center_action("dismiss", req.id)
+        else:
+            persistent = _do_center_action("dismiss", req.id)
     elif req.all:
         try:
             from backend.agent import notifications as _nc
@@ -961,9 +1000,16 @@ def _on_reminder_due(payload: Dict[str, Any]) -> None:
     if not text:
         return
     speak_text = f"Sir, reminder: {text[:200]}."
-    _push_notification("reminder", "Reminder", text[:200], speak_text)
+    rid = ""
     try:
-        get_voice_system().speak(speak_text, priority=5, interrupt=False)
+        rid = str((payload.get("reminder") or {}).get("id") or payload.get("id") or "").strip()
+    except Exception:
+        rid = ""
+    _push_notification("reminder", "Reminder", text[:200], speak_text,
+                       center_id=f"reminder:{rid}" if rid else "")
+    try:
+        # Low priority so live replies always jump ahead of queued reminders.
+        get_voice_system().speak(speak_text, priority=-10, interrupt=False)
     except Exception as exc:
         print(f"[scheduler] reminder TTS failed: {exc}")
 
@@ -978,15 +1024,18 @@ def _send_scheduled_whatsapp(contact: str, message: str) -> Dict[str, Any]:
 def _on_whatsapp_result(job: Dict[str, Any], result: Dict[str, Any]) -> None:
     contact = str(job.get("contact") or "Unknown")
     ok = result.get("status") == "success"
+    jid_early = str(job.get("id") or "").strip()
+    wa_center = f"wa:{jid_early}" if jid_early else ""
     if ok:
         speak_text = f"Scheduled WhatsApp delivered to {contact}, sir."
         _push_notification("whatsapp", "WhatsApp delivered",
                            f"To {contact}: {str(job.get('message') or '')[:120]}",
-                           speak_text)
+                           speak_text, center_id=wa_center)
     else:
         speak_text = (f"Sir, the scheduled WhatsApp to {contact} failed: "
                       f"{str(result.get('message') or 'unknown error')[:160]}")
-        _push_notification("whatsapp", "WhatsApp failed", speak_text, speak_text)
+        _push_notification("whatsapp", "WhatsApp failed", speak_text, speak_text,
+                           center_id=wa_center)
     try:
         from backend.agent import notifications as _nc
         jid = str(job.get("id") or "").strip()
@@ -1001,7 +1050,8 @@ def _on_whatsapp_result(job: Dict[str, Any], result: Dict[str, Any]) -> None:
     except Exception as exc:
         print(f"[scheduler] persist whatsapp result failed: {exc}")
     try:
-        get_voice_system().speak(speak_text, priority=5, interrupt=False)
+        # Low priority so live replies always jump ahead of status chatter.
+        get_voice_system().speak(speak_text, priority=-10, interrupt=False)
     except Exception as exc:
         print(f"[scheduler] whatsapp TTS failed: {exc}")
 
@@ -1018,7 +1068,7 @@ def _ensure_scheduler_worker() -> None:
 _ensure_scheduler_worker()
 
 @app.get("/api/status")
-def read_status():
+async def read_status():
     return {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}
 
 
@@ -1063,20 +1113,25 @@ class TTSRequest(BaseModel):
 
 @app.post("/api/voice/command")
 async def voice_command(req: VoiceCommandRequest):
-    """Endpoint for the native voice service to send recognized commands."""
+    """Endpoint for the native voice service to send recognized commands.
+
+    The classification step is instant (no I/O); the full command runs in a
+    worker thread via asyncio.to_thread so this endpoint never blocks the
+    event loop either (same watchdog-timeout root cause as /api/command).
+    """
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="Empty prompt")
-    
+
     # Get command processor and process the voice command
     processor = get_command_processor()
     processor.set_agent_core(AgentCore())
-    
+
     # Create a temporary task state for context checking
     temp_state = TaskState()
     temp_state.task = getattr(temp_state, 'task', '') or ''
-    
+
     result = await processor.process_command(req.prompt.strip(), temp_state)
-    
+
     if result.get("status") == "interrupted":
         return {"status": "interrupted", "speak": "Interrupted, sir."}
     elif result.get("status") == "mid_task_instruction":
@@ -1084,10 +1139,11 @@ async def voice_command(req: VoiceCommandRequest):
     elif result.get("status") == "task_queued":
         return {"status": "task_queued", "speak": "Noted, sir — queued to run after the current task."}
     elif result.get("status") == "new_command":
-        # Process as new command
+        # Process as new command — process_command is sync (threadpool),
+        # so offload it instead of awaiting a coroutine.
         command_req = CommandRequest(prompt=req.prompt.strip(), apiKey=None)
-        return await process_command(command_req)
-    
+        return await asyncio.to_thread(process_command, command_req)
+
     return result
 
 
@@ -1116,15 +1172,20 @@ async def voice_tts_state():
 
 @app.get("/api/voice/voices")
 async def voice_list():
-    """Installed TTS voices (SAPI) with genders + which one JARVIS uses."""
+    """Installed TTS voices (SAPI) with genders + which one JARVIS uses.
+
+    Reads only worker-maintained state — never touches the SAPI COM object
+    from a request thread (that cross-thread access crashes the backend)."""
     voice = get_voice_system()
     try:
-        current_id = voice._sapi_voice.Voice.Id if voice._sapi_voice is not None else ""
+        ready = voice._sapi_ready
+        if not ready.is_set():
+            await asyncio.to_thread(ready.wait, 8.0)
     except Exception:
-        current_id = ""
+        pass
     return {
         "status": "success",
-        "active_voice_id": current_id,
+        "active_voice_id": getattr(voice, "_active_voice_id", ""),
         "voices": voice.get_available_voices(),
     }
 
@@ -1498,7 +1559,16 @@ def document_stream(req: DocumentAnalysisRequest):
 
 
 @app.post("/api/command")
-async def process_command(req: CommandRequest):
+def process_command(req: CommandRequest):
+    """Sync (threadpool) endpoint — NEVER block the event loop.
+
+    Previously `async def` with blocking Gemini/WhatsApp/phone/screenshot
+    calls inline, which stalled the loop for 10-30s per command. During that
+    window /api/status + watchdog health checks timed out, the UI looked
+    frozen, dismiss POSTs failed, and queued TTS fired late (perceived as a
+    duplicate reply). As a plain `def`, FastAPI runs this in its threadpool
+    so /api/status stays snappy even mid-reply.
+    """
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="Command prompt cannot be empty.")
 
@@ -1534,6 +1604,81 @@ async def process_command(req: CommandRequest):
     except Exception as exc:
         print(f"[scheduler] direct handler failed: {exc}")
 
+    # ── Deterministic identity memory (never LLM-dependent) ──────────────
+    # "My name is Taha" / "I live in Pune" / "Pune only for weather" are
+    # saved here on EVERY command — even offline or rate-limited — so the
+    # facts are already in memory context before the LLM call below.
+    # Name/city QUESTIONS are answered straight from memory too.
+    _memory_note = ""
+    try:
+        from backend.agent import phase1_runtime as _rt
+        _saved = _rt.capture_implicit_memories(req.prompt)
+        if _saved:
+            try:
+                from backend.agent import phase1_memory as _pm
+                _nick = _pm.get_user_name()
+                _city = _pm.get_home_city()
+                _bits = []
+                try:
+                    from backend.agent import marathi as _mmod
+                    _mr_mode = _mmod.is_marathi(req.prompt)
+                except Exception:
+                    _mr_mode = False
+                try:
+                    from backend.agent import hindi as _hmod
+                    _hi_mode = (not _mr_mode) and _hmod.is_hindi(req.prompt)
+                except Exception:
+                    _hi_mode = False
+                for _item in _saved:
+                    _k = str((_item or {}).get("key", "")).casefold()
+                    if _k == "name" and _nick:
+                        _bits.append(f"तुमचं नाव ({_nick}) लक्षात ठेवीन" if _mr_mode
+                                     else f"आपका नाम ({_nick}) याद रखूँगा" if _hi_mode
+                                     else f"noted your name ({_nick})")
+                    elif _k in ("default city", "weather city", "city", "location",
+                                "home city") and _city:
+                        _bits.append(f"{_city} — हवामान तिथलंच सांगेन" if _mr_mode
+                                     else f"{_city} — मौसम वहीं का बताऊँगा" if _hi_mode
+                                     else f"locked in {_city} for weather")
+                if _bits:
+                    _memory_note = ("नोंदवलं — " if _mr_mode
+                                    else "नोट किया — " if _hi_mode else "Noted — ") \
+                        + (" आणि ".join(_bits) if _mr_mode else " और ".join(_bits)) \
+                        + ("।" if (_mr_mode or _hi_mode) else ".")
+            except Exception:
+                pass
+        _mem_answer = _rt.answer_from_memory(req.prompt)
+        if _mem_answer:
+            try:
+                import agent as _agent_mod
+                _agent_mod.add_to_history("user", req.prompt)
+                _agent_mod.add_to_history("assistant", _mem_answer)
+            except Exception:
+                pass
+            try:
+                _rt.runtime.conversation.add("user", req.prompt, {"intent": "question"})
+                _rt.runtime.conversation.add("assistant", _mem_answer, {})
+            except Exception:
+                pass
+            try:
+                from backend.agent.lang_detect import detect_lang as _dl
+                _mem_lang = _dl(_mem_answer, req.prompt)
+            except Exception:
+                _mem_lang = "en"
+            return {
+                "speak": _mem_answer,
+                "speak_lang": _mem_lang,
+                "logs": [f"INPUT RECEIVED: \"{req.prompt}\"", "MEMORY: Answered from stored memory"],
+                "file_data": None,
+                "refresh_files": False,
+                "image_data": None,
+                "timer_data": None,
+                "clarification_needed": None,
+                "narration_steps": [],
+            }
+    except Exception as exc:
+        print(f"[memory] deterministic handler failed: {exc}")
+
     # Load config once
     config = load_config()
     api_key_to_use = req.apiKey or config.get("gemini_api_key")
@@ -1543,11 +1688,30 @@ async def process_command(req: CommandRequest):
     # Gather files context
     files_context = list_files()
 
-    # Run blocking Gemini network call in a thread pool so we don't block the event loop
-    loop = asyncio.get_event_loop()
-    actions = await loop.run_in_executor(
-        None, get_gemini_actions, req.prompt, api_key_to_use, files_context, gemini_project_id
-    )
+    # Sync endpoint => already on a worker thread, direct blocking call is fine
+    # and keeps the asyncio event loop free for /api/status + watchdog.
+    actions = get_gemini_actions(req.prompt, api_key_to_use, files_context, gemini_project_id)
+
+    # Home-city override: a bare "weather" (or the model's example-biased
+    # "London" / "your location") resolves to the remembered default city.
+    # An explicitly named city always wins and is left untouched.
+    try:
+        if isinstance(actions, list):
+            _home = ""
+            try:
+                from backend.agent import phase1_memory as _pm2
+                _home = (_pm2.get_home_city() or "").strip()
+            except Exception:
+                _home = ""
+            if _home:
+                for _a in actions:
+                    if isinstance(_a, dict) and _a.get("type") == "weather":
+                        _c = str(_a.get("city", "") or "").strip()
+                        if _c.casefold() in ("", "london", "your location",
+                                              "my location", "here", "local"):
+                            _a["city"] = _home
+    except Exception:
+        pass
     
     execution_logs = []
     speak_text = ""
@@ -1560,7 +1724,16 @@ async def process_command(req: CommandRequest):
     execution_logs.append(f"INPUT RECEIVED: \"{req.prompt}\"")
     
     for action in actions:
-        act_type = action.get("type", "unknown")
+        # A malformed action (e.g. a bare string from the model) must never
+        # 500 the whole command into a bare "Command failed".
+        if not isinstance(action, dict):
+            execution_logs.append(f"ACTION: Skipping malformed action {str(action)[:80]}")
+            continue
+        try:
+            act_type = action.get("type", "unknown")
+        except Exception:
+            execution_logs.append("ACTION: Skipping unreadable action")
+            continue
         
         if act_type == "speak":
             speak_text = action.get("text", "")
@@ -1628,11 +1801,88 @@ async def process_command(req: CommandRequest):
             speak_text = res["message"]
 
         elif act_type == "weather":
-            city = action.get("city", "London")
-            execution_logs.append(f"ACTION: Fetching weather for {city}")
-            res = get_weather(city)
+            city = (action.get("city", "") or "").strip()
+            if not city:
+                try:
+                    from backend.agent import phase1_memory as _wmem
+                    city = _wmem.get_home_city() or ""
+                except Exception:
+                    city = ""
+            try:
+                day = int(action.get("day", 0) or 0)
+            except (TypeError, ValueError):
+                day = 0
+            execution_logs.append(f"ACTION: Fetching weather for {city or 'home city'} (day+{day})")
+            res = get_weather(city, day)
             execution_logs.append(f"RESULT: {res['message']}")
             # Always override with actual weather data (replaces any prior 'retrieving' placeholder)
+            speak_text = res["message"]
+
+        elif act_type == "calculate":
+            expr = str(action.get("expression", "") or "")
+            execution_logs.append(f"ACTION: Calculating \"{expr[:80]}\"")
+            try:
+                from backend.tools import knowledge as _know
+                res = _know.calculate(expr or req.prompt)
+            except Exception as exc:
+                res = {"status": "error", "message": f"Couldn't crunch that: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "Couldn't crunch that.")
+
+        elif act_type == "convert":
+            ctext = str(action.get("text", "") or "")
+            execution_logs.append(f"ACTION: Converting \"{ctext[:80]}\"")
+            try:
+                from backend.tools import knowledge as _know
+                res = _know.convert_units(ctext or req.prompt)
+            except Exception as exc:
+                res = {"status": "error", "message": f"Couldn't convert that: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "Couldn't convert that.")
+
+        elif act_type == "define":
+            word = str(action.get("word", "") or "")
+            execution_logs.append(f"ACTION: Defining \"{word[:40]}\"")
+            try:
+                from backend.tools import knowledge as _know
+                res = _know.define_word(word or req.prompt)
+            except Exception as exc:
+                res = {"status": "error", "message": f"Dictionary lookup failed: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "Couldn't define that.")
+
+        elif act_type == "joke":
+            joke_lang = str(action.get("lang", "") or "")
+            execution_logs.append(f"ACTION: Telling a joke (lang={joke_lang or 'en'})")
+            try:
+                from backend.tools import knowledge as _know
+                res = _know.get_joke(joke_lang or "en")
+            except Exception:
+                res = {"status": "success", "message": "Why do programmers prefer dark mode? Because light attracts bugs."}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "")
+
+        elif act_type == "fact":
+            fact_lang = str(action.get("lang", "") or "")
+            execution_logs.append(f"ACTION: Sharing a fact (lang={fact_lang or 'en'})")
+            try:
+                from backend.tools import knowledge as _know
+                res = _know.get_fact(fact_lang or "en")
+            except Exception:
+                res = {"status": "success", "message": "Honey never spoils — 3,000-year-old pots found in tombs were still edible."}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "")
+
+        elif act_type == "empty_recycle":
+            execution_logs.append("ACTION: Emptying Recycle Bin")
+            res = empty_recycle_bin()
+            execution_logs.append(f"RESULT: {res['message']}")
+            speak_text = res["message"]
+
+        elif act_type == "clean_temp":
+            execution_logs.append("ACTION: Cleaning temp folders")
+            res = clean_temp_files()
+            execution_logs.append(f"RESULT: {res['message']}")
             speak_text = res["message"]
 
         elif act_type == "datetime_info":
@@ -1641,6 +1891,76 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"RESULT: {res['message']}")
             # Always override with actual datetime data
             speak_text = res["message"]
+
+        elif act_type == "read_email":
+            try:
+                count = int(action.get("count", 1))
+            except (TypeError, ValueError):
+                count = 1
+            sender = (action.get("sender", "") or "").strip()
+            unread_only = bool(action.get("unread_only", False))
+            try:
+                days = int(action.get("days", 0) or 0)
+            except (TypeError, ValueError):
+                days = 0
+            try:
+                older_than_days = int(action.get("older_than_days", 0) or 0)
+            except (TypeError, ValueError):
+                older_than_days = 0
+            execution_logs.append(
+                f"ACTION: Reading mail via Gmail API "
+                f"(count={count}, sender={sender or 'any'}, "
+                f"unread_only={unread_only}, days={days})")
+            try:
+                from backend.tools import gmail_notify
+                # Sync endpoint => direct call (already off the event loop).
+                res = gmail_notify.read_latest_mail(
+                    count, sender, unread_only, days, older_than_days)
+            except Exception as exc:
+                res = {"status": "error",
+                       "message": f"Couldn't reach Gmail, sir: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            # Always override with the real mail content — read aloud, never
+            # by opening an app.
+            speak_text = res.get("message", "Couldn't read your mail, sir.")
+
+        elif act_type == "send_email":
+            to = (action.get("to", "") or "").strip()
+            subject = (action.get("subject", "") or "").strip()
+            body = (action.get("body", "") or "").strip()
+            execution_logs.append(f"ACTION: Sending mail to \"{to}\"")
+            try:
+                from backend.tools import gmail_notify
+                res = gmail_notify.send_email(to, subject, body)
+            except Exception as exc:
+                res = {"status": "error",
+                       "message": f"Couldn't send that mail, sir: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            speak_text = res.get("message", "Couldn't send that mail, sir.")
+
+        elif act_type == "gmail_vip":
+            op = (action.get("op", "add") or "add").strip().lower()
+            contact = (action.get("contact", "") or "").strip()
+            execution_logs.append(f"ACTION: Gmail VIP {op} \"{contact}\"")
+            try:
+                from backend.tools import gmail_notify
+                if op == "remove":
+                    res = gmail_notify.remove_vip(contact)
+                elif op == "list":
+                    vips = gmail_notify.load_watch().get("vip_senders", [])
+                    res = {"status": "success",
+                           "message": ("No VIP senders yet, sir — say 'treat mail "
+                                       "from X as important' to add one.")
+                           if not vips else
+                           "Your VIP senders, sir: " + ", ".join(vips) + "."}
+                else:
+                    res = gmail_notify.add_vip(contact)
+            except Exception as exc:
+                res = {"status": "error",
+                       "message": f"Couldn't update VIPs, sir: {exc}"}
+            execution_logs.append(f"RESULT: {res.get('message', '')[:200]}")
+            if not speak_text:
+                speak_text = res.get("message", "")
 
         elif act_type == "open_url":
             url = action.get("url", "")
@@ -1682,25 +2002,62 @@ async def process_command(req: CommandRequest):
             todos.append(todo)
             _save_json_list(TODOS_FILE, todos)
             execution_logs.append(f"RESULT: Todo added")
+
+        elif act_type == "remember":
+            mem_text = (action.get("text", "") or "").strip()
+            execution_logs.append(f"ACTION: Storing memory \"{mem_text[:80]}\"")
+            # Guard: questions are NOT facts ("tumhara naam kya hai?" must
+            # never be stored as a memory, nor spoken back as one).
+            _is_question = (not mem_text or mem_text.rstrip().endswith("?")
+                            or bool(re.search(
+                                r"\b(kya|kaun|kab|kahan|kaise|kitna|what|who|whom|whose|which|when|where|why|how)\b",
+                                mem_text, re.I)))
+            if _is_question:
+                # Logged as MEMORY: (not RESULT:) so it can never leak into
+                # the spoken reply via the humanize result extractor.
+                execution_logs.append(
+                    f"MEMORY: Skipped save — question, not a fact: \"{mem_text[:80]}\"")
+            else:
+                try:
+                    from backend.agent import phase1_memory
+                    saved = phase1_memory.remember(
+                        mem_text, category="general", source="jarvis-command")
+                    # Internal status only (MEMORY:, not RESULT:) — the user
+                    # hears Gemini's speak line, never "Memory stored (ok)".
+                    execution_logs.append(
+                        f"MEMORY: Stored ({saved.get('status', 'ok')}): \"{mem_text[:80]}\"")
+                except Exception as exc:
+                    execution_logs.append(f"MEMORY: Store failed: {exc}")
             
             
         elif act_type == "open_app":
             app_name = action.get("app_name", "")
             execution_logs.append(f"ACTION: Opening application \"{app_name}\"")
-            res = launch_any_app(app_name)
+            res = launch_any_app(app_name) or {"status": "error",
+                "message": f"Couldn't launch {app_name}, sir."}
             execution_logs.append(f"RESULT: {res['message']}")
             
         elif act_type == "close_app":
             app_name = action.get("app_name", "")
             execution_logs.append(f"ACTION: Closing application \"{app_name}\"")
-            res = close_application(app_name)
+            res = close_application(app_name) or {"status": "error",
+                "message": f"Couldn't close {app_name}, sir."}
             execution_logs.append(f"RESULT: {res['message']}")
 
         elif act_type == "launch_app":
             app_name = action.get("app_name", "")
             execution_logs.append(f"ACTION: Launching application \"{app_name}\"")
-            res = launch_any_app(app_name)
+            res = launch_any_app(app_name) or {"status": "error",
+                "message": f"Couldn't launch {app_name}, sir."}
             execution_logs.append(f"RESULT: {res['message']}")
+
+        elif act_type == "open_folder":
+            target = action.get("folder", action.get("path", ""))
+            execution_logs.append(f"ACTION: Opening folder \"{target}\"")
+            res = open_folder(target)
+            execution_logs.append(f"RESULT: {res['message']}")
+            if not speak_text:
+                speak_text = res["message"]
             
         elif act_type == "write_file":
             filename = action.get("filename", "")
@@ -1720,12 +2077,29 @@ async def process_command(req: CommandRequest):
                     "filename": res["filename"],
                     "content": res["content"]
                 }
+                if not speak_text and res.get("message"):
+                    speak_text = res["message"]
+            elif res["status"] == "clarify":
+                clarification_needed = {
+                    "question": res["message"],
+                    "context": "read_file",
+                    "options": res.get("options", []),
+                }
+                speak_text = res["message"]
                 
         elif act_type == "delete_file":
             filename = action.get("filename", "")
             execution_logs.append(f"ACTION: Deleting file \"{filename}\"")
             res = delete_file(filename)
             execution_logs.append(f"RESULT: {res['message']}")
+            if res["status"] == "clarify":
+                clarification_needed = {
+                    "question": res["message"],
+                    "context": "delete_file",
+                    "options": res.get("options", []),
+                }
+            if not speak_text:
+                speak_text = res["message"]
             refresh_files = True
             
         elif act_type == "take_screenshot":
@@ -1736,6 +2110,26 @@ async def process_command(req: CommandRequest):
             
         elif act_type == "show_stats":
             execution_logs.append("ACTION: Loading HUD diagnostics...")
+            try:
+                stats = get_system_stats()
+                if isinstance(stats, dict) and "error" not in stats:
+                    procs = stats.get("processes", []) or []
+                    # Name the hungriest apps first so "what's running" gets a real answer.
+                    top = ", ".join(
+                        p.get("name", "?") for p in procs[:5] if p.get("name")
+                    ) or "no processes sampled"
+                    speak_text = (
+                        f"CPU at {stats.get('cpu', '?')} percent, memory at "
+                        f"{stats.get('memory', '?')} percent, disk at "
+                        f"{stats.get('disk', '?')} percent, sir. "
+                        f"Busiest applications: {top}."
+                    )
+                    execution_logs.append(f"RESULT: {speak_text}")
+                else:
+                    speak_text = "I couldn't sample the system stats, sir."
+            except Exception as exc:
+                speak_text = f"Diagnostics failed, sir: {exc}"
+                execution_logs.append(f"RESULT: {speak_text}")
 
         elif act_type == "create_folder":
             folder_name = action.get("folder_name", "")
@@ -1792,6 +2186,10 @@ async def process_command(req: CommandRequest):
             execution_logs.append(f"ACTION: Searching web for \"{query}\"")
             res = search_web(query)
             execution_logs.append(f"RESULT: {res['message']}")
+            # Speak the short answer aloud when one was found (browser
+            # still opens for depth) — searching now answers, not just shows.
+            if res.get("status") == "success" and res.get("answer"):
+                speak_text = res["message"]
 
         elif act_type == "generate_image":
             img_prompt = action.get("prompt", "")
@@ -2004,21 +2402,85 @@ async def process_command(req: CommandRequest):
 
         else:
             execution_logs.append(f"ACTION: Unknown command type \"{act_type}\"")
-            
+            execution_logs.append(
+                f"RESULT: Skipped — no handler for \"{act_type}\".")
+            if not speak_text:
+                speak_text = (
+                    "I understood the words, sir, but that particular trick "
+                    "isn't wired up yet.")
     # Default fallback if no voice response was generated
     if not speak_text:
         speak_text = "I have completed your request, sir."
+
+    # ── Human polish: make every reply sound like a real human butler ──
+    # Facts (times, temps, paths, mail bodies) are preserved verbatim;
+    # only the framing gets warmed up. Never breaks the reply.
+    try:
+        from backend.agent import human_replies as _hr
+        # Smalltalk first (hi / thanks / morning…) — no tools needed.
+        _small = _hr.smalltalk(req.prompt)
+        # Last non-speak action decides the human category; its RESULT
+        # message carries the facts. Gemini's speak is the personality.
+        _gemini_speak = ""
+        _last_tool = ""
+        _last_result = ""
+        try:
+            for _a in (actions or []):
+                if isinstance(_a, dict) and _a.get("type") == "speak" and not _gemini_speak:
+                    _gemini_speak = str(_a.get("text", "") or "")
+        except Exception:
+            pass
+        # Internal-only statuses must NEVER reach the spoken reply
+        # (this is what once leaked "Memory stored (success)" into chat).
+        _INTERNAL_RESULTS = ("memory stored", "memory store failed",
+                             "memory saved", "action: skipping")
+        try:
+            for _line in reversed(execution_logs or []):
+                if isinstance(_line, str) and _line.startswith("RESULT:"):
+                    _cand = _line[len("RESULT:"):].strip()
+                    if _cand.casefold().startswith(_INTERNAL_RESULTS):
+                        continue
+                    _last_result = _cand
+                    break
+        except Exception:
+            pass
+        try:
+            for _a in reversed(actions or []):
+                if isinstance(_a, dict) and _a.get("type") not in ("speak", "unknown"):
+                    _last_tool = str(_a.get("type", "") or "")
+                    break
+        except Exception:
+            pass
+        if _small and not _last_tool:
+            speak_text = _small
+        elif clarification_needed:
+            # Questions to the user stay exactly as asked (plus gentle frame).
+            pass
+        else:
+            speak_text = _hr.humanize_normal(_last_tool, _gemini_speak or speak_text, _last_result or speak_text, req.prompt)
+    except Exception:
+        pass
+
+    # Confirm freshly stored identity facts (once — never stacked twice).
+    try:
+        if _memory_note and _memory_note.casefold() not in (speak_text or "").casefold():
+            speak_text = f"{_memory_note} {speak_text}".strip()
+    except Exception:
+        pass
 
     # Collect extra structured data for the frontend
     timer_data = None
     weather_data_out = None
     for action in actions:
-        if action.get("type") == "set_timer":
-            timer_data = {
-                "seconds": int(action.get("seconds", 60)),
-                "label": action.get("label", "Timer")
-            }
-        if action.get("type") == "weather":
+        if isinstance(action, dict) and action.get("type") == "set_timer":
+            try:
+                timer_data = {
+                    "seconds": int(action.get("seconds", 60)),
+                    "label": action.get("label", "Timer")
+                }
+            except Exception:
+                timer_data = {"seconds": 60, "label": "Timer"}
+        if isinstance(action, dict) and action.get("type") == "weather":
             city = action.get("city", "London")
             # Already fetched above; grab from last weather result if available
         

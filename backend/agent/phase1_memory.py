@@ -33,9 +33,43 @@ _MEMORY_PREFIX_REGEX = re.compile(
     r"don't\s+forget\s+that|don't\s+forget|do\s+not\s+forget\s+that|do\s+not\s+forget|"
     r"keep\s+in\s+mind\s+that|keep\s+in\s+mind|"
     r"save\s+(?:this\s+)?to\s+memory:?|save\s+to\s+memory:?|"
-    r"note\s+that|note:?)\s*",
+    r"note\s+that|note:?|"
+    r"yaad\s+rakhna:?|yaad\s+rakho:?|yaad\s+rakh:?|yaad\s+rakhiye:?|"
+    r"याद\s+रखना:?|याद\s+रखो:?|याद\s+रख:?|याद\s+रखिए:?)\s*",
     re.IGNORECASE,
 )
+
+# Trailing imperatives humans append AFTER the fact ("i live in pune,
+# remember it"). These must never end up stored in the value — they are
+# the reason a "pune remember it" record can poison weather/name lookups.
+_TRAILING_JUNK_REGEX = re.compile(
+    r"\s+(?:please\s+)?(?:remember(?:\s+it|\s+this|\s+that)?|"
+    r"don't\s+forget(?:\s+it|\s+this|\s+that)?|"
+    r"do\s+not\s+forget(?:\s+it|\s+this|\s+that)?|"
+    r"keep\s+(?:it\s+|this\s+|that\s+)?in\s+mind|"
+    r"note\s+it\s+down|for\s+future(?:\s+reference)?|ok(?:ay)?)"
+    r"\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+# Trailing filler words in Hindi/Hinglish/Marathi name+city statements.
+_TRAILING_FILLER_REGEX = re.compile(
+    r"\s+(?:hai|hain|he|aahe|ahe|please|plz|na|ji)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _scrub_trailing(text: str) -> str:
+    """Remove trailing memory imperatives + filler so values stay clean."""
+    t = (text or "").strip()
+    for _ in range(3):  # suffixes can stack ("pune, remember it please")
+        new = _TRAILING_JUNK_REGEX.sub("", t).strip()
+        new = _TRAILING_FILLER_REGEX.sub("", new).strip()
+        new = new.rstrip(",.!?; ").strip()
+        if new == t:
+            break
+        t = new
+    return t
 
 
 def _memory_path() -> str:
@@ -76,6 +110,17 @@ def _load() -> List[Dict[str, Any]]:
             item.setdefault("value", normalized["value"])
             if not item.get("text"):
                 item["text"] = normalized["text"]
+        # Heal polluted values in memory ("pune remember it" -> "pune").
+        # Persisted on the next remember() save; reads are clean immediately.
+        try:
+            raw_val = str(item.get("value", "") or "")
+            clean_val = _scrub_trailing(raw_val)
+            if clean_val != raw_val and clean_val:
+                item["value"] = clean_val
+                key = str(item.get("key", "") or "")
+                item["text"] = f"{key}: {clean_val}" if key else clean_val
+        except Exception:
+            pass
 
     return items
 
@@ -130,8 +175,27 @@ def _normalize_memory(text: str) -> Dict[str, str]:
     # Strip conversational prefixes ("Remember that", "Please remember", etc.)
     stripped = _MEMORY_PREFIX_REGEX.sub("", cleaned).strip()
     stripped = stripped.rstrip(".!?; ")
+    # Strip trailing imperatives ("...remember it", "...don't forget") so
+    # they never pollute the stored value.
+    stripped = _scrub_trailing(stripped)
     if not stripped:
         stripped = cleaned
+
+    # 0. Explicit name statements (highest priority — must beat generic splits).
+    # Handles: "my name is Taha", "my name's Taha", "call me Taha",
+    # "user's name is Taha" (LLM phrasing), "mera naam Taha hai",
+    # "maza naav Taha aahe".
+    match = re.match(
+        r"^(?:my\s+name\s+(?:is|'s)|call\s+me|the\s+user'?s\s+name\s+is|"
+        r"user'?s\s+name\s+is|mera\s+naam(?:\s+hai)?|maza\s+naav)\s+(.+)$",
+        stripped, re.I)
+    if match:
+        value = _scrub_trailing(_clean_text(match.group(1)))
+        # "mera naam Taha hai" / "maza naav Taha aahe" leave the verb behind.
+        value = re.sub(r"\s+(?:hai|hain|aahe|ahe)$", "", value, flags=re.I).strip()
+        value = value.rstrip(".!?; ").strip()
+        if value and value.casefold() not in ("it", "this", "that"):
+            return {"text": f"name: {value}", "key": "name", "value": value}
 
     # 1. Pre-formatted "key: value" or "key = value"
     match = re.match(r"^([a-z0-9\s'_/-]+?)\s*[:=]\s*(.+)$", stripped, re.I)
@@ -185,8 +249,16 @@ def _tokens(text: str) -> set[str]:
     return {word for word in words if word not in _STOP_WORDS and len(word) > 1}
 
 
+_META_COMMENTARY_RE = re.compile(
+    r"^\s*user\s+(asked|said|wants|wanted|is\s+asking|asked\s+me)\b", re.I)
+
+
 def remember(text: str, category: str = "general", source: str = "user", source_text: Optional[str] = None) -> Dict[str, Any]:
     """Persist an explicit memory in normalized, structured, and searchable form."""
+    # Guard: meta-commentary about the conversation ("User asked my name in
+    # Hindi") is not a fact — refuse it everywhere, for every caller.
+    if _META_COMMENTARY_RE.search(text or ""):
+        return {"status": "error", "message": "Not a storable fact (meta-commentary)."}
     original = _clean_text(text)
     raw_source = _clean_text(source_text or text)
     category = (category or "general").strip().lower()
@@ -333,3 +405,51 @@ def memory_context(query: str = "", limit: int = 8) -> str:
     if not memories:
         return "No stored memories relevant to this task."
     return "\n".join(f"- [{m.get('category', 'general')}] {m.get('text', '')}" for m in memories)
+
+
+_HOME_CITY_KEYS = ("default city", "weather city", "city", "home city", "location", "hometown")
+
+
+def get_user_name() -> str:
+    """The remembered user name, or '' when unknown. Never raises."""
+    try:
+        with _LOCK:
+            items = _load()
+        for item in items:
+            try:
+                if str(item.get("key", "")).casefold() == "name":
+                    val = _scrub_trailing(str(item.get("value", "") or "").strip())
+                    if val:
+                        return val
+            except Exception:
+                continue
+        return ""
+    except Exception:
+        return ""
+
+
+def get_home_city() -> str:
+    """The remembered home/default weather city, or '' when unknown.
+
+    Priority: explicit default/weather city first, then plain city, then
+    location. Values are scrubbed at read time so old polluted records
+    ("pune remember it") still resolve to the real city.
+    """
+    try:
+        with _LOCK:
+            items = _load()
+        by_key = {}
+        for item in items:
+            try:
+                key = str(item.get("key", "")).casefold()
+                val = _scrub_trailing(str(item.get("value", "") or "").strip())
+                if key and val and key not in by_key:
+                    by_key[key] = val
+            except Exception:
+                continue
+        for key in _HOME_CITY_KEYS:
+            if by_key.get(key):
+                return by_key[key]
+        return ""
+    except Exception:
+        return ""

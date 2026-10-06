@@ -32,7 +32,9 @@ def _pick(options: list) -> str:
 
 
 def _has_sir(text: str) -> bool:
-    return bool(re.search(r"\bsir\b", (text or ""), re.I))
+    # English "sir" AND Devanagari "सर" both count — otherwise Hindi replies
+    # ending in "…सर।" get a mangled ", sir" stapled on ("…सर।, sir").
+    return bool(re.search(r"\bsir\b|सर", (text or ""), re.I))
 
 
 def _with_sir(text: str, prob: float = 0.35) -> str:
@@ -95,6 +97,12 @@ _OPENERS = {
     "code": ["On the code now", "Diving into the source", "Reviewing the codebase"],
     "reminder": ["Locked in", "I'll remind you", "Set — I won't forget"],
     "schedule": ["Scheduled", "Queued up", "Locked into the diary"],
+    "calc": ["Crunching done", "Numbers are in", "Worked that out"],
+    "convert": ["Converted", "Done — converted", "Here's the conversion"],
+    "define": ["Word looked up", "Dictionary says", "Found it"],
+    "joke": ["Here's one for you", "Fresh from the humour circuits", "This one always lands"],
+    "fact": ["Did you know", "Here's a good one", "Filing this under fascinating"],
+    "clean": ["All clean", "Swept and sorted", "Tidied up"],
     "greeting": ["Always a pleasure", "At your service", "Good to hear from you"],
 }
 
@@ -198,6 +206,18 @@ def humanize_normal(action_type: str = "", gemini_speak: str = "",
             cat = "note"
         elif k in ("add_todo",):
             cat = "todo"
+        elif k in ("calculate",):
+            cat = "calc"
+        elif k in ("convert",):
+            cat = "convert"
+        elif k in ("define",):
+            cat = "define"
+        elif k in ("joke",):
+            cat = "joke"
+        elif k in ("fact",):
+            cat = "fact"
+        elif k in ("empty_recycle", "clean_temp"):
+            cat = "clean"
         elif k in ("remember", "clear_history"):
             cat = "memory"
         elif k in ("send_whatsapp", "send_whatsapp_phone", "add_whatsapp_contact"):
@@ -209,10 +229,61 @@ def humanize_normal(action_type: str = "", gemini_speak: str = "",
         elif k in ("reminder", "schedule", "snooze", "reschedule"):
             cat = "reminder"
 
+        # Internal-only statuses must NEVER be spoken or blended, no matter
+        # which caller passes them ("Memory stored (success)" once leaked
+        # into chat here). Drop them as if there were no result at all.
+        if (result_message or "").strip().casefold().startswith(
+                ("memory stored", "memory store failed", "memory saved",
+                 "action: skipping")):
+            result_message = ""
+
+        # Performance content (jokes, facts) is a complete act — speak it
+        # VERBATIM. Never blend intros, never append openers, never add sir:
+        # any of that lands mid-punchline ("…सर।, sir").
+        if cat in ("joke", "fact") and result_message:
+            return _strip_robotic_prefix(result_message).strip()
+
+        # Full Hindi/Marathi mode: the user speaks Hindi or Marathi, so the
+        # WHOLE reply is framed in that language — English openers/leads
+        # would read wrong, and an English ", sir" must never land on
+        # Devanagari text.
+        _HI_DATA_CATS = {"weather", "datetime", "battery", "network", "stats",
+                         "clipboard", "mail_read", "mail_send", "file_read",
+                         "define", "calc", "convert"}
+        try:
+            _ulang = _conv_lang(prompt, gemini_speak, result_message)
+        except Exception:
+            _ulang = "en"
+        if _ulang in ("hi", "mr"):
+            try:
+                if result_message:
+                    clean = _strip_robotic_prefix(result_message)
+                    if _ulang == "mr":
+                        from backend.agent import marathi as _mm
+                        mapped = _map_tool_error_mr(clean)
+                        if mapped:
+                            return mapped
+                        if cat in _HI_DATA_CATS:
+                            return _mm.mr_lead(cat, clean)
+                        return _mm.mr_wrap(cat, clean)
+                    from backend.agent import hindi as _hm
+                    mapped = _map_tool_error_hi(clean)
+                    if mapped:
+                        return mapped
+                    if cat in _HI_DATA_CATS:
+                        return _hm.hi_lead(cat, clean)
+                    return _hm.hi_wrap(cat, clean)
+                if gemini_speak:
+                    return gemini_speak.strip()
+                return "झालं।" if _ulang == "mr" else "हो गया।"
+            except Exception:
+                pass
+
         # Data-heavy results (weather/time/battery/network/mail/clipboard/
         # stats) already contain the real numbers — frame them, don't rewrite.
         data_cats = {"weather", "datetime", "battery", "network", "stats",
-                     "clipboard", "mail_read", "mail_send", "file_read"}
+                     "clipboard", "mail_read", "mail_send", "file_read",
+                     "define", "calc", "convert"}
         if cat in data_cats and result_message:
             clean = _strip_robotic_prefix(result_message)
             # Keep the data verbatim; add a one-line human lead when the
@@ -229,6 +300,9 @@ def humanize_normal(action_type: str = "", gemini_speak: str = "",
                 "mail_read": _pick(["From your inbox", "Here's your mail", "Inbox report"]),
                 "mail_send": _pick(["Mail update", "Done", "Sent"]),
                 "file_read": _pick(["Here's the file", "Pulled that up", "Contents below"]),
+                "define": _pick(["Dictionary says", "Word looked up", "Here's the word"]),
+                "calc": _pick(["Crunching done", "The answer is", "Numbers are in"]),
+                "convert": _pick(["Converted", "Here's the conversion", "Done"]),
             }
             lead = leads.get(cat, "Here's the result")
             out = f"{lead}: {clean}"
@@ -305,9 +379,112 @@ def humanize_agent(task: str = "", completed: int = 0, total: int = 0,
         return (summary or "").strip() or "Done, sir."
 
 
-def humanize_error(kind: str = "", detail: str = "") -> str:
+def _conv_lang(*texts: str) -> str:
+    """Conversation language: 'mr' | 'hi' | 'en'.
+
+    Marathi is checked first — Devanagari is shared, and is_hindi() claims
+    all of it. is_marathi() only fires on a Marathi marker win (or clean
+    Roman Marathi), so this order never steals Hindi.
+    """
+    try:
+        blob = " ".join(t or "" for t in texts if t)
+        if not blob.strip():
+            return "en"
+        try:
+            from backend.agent import marathi as _mm
+            if _mm.is_marathi(blob):
+                return "mr"
+        except Exception:
+            pass
+        try:
+            from backend.agent import hindi as _hm
+            if _hm.is_hindi(blob):
+                return "hi"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return "en"
+
+
+def _map_tool_error_hi(clean: str) -> Optional[str]:
+    """Map known English tool-error strings to Hindi. None when N/A."""
+    try:
+        from backend.agent import hindi as _hm
+        c = (clean or "").casefold()
+        if not c:
+            return None
+        if "only crunch numbers" in c or "couldn't parse that sum" in c:
+            return _hm.hi_error("bad_sum")
+        if "give me a sum to crunch" in c:
+            return _hm.hi_error("empty_calc")
+        if "tell me like" in c or "i convert temperature" in c:
+            return _hm.hi_error("convert_help")
+        if "can't reach the exchange" in c:
+            return _hm.hi_error("rates_down")
+        if "which word should i define" in c:
+            return _hm.hi_error("no_word")
+        if "no dictionary entry" in c or "drew a blank" in c:
+            return _hm.hi_error("dict_miss")
+        if "couldn't retrieve weather" in c:
+            return _hm.hi_error("weather_down")
+        if "gmail isn't linked" in c or "gmail linked" in c and "isn't" in c:
+            return _hm.hi_error("mail_unlinked")
+    except Exception:
+        pass
+    return None
+
+
+def _map_tool_error_mr(clean: str) -> Optional[str]:
+    """Map known English tool-error strings to Marathi. None when N/A."""
+    try:
+        from backend.agent import marathi as _mm
+        c = (clean or "").casefold()
+        if not c:
+            return None
+        if "only crunch numbers" in c or "couldn't parse that sum" in c:
+            return _mm.mr_error("bad_sum")
+        if "give me a sum to crunch" in c:
+            return _mm.mr_error("empty_calc")
+        if "tell me like" in c or "i convert temperature" in c:
+            return _mm.mr_error("convert_help")
+        if "can't reach the exchange" in c:
+            return _mm.mr_error("rates_down")
+        if "which word should i define" in c:
+            return _mm.mr_error("no_word")
+        if "no dictionary entry" in c or "drew a blank" in c:
+            return _mm.mr_error("dict_miss")
+        if "couldn't retrieve weather" in c:
+            return _mm.mr_error("weather_down")
+        if "gmail isn't linked" in c:
+            return _mm.mr_error("mail_unlinked")
+    except Exception:
+        pass
+    return None
+
+
+def humanize_error(kind: str = "", detail: str = "", prompt: str = "") -> str:
     """Calm, plain failure line. No jokes, no sir-stuffing."""
     try:
+        lang = _conv_lang(prompt, detail)
+        if lang != "en":
+            k = (kind or "").strip().lower()
+            mapping = {"offline": "offline", "network": "offline",
+                       "timeout": "offline", "auth": "auth",
+                       "login": "auth", "permission": "auth",
+                       "not_found": "not_found", "missing": "not_found"}
+            if lang == "mr":
+                try:
+                    from backend.agent import marathi as _mm
+                    return _mm.mr_error(mapping.get(k, "generic"), detail)
+                except Exception:
+                    pass
+            else:
+                try:
+                    from backend.agent import hindi as _hm
+                    return _hm.hi_error(mapping.get(k, "generic"), detail)
+                except Exception:
+                    pass
         kind = (kind or "").strip().lower()
         detail = (detail or "").strip()
         # Strip any leaked tracebacks / paths down to one human line.
@@ -359,15 +536,65 @@ def smalltalk(prompt: str = "") -> Optional[str]:
                 "Running cool and thinking fast, thanks for asking. How can I help?",
                 "All cores green and in good spirits. What do you need?",
             ])
+        if re.search(r"kaise ho|कैसे हो|kaisi ho|कैसी हो|aur batao|और बताओ", p):
+            return _pick([
+                "मैं एकदम बढ़िया हूँ — पूछने के लिए शुक्रिया! बताइए, क्या काम है?",
+                "सब सिस्टम हरे हैं और मूड भी अच्छा है। क्या करूँ आपके लिए?",
+            ])
+        if re.search(r"suprabhat|सुप्रभात|shubh prabhat|शुभ प्रभात", p):
+            return _pick([
+                "सुप्रभात! सिस्टम गरम हैं और मैं हाज़िर हूँ — आज सबसे पहले क्या करें?",
+                "शुभ प्रभात! चाय आपकी, काम मेरे — बताइए क्या करना है?",
+            ])
+        if re.search(r"shubh ratri|शुभ रात्रि|good night.*hindi|goodnight.*hindi", p):
+            return "शुभ रात्रि! बत्तियाँ जलती रहेंगी, सिस्टम पर नज़र रहेगी।"
         if re.search(r"who are you|your name|about yourself", p):
             return "I'm Jarvis — your desktop right hand. I run apps, files, mail, reminders and research, and I talk you through it all as I go."
-        if re.search(r"thank|thanks|shukriya|dhanyavad", p):
+        # ── Marathi smalltalk (checked before Hindi: shared script) ──
+        # Jarvis's own identity ("tumcha naav kay", "तुमचं नाव काय").
+        if re.search(r"tumcha|तुमचं|तुमचे|tujha|तुझं|naav kay|नाव काय", p):
+            return "माझं नाव J.A.R.V.I.S. आहे — तुमचा नम्र डिजिटल बटलर।"
+        # Capabilities ("tu kay karu shaktos", "तू काय करू शकतोस").
+        if re.search(r"(tu|तू).{0,20}(kay|काय).{0,20}(karu|करू|shaktos|शकतोस)|what can you do.*marathi", p):
+            return ("मी ॲप्स उघडणं, हवामान सांगणं, फाइल्स, मेल आणि रिमाइंडर सांभाळणं, "
+                    "हिशोब करणं आणि रिसर्चमध्ये मदत करू शकतो — फक्त सांगून बघा।")
+        # How are you ("kase aahat", "कसे आहात").
+        if re.search(r"kase aahat|कसे आहात|kashi aahes|कशी आहेस|kasa aahes|कसा आहेस", p):
+            return _pick([
+                "मी एकदम मजेत आहे — विचारल्याबद्दल धन्यवाद! सांगा, काय काम आहे?",
+                "सगळे सिस्टीम हिरवे आहेत आणि मूडही छान आहे। काय करू तुमच्यासाठी?",
+            ])
+        if re.search(r"namaskar|नमस्कार", p):
+            return _pick([
+                "नमस्कार! मी हजर आहे — सांगा, काय काम आहे?",
+                "नमस्कार! सगळे सिस्टीम तयार आहेत — काय करू तुमच्यासाठी?",
+            ])
+        # Jarvis's own identity in Hindi ("tumhara naam kya hai").
+        if re.search(r"tumhara|tumharaa|aapka|आपका|तुम्हारा|तुम्हारा नाम|naam kya|नाम क्या", p):
+            return "मेरा नाम J.A.R.V.I.S. है — आपका विनम्र डिजिटल बटलर।"
+        # Capabilities in Hindi ("tum kya kya kar sakte ho").
+        if re.search(r"(tum|आप|तुम).{0,20}(kya|क्या).{0,20}(kar sakte|कर सकते)|what can you do", p):
+            return ("मैं ऐप्स खोलने, मौसम बताने, फाइलें, मेल और रिमाइंडर संभालने, "
+                    "हिसाब-किताब करने और रिसर्च में मदद कर सकता हूँ — बस कहकर देखिए।")
+        if re.search(r"namaste|नमस्ते", p):
+            return _pick([
+                "नमस्ते! मैं हाज़िर हूँ — बताइए, क्या काम है?",
+                "नमस्ते! सब सिस्टम तैयार हैं — क्या करूँ आपके लिए?",
+            ])
+        if re.search(r"thank|thanks|shukriya|dhanyavad|धन्यवाद|शुक्रिया", p):
+            try:
+                from backend.agent import marathi as _mm
+                if _mm.is_marathi(prompt):
+                    return "काही हरकत नाही — हेच तर माझं काम आहे!"
+            except Exception:
+                pass
             return _pick([
                 "Always a pleasure.",
                 "Anytime — that's what I'm here for.",
                 "Happy to help.",
+                "कोई बात नहीं — यही तो मेरा काम है!",
             ])
-        if re.search(r"\b(bye|goodbye|see you|alvida)\b", p):
+        if re.search(r"\b(bye|goodbye|see you|alvida|अलविदा)\b", p):
             return _pick([
                 "Standing by whenever you need me.",
                 "I'll be here — just say the word.",

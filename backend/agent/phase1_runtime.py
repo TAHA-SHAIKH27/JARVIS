@@ -101,11 +101,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_MR_REMIND_VERBS = ("karun de", "karun dya", "करून दे", "करून द्या", "kara",
+                    "करा", "lava", "लावा", "dilao", "दिलाओ")
+
+
 def normalize_intent(text: str) -> Dict[str, Any]:
     original = (text or "").strip()
     lower = original.casefold()
     intent = "conversation"
-    if any(k in lower for k in ("remember", "don't forget", "do not forget", "keep in mind", "save this to memory", "save to memory")):
+    _mr_reminder = any(v in lower for v in _MR_REMIND_VERBS)
+    _mr_remember = (any(k in lower for k in ("lakshat", "लक्षात", "aathvan thev",
+                                             "आठवण ठेव")) and not _mr_reminder)
+    if any(k in lower for k in ("remember", "don't forget", "do not forget", "keep in mind",
+                                "save this to memory", "save to memory", "save it",
+                                "note that", "note it", "memoris", "memoriz",
+                                "yaad", "याद")) or _mr_remember:
         intent = "remember"
     elif any(k in lower for k in ("remind me", "reminder", "remind")):
         intent = "reminder"
@@ -147,11 +157,50 @@ def _extract_memory_text(task: str) -> str:
         "do not forget ",
         "keep in mind that ",
         "keep in mind ",
+        "yaad rakhna ",
+        "yaad rakho ",
+        "yaad rakh ",
+        "yaad rakhna ki ",
+        "yaad rakhiye ",
+        "याद रखना ",
+        "याद रखो ",
+        "याद रख ",
+        "याद रखिए ",
+        "lakshat thev ",
+        "lakshat theva ",
+        "लक्षात ठेव ",
+        "लक्षात ठेवा ",
+        "aathvan thev ",
+        "आठवण ठेव ",
     )
     for prefix in prefixes:
         if lower.startswith(prefix):
-            return text[len(prefix):].strip().rstrip(".")
-    return text
+            candidate = text[len(prefix):].strip().rstrip(".")
+            return _strip_memory_suffix(candidate)
+    # Suffix form ("i live in pune, remember it"): the fact comes first.
+    return _strip_memory_suffix(text)
+
+
+def _strip_memory_suffix(text: str) -> str:
+    """Remove a trailing memory imperative. Returns '' when nothing remains."""
+    import re as _re
+    t = (text or "").strip()
+    t = _re.sub(
+        r"[,.\s]*(?:,?\s*please)?\s*(?:remember(?:\s+it|\s+this|\s+that)?|"
+        r"don't\s+forget(?:\s+it|\s+this|\s+that)?|"
+        r"do\s+not\s+forget(?:\s+it|\s+this|\s+that)?|"
+        r"keep\s+(?:it\s+|this\s+|that\s+)?in\s+mind|"
+        r"note\s+it\s+down|for\s+future(?:\s+reference)?|ok(?:ay)?|"
+        r"yaad\s+rakhna|yaad\s+rakho|yaad\s+rakh|yaad\s+rakhiye|"
+        r"याद\s+रखना|याद\s+रखो|याद\s+रख|याद\s+रखिए|"
+        r"lakshat\s+thev|lakshat\s+theva|लक्षात\s+ठेव|लक्षात\s+ठेवा|"
+        r"aathvan\s+thev|आठवण\s+ठेव)"
+        r"\s*[.!?।]?\s*$",
+        "", t, flags=_re.I).strip()
+    t = t.rstrip(".!?; ").strip()
+    if t.casefold() in ("", "it", "this", "that", "please"):
+        return ""
+    return t
 
 
 def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
@@ -162,8 +211,14 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
 
     memory_text = _extract_memory_text(task)
     if not memory_text:
+        try:
+            from backend.agent import hindi as _hmod
+            _speak = ("बताइए, क्या याद रखूँ?" if _hmod.is_hindi(task)
+                      else "Please tell me what you want me to remember, sir.")
+        except Exception:
+            _speak = "Please tell me what you want me to remember, sir."
         return {
-            "speak": "Please tell me what you want me to remember, sir.",
+            "speak": _speak,
             "speak_lang": "en",
             "logs": ["MEMORY: No memory content supplied"],
             "file_data": None,
@@ -184,8 +239,23 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
 
     memory_item = result.get("memory") or {}
     logged_text = memory_item.get("text", memory_text)
+    try:
+        from backend.agent import marathi as _mmod
+        _is_mr = _mmod.is_marathi(task)
+    except Exception:
+        _is_mr = False
+    try:
+        if _is_mr:
+            from backend.agent import marathi as _mmod2
+            _speak = _mmod2.mr_memory_saved(memory_text)
+        else:
+            from backend.agent import hindi as _hmod
+            _speak = (_hmod.hi_memory_saved(memory_text) if _hmod.is_hindi(task)
+                      else f"Got it — I'll remember that: {memory_text}")
+    except Exception:
+        _speak = f"Got it — I'll remember that: {memory_text}"
     return {
-        "speak": f"Understood, sir. I will remember that: {memory_text}",
+        "speak": _speak,
         "speak_lang": "en",
         "logs": [f"MEMORY SAVED: {logged_text}"],
         "file_data": None,
@@ -194,6 +264,215 @@ def _direct_memory_command(task: str) -> Optional[Dict[str, Any]]:
         "memory_saved": True,
         "memory": memory_item,
     }
+
+
+# ── Deterministic identity capture (never LLM-dependent) ────────────────────
+# "My name is Taha" or "I live in Pune" must be remembered even when the
+# neural processor is offline, rate-limited, or mis-parses. These extractors
+# run on every normal-mode command (cheap regexes) before the LLM call.
+import re as _re
+
+_NAME_CAPTURES = (
+    _re.compile(r"\bmy\s+name\s+(?:is|'s)\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bcall\s+me\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmera\s+naam\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmazha?\s+naav\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmaajh[ae]\s+naav\s+(.+?)\s*$", _re.I | _re.S),
+)
+
+_RESIDENCE_CAPTURES = (
+    _re.compile(r"\bi\s+live\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi'?m\s+living\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi\s+stay\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi'?m\s+staying\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi\s+am\s+from\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi'?m\s+from\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmy\s+city\s+is\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmy\s+town\s+is\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmy\s+location\s+is\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmy\s+hometown\s+is\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi'?m\s+based\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bi\s+am\s+based\s+in\s+(.+?)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmain\s+(.+?)\s+m(?:e|ein|en)\s+reht[ai]\s+h(?:u|un|oon|ai|ain)\s*$", _re.I | _re.S),
+    _re.compile(r"\bmi\s+(.+?)\s+madh?e\s+rah?at[oi]\s*$", _re.I | _re.S),
+)
+
+# "Call me back/later/…" is a phone request, never a name.
+_CALL_ME_NON_NAMES = frozenset({
+    "back", "later", "soon", "today", "tonight", "tomorrow", "again",
+    "now", "please", "sir", "asap", "up",
+})
+
+_WEATHER_PREF_RE = _re.compile(
+    r"(?:weather|mausam)[^.?!]{0,40}?\b(?:in|for|of|related\s+to)\s+"
+    r"([A-Za-z][A-Za-z][A-Za-z\s.\-']{0,28}?)\s*"
+    r"(?:only|always|by\s+default|as\s+default|just|alone|remember|prefer)",
+    _re.I)
+_WEATHER_PREF_RE2 = _re.compile(
+    r"\b([A-Za-z][A-Za-z][A-Za-z\s.\-']{0,28}?)\s+only\s+(?:for\s+)?(?:weather|mausam)",
+    _re.I)
+_DEFAULT_CITY_RE = _re.compile(
+    r"\bdefault\s+city(?:\s+is)?\s+([A-Za-z][A-Za-z][A-Za-z\s.\-']{0,28}?)\s*$",
+    _re.I)
+
+_NAME_QUESTION_RE = _re.compile(
+    r"(what'?s?\s+my\s+name|do\s+you\s+know\s+my\s+name|tell\s+me\s+my\s+name|"
+    r"who\s+am\s+i|my\s+name\??|mera\s+naam\s+kya)",
+    _re.I)
+_MR_NAME_QUESTION_RE = _re.compile(
+    r"(mazha?\s+naav\s+kay|maajh[ae]\s+naav\s+kay|माझ[ंे]\s+नाव\s+काय|"
+    r"tula\s+mazha?\s+naav|naav\s+kay\s+aahe)",
+    _re.I)
+_CITY_QUESTION_RE = _re.compile(
+    r"(what'?s?\s+my\s+(?:city|location|town)|where\s+do\s+i\s+live|"
+    r"which\s+city\s+am\s+i\s+in|my\s+(?:city|location)\??|"
+    r"mera\s+sheher\s+(?:kya|kaunsa))",
+    _re.I)
+_MR_CITY_QUESTION_RE = _re.compile(
+    r"(mi\s+kuthe\s+rahato|मी\s+कुठे\s+राहतो|mazha?\s+shahar|"
+    r"माझ[ंे]\s+शहर|kuthe\s+rahato\s+mi)",
+    _re.I)
+
+
+def _clean_capture(raw: str, max_words: int = 3) -> str:
+    """Trim a captured name/city to its first clean chunk."""
+    t = (raw or "").strip()
+    t = _re.split(r"\s+and\s+|\s+but\s+|[,.!?;\n]", t, maxsplit=1)[0].strip()
+    try:
+        from backend.agent.phase1_memory import _scrub_trailing
+        t = _scrub_trailing(t)
+    except Exception:
+        pass
+    t = _re.sub(r"\s+please\s*$", "", t, flags=_re.I).strip()
+    t = t.rstrip(".!?; ").strip()
+    words = t.split()
+    if len(words) > max_words:
+        t = " ".join(words[:max_words])
+    if not _re.fullmatch(r"[A-Za-z][A-Za-z .'\-]*", t or ""):
+        return ""
+    if len(t) < 2 or len(t) > 40:
+        return ""
+    if t.casefold() in ("it", "this", "that", "here", "there", "you", "me"):
+        return ""
+    return t
+
+
+def capture_implicit_memories(task: str) -> list:
+    """Save name/home-city facts found in ANY phrasing. Never raises.
+
+    Runs before the LLM call so fresh facts are already in memory context.
+    Returns the saved memory items (possibly empty).
+    """
+    saved = []
+    text = (task or "").strip()
+    if not text:
+        return saved
+    try:
+        from backend.agent import phase1_memory as _mem
+    except Exception:
+        return saved
+
+    def _save(sentence: str, category: str = "general"):
+        try:
+            res = _mem.remember(sentence, category=category,
+                                source="jarvis-implicit", source_text=text)
+            if res.get("status") == "success" and res.get("memory"):
+                saved.append(res["memory"])
+        except Exception:
+            pass
+
+    # 1. Name in any explicit statement.
+    for idx, pat in enumerate(_NAME_CAPTURES):
+        try:
+            m = pat.search(text)
+        except Exception:
+            continue
+        if m:
+            name = _clean_capture(m.group(1), max_words=3)
+            if idx == 1:
+                first = (name.split() or [""])[0].casefold()
+                if first in _CALL_ME_NON_NAMES or name.casefold() in _CALL_ME_NON_NAMES:
+                    break  # "call me back/later/…" — a phone request, not a name.
+            if name:
+                _save(f"my name is {name}", "identity")
+            break
+
+    # 2. Home city in any residence statement.
+    for pat in _RESIDENCE_CAPTURES:
+        try:
+            m = pat.search(text)
+        except Exception:
+            continue
+        if m:
+            city = _clean_capture(m.group(1), max_words=3)
+            if city:
+                _save(f"I live in {city}", "identity")
+            break
+
+    # 3. Weather-only preference ("Pune only for weather", "default city X").
+    pref_city = ""
+    try:
+        m = _WEATHER_PREF_RE.search(text) or _WEATHER_PREF_RE2.search(text)
+        if m:
+            pref_city = _clean_capture(m.group(1), max_words=3)
+        else:
+            m2 = _DEFAULT_CITY_RE.search(text)
+            if m2:
+                pref_city = _clean_capture(m2.group(1), max_words=3)
+    except Exception:
+        pref_city = ""
+    if pref_city:
+        _save(f"my default city is {pref_city}", "preference")
+
+    return saved
+
+
+def answer_from_memory(task: str) -> Optional[str]:
+    """Deterministic answers for name/city questions. None when no answer."""
+    text = (task or "").strip()
+    if not text:
+        return None
+    try:
+        from backend.agent import phase1_memory as _mem
+        try:
+            from backend.agent import marathi as _mmod
+            _mr = _mmod.is_marathi(text)
+        except Exception:
+            _mr = False
+        try:
+            from backend.agent import hindi as _hmod
+            _hi = (not _mr) and _hmod.is_hindi(text)
+        except Exception:
+            _hi = False
+        if _MR_NAME_QUESTION_RE.search(text):
+            name = _mem.get_user_name()
+            if name:
+                try:
+                    from backend.agent import marathi as _m2
+                    return _m2.mr_name_answer(name)
+                except Exception:
+                    pass
+        if _NAME_QUESTION_RE.search(text):
+            name = _mem.get_user_name()
+            if name:
+                return (_hmod.hi_name_answer(name) if _hi
+                        else f"Your name is {name} — I'd know it anywhere.")
+        if _MR_CITY_QUESTION_RE.search(text):
+            city = _mem.get_home_city()
+            if city:
+                try:
+                    from backend.agent import marathi as _m3
+                    return _m3.mr_city_answer(city)
+                except Exception:
+                    pass
+        if _CITY_QUESTION_RE.search(text):
+            city = _mem.get_home_city()
+            if city:
+                return (_hmod.hi_city_answer(city) if _hi
+                        else f"You're in {city} — at least, that's where you've told me home is.")
+    except Exception:
+        pass
+    return None
 
 
 class ConversationContext:

@@ -57,7 +57,11 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
   // the user cut in with "Jarvis, …" / "stop" / "wait" instead of waiting.
   const ttsPlayingRef = useRef(false);
   // Rolling window of what JARVIS recently said (lowercase) for echo guard.
+  // 2000 chars covers long replies — the old 400-char window let the tail of
+  // a long answer slip past the guard, so Chrome hearing our own voice would
+  // re-execute the same command ~30s later (duplicate bubble + duplicate TTS).
   const lastSpokenRef = useRef('');
+  const ttsEndedAtRef = useRef(0);
   // WAKE | COMMAND listen state lives in a ref so barge-in can drive it.
   const listenStateRef = useRef<'WAKE' | 'COMMAND'>('WAKE');
   const bargeRevertTimerRef = useRef<any>(null);
@@ -222,6 +226,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
     console.log('[Voice] TTS ended — normal wake-word listening');
     isMutedForTTSRef.current = false;
     ttsPlayingRef.current = false;
+    ttsEndedAtRef.current = Date.now();
   }, []);
 
   // ---------- Command Execution Wrapper ----------
@@ -258,7 +263,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
       // tell our own voice apart from the user's.
       try {
         const said = (utterance.text || '').toLowerCase();
-        lastSpokenRef.current = (lastSpokenRef.current + ' ' + said).slice(-400);
+        lastSpokenRef.current = (lastSpokenRef.current + ' ' + said).slice(-2000);
       } catch {}
 
       utterance.onstart = function (e) {
@@ -406,6 +411,23 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
 
       const fullText = currentSegment.trim().toLowerCase();
 
+      // Post-TTS echo cooldown: Chrome often delivers the tail of our own
+      // voice as a "new" result 0-2s after speech ends. If it overlaps what
+      // we just said, drop it — otherwise the same command re-executes and
+      // the user hears the same reply twice with a duplicate chat bubble.
+      if (Date.now() - ttsEndedAtRef.current < 2500 && fullText) {
+        const words = fullText.split(/\s+/).filter(w => w.length > 2);
+        if (words.length > 0) {
+          const spoken = lastSpokenRef.current;
+          let hits = 0;
+          for (const w of words) if (spoken.includes(w)) hits++;
+          if (hits / words.length >= 0.5) {
+            setPartialTranscript('');
+            return;
+          }
+        }
+      }
+
       if (listenStateRef.current === 'WAKE') {
         const wakeHit = WAKE_WORDS.find(w => hasWord(fullText, w));
         if (wakeHit) {
@@ -446,7 +468,7 @@ export function useVoice(options: UseVoiceOptions = {}): UseVoiceReturn {
               playBeep(850);
               if (!mutedRef.current && window.speechSynthesis) {
                 const utter = new SpeechSynthesisUtterance('Yes?');
-                utter.rate = 1.0;
+                utter.rate = 0.88;
                 utter.pitch = 0.85;
                 try {
                   // JARVIS is male — use the male English voice, never the default.

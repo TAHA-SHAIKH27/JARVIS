@@ -862,8 +862,14 @@ class AgentCore:
                     # Fatal error or max retries exceeded
                     await emit("error", f"Fatal failure on step '{desc}': {fail_msg}. Task cannot continue.", icon="✗")
                     state.completion_status = "failed"
-                    speak_text = personality.serious(
-                        f"Task failed, sir. Critical step failed: {desc}. Error: {fail_msg}")
+                    try:
+                        from backend.agent import human_replies as _hr2
+                        speak_text = personality.serious(
+                            _hr2.humanize_error("action_failed",
+                                f"I couldn't get past '{desc}' — {fail_msg}. Nothing half-done was left behind."))
+                    except Exception:
+                        speak_text = personality.serious(
+                            f"Task failed, sir. Critical step failed: {desc}. Error: {fail_msg}")
                     if self.executor._browser:
                         await self.executor.close_browser()
                     await emit(
@@ -950,18 +956,40 @@ class AgentCore:
 
         if not final_verification["verified"]:
             # Final outcome not achieved - try to recover or report partial
-            await emit("verification_failed", f"Final outcome not verified: {final_verification['message']}", 
+            await emit("verification_failed", f"Final outcome not verified: {final_verification['message']}",
                       final_verification, icon="✗")
             state.completion_status = "partial" if state.completed_steps else "failed"
-            speak_text = final_verification.get("message", "Task could not be fully completed.")
+            _raw = final_verification.get("message", "Task could not be fully completed.")
+            try:
+                from backend.agent import human_replies as _hr
+                _done = len(state.completed_steps)
+                _total = len([a for a in actions if a.type != "speak"])
+                speak_text = _hr.humanize_agent(task, _done, _total, _raw,
+                                                failed=(state.completion_status == "failed"),
+                                                partial=(state.completion_status == "partial"))
+            except Exception:
+                speak_text = _raw
         else:
             state.completion_status = "completed"
             await emit("verification_passed", "Final outcome verified successfully", final_verification, icon="✓")
-            # Build final speak text if not set
+            # Build final speak text if not set — warm human closing, facts kept.
             if not speak_text:
                 completed = len(state.completed_steps)
                 total = len([a for a in actions if a.type != "speak"])
-                speak_text = f"Task complete, sir. {completed} of {total} steps executed successfully. {final_verification.get('summary', '')}"
+                try:
+                    from backend.agent import human_replies as _hr
+                    speak_text = _hr.humanize_agent(task, completed, total,
+                                                    final_verification.get('summary', ''))
+                except Exception:
+                    speak_text = f"Task complete, sir. {completed} of {total} steps executed successfully. {final_verification.get('summary', '')}"
+            else:
+                try:
+                    from backend.agent import human_replies as _hr
+                    _done = len(state.completed_steps)
+                    _total = len([a for a in actions if a.type != "speak"])
+                    speak_text = _hr.humanize_agent(task, _done, _total, speak_text)
+                except Exception:
+                    pass
 
         # Close browser if it was opened
         if self.executor._browser:

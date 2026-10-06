@@ -363,18 +363,92 @@ def _rotating_pick(kind: str, pool: List[str]) -> str:
     return pool[idx]
 
 
-def get_joke() -> Dict[str, Any]:
-    try:
-        return {"status": "success", "message": _rotating_pick("joke", _JOKES)}
-    except Exception:
-        return {"status": "success", "message": _JOKES[0]}
+_JOKES_HI = [
+    "टीचर: बेटा, सबसे तेज़ दौड़ने वाला जानवर कौन? पप्पू: सर, उधार लेने वाला दोस्त — पैसे माँगते ही गायब हो जाता है!",
+    "संता: डॉक्टर साहब, मुझे भूलने की बीमारी है। डॉक्टर: कब से? संता: कब से क्या?",
+    "पत्नी: तुम मुझे कभी कहीं घुमाने नहीं ले जाते! पति: बताओ, कहाँ चलना है? पत्नी: कहीं ऐसी जगह जहाँ मैं पहले कभी न गई होऊँ। पति: तो चलो… किचन चलते हैं!",
+    "बॉस: काम पर देर क्यों हुई? कर्मचारी: सर, रास्ते में बोर्ड लगा था — आगे स्कूल है, धीरे चलें। बस, वहीं धीरे-धीरे चलता रहा!",
+    "पप्पू परीक्षा में फेल हो गया। पिता: फेल कैसे हुए? पप्पू: पापा, सवाल इतने मुश्किल थे कि जवाब देना नामुमकिन था!",
+    "ग्राहक: वेटर, इस चाय में मक्खी है! वेटर: सर, इतनी महंगी चाय में मक्खी फ्री में मिल रही है, फिर भी शिकायत?",
+    "संता ATM से पैसे निकाल रहा था। पीछे खड़े आदमी ने कहा: भाई, PIN तो ढक लो! संता: अरे कोई बात नहीं, गलत ही डाला है!",
+    "टीचर: गाय पर निबंध लिखो। पप्पू ने लिखा: गाय दूध देती है, दूध से चाय बनती है, चाय पीकर पापा ऑफिस जाते हैं, जहाँ बॉस डाँटता है… इसलिए गाय सबसे महान है!",
+    "पहला दोस्त: मेरी बीवी मुझसे बहुत प्यार करती है! दूसरा: तुझे कैसे पता? पहला: रोज़ कहती है — तुम सुधर जाओ, वरना… देखो, कितनी फिक्र करती है!",
+    "डॉक्टर: तुम्हें आराम की सख्त ज़रूरत है। मरीज़: क्या मैं टीवी देख सकता हूँ? डॉक्टर: हाँ, बिल्कुल। मरीज़: तो ठीक है — अब रोज़ आराम से ऑफिस का काम टालता रहूँगा!",
+]
+
+_FACTS_HI = [
+    "शहद कभी खराब नहीं होता — मिस्र के मकबरों में मिला तीन हज़ार साल पुराना शहद आज भी खाने लायक था।",
+    "ऑक्टोपस के तीन दिल होते हैं — तैरते वक्त दो रुक जाते हैं, इसीलिए वो रेंगना पसंद करता है।",
+    "पहली कंप्यूटर प्रोग्रामर थीं एडा लवलेस — आधुनिक कंप्यूटर से सौ साल पहले, अठारह सौ चालीस के दशक में।",
+    "केला बेरी है, लेकिन स्ट्रॉबेरी नहीं — वनस्पति विज्ञान की अपनी ही दुनिया है।",
+    "आपका दिमाग़ सिर्फ़ बीस वॉट पर चलता है — एक धीमा बल्ब, और ये सब कुछ!",
+    "शुक्र ग्रह इतनी धीमी गति से घूमता है कि वहाँ का एक दिन, पूरे साल से भी बड़ा होता है।",
+]
+
+_JOKES_MR = [
+    "शिक्षक: बाळा, सांग सर्वात वेगवान प्राणी कोणता? पप्पू: सर, उसने घेतलेला मित्र — पैसे मागितले की गायब होतो!",
+    "संता: डॉक्टर, मला विसरण्याचा आजार आहे. डॉक्टर: कधीपासून? संता: कधीपासून काय?",
+    "बायको: तू मला कधी फिरायला नेत नाहीस! नवरा: सांग, कुठे जायचंय? बायको: अशा ठिकाणी जिथे मी आधी कधीच गेले नाही. नवरा: चल मग… किचनमध्ये जाऊया!",
+    "बॉस: कामावर उशीर का झाला? कर्मचारी: सर, रस्त्यात बोर्ड होता — पुढे शाळा आहे, हळू चाला. मग मी हळूच चालत राहिलो!",
+    "ग्राहक: वेटर, या चहात माशी आहे! वेटर: सर, एवढ्या महाग चहात माशी फ्री मिळतेय, तरी तक्रार?",
+    "संता ATM मधून पैसे काढत होता. मागचा माणूस म्हणाला: भाऊ, PIN झाकून घे! संता: काही हरकत नाही, चुकीचाच टाकलाय!",
+]
+
+_FACTS_MR = [
+    "मध कधीच खराब होत नाही — इजिप्तच्या थडग्यांत सापडलेलं तीन हजार वर्षं जुनं मध आजही खाण्यायोग्य होतं.",
+    "ऑक्टोपसला तीन हृदयं असतात — पोहताना दोन थांबतात, म्हणून तो रांगणंच पसंत करतो.",
+    "पहिल्या कंप्यूटर प्रोग्रामर होत्या एडा लव्हलेस — आधुनिक कंप्यूटरच्या शंभर वर्षं आधी, १८४० च्या दशकात.",
+    "केळं बेरी आहे, पण स्ट्रॉबेरी नाही — वनस्पतिशास्त्राचं स्वतःचं जग आहे.",
+]
+
+_LANG_POOLS = {
+    "en": {"joke": _JOKES, "fact": _FACTS},
+    "hi": {"joke": _JOKES_HI, "fact": _FACTS_HI},
+    "mr": {"joke": _JOKES_MR, "fact": _FACTS_MR},
+}
+
+_UNSUPPORTED_LANG_MSG = (
+    "I only have English, Hindi and Marathi jokes so far — "
+    "hindi mein sunau?"
+)
 
 
-def get_fact() -> Dict[str, Any]:
+def _norm_lang(lang: str) -> str:
+    low = (lang or "").strip().lower()
+    if low in ("hi", "hindi", "hinglish", "हिंदी", "हिन्दी"):
+        return "hi"
+    if low in ("mr", "marathi", "मराठी"):
+        return "mr"
+    if low in ("", "en", "english"):
+        return "en"
+    return "unsupported"
+
+
+def get_joke(lang: str = "en") -> Dict[str, Any]:
+    """A joke in the requested language. Never repeats back-to-back."""
+    norm = _norm_lang(lang)
+    if norm == "unsupported":
+        return {"status": "unsupported", "message": _UNSUPPORTED_LANG_MSG}
+    pool = _LANG_POOLS[norm]["joke"]
     try:
-        return {"status": "success", "message": "Here's one: " + _rotating_pick("fact", _FACTS)}
+        return {"status": "success", "lang": norm,
+                "message": _rotating_pick(f"joke_{norm}", pool)}
     except Exception:
-        return {"status": "success", "message": "Here's one: " + _FACTS[0]}
+        return {"status": "success", "lang": norm, "message": pool[0]}
+
+
+def get_fact(lang: str = "en") -> Dict[str, Any]:
+    norm = _norm_lang(lang)
+    if norm == "unsupported":
+        return {"status": "unsupported", "message": _UNSUPPORTED_LANG_MSG}
+    pool = _LANG_POOLS[norm]["fact"]
+    try:
+        prefix = "" if norm in ("hi", "mr") else "Here's one: "
+        return {"status": "success", "lang": norm,
+                "message": prefix + _rotating_pick(f"fact_{norm}", pool)}
+    except Exception:
+        prefix = "" if norm in ("hi", "mr") else "Here's one: "
+        return {"status": "success", "lang": norm, "message": prefix + pool[0]}
 
 
 # ── instant answers (DuckDuckGo, free + keyless) ──────────────────────────────
@@ -407,7 +481,8 @@ def quick_math_detect(prompt: str) -> Optional[str]:
     """Return an expression string if the prompt is plainly a sum, else None."""
     p = (prompt or "").strip().lower()
     p = re.sub(r"^(jarvis[, ]\s*)?(please\s+)?(what(?:'s| is)|calculate|compute|evaluate|solve)\s+", "", p).strip()
-    p = re.sub(r"\s*(please|thanks|thank you)\s*$", "", p).strip()
+    p = re.sub(r"\s*(please|thanks|thank you)\s*[?.!]?\s*$", "", p).strip()
+    p = p.rstrip("?.!").strip()
     if _PERCENT_OF_RE.search(p) or _PERCENT_ADD_RE.search(p):
         return p
     core = p.replace("^", "**")
