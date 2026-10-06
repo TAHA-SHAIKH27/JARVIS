@@ -348,6 +348,65 @@ Configure the services you want to use through the project's local configuration
 
 ---
 
+## First run on a new machine
+
+JARVIS is **offline-first**: a fresh clone with *zero* API keys still runs. Local commands (volume, screenshots, timers, files, math, weather via IP location, jokes, Hindi/Marathi/English offline replies), reminders, notes and the full dashboard all work. AI features light up as you add keys below.
+
+### 1. Add API keys (all optional, easiest via the UI)
+
+Open the dashboard → **Settings** (gear icon) and paste keys, or create `config.json` in the project root (it is gitignored — never commit it):
+
+```json
+{
+  "gemini_api_key": "AIza… or AQ.…",
+  "huggingface_api_key": "hf_…",
+  "gemini_project_id": "",
+  "groq_api_key": "",
+  "nvidia_api_key": "nvapi-…",
+  "nvidia_model": "z-ai/glm-5.3-flash"
+}
+```
+
+| Key | Unlocks |
+|---|---|
+| `gemini_api_key` | Full conversation, planning, vision, document Q&A (or link Google in Settings instead) |
+| `groq_api_key` | Cloud fallback for voice transcription (free at console.groq.com) |
+| `nvidia_api_key` | Code Core audits and repairs |
+| `huggingface_api_key` | Image generation |
+
+### 2. Optional `.env` file
+
+```bash
+Copy-Item .env.example .env
+```
+
+Only needed for phone mirroring (`JARVIS_ADB_PATH`, `JARVIS_PHONE_PIN`) or voice fallback (`GROQ_API_KEY`). Everything has a working default without it.
+
+### 3. Optional: Gmail + Google
+
+- **Gemini via Google account:** Settings → *Link Google* (no key needed).
+- **Gmail reading/sending:** Settings → *Link Gmail*. First link needs a Google Cloud **Desktop-app** OAuth client saved as `client_secret.json` in the project root (gitignored). Without it, mail features simply report "not linked" — nothing breaks.
+
+### 4. Optional components (all degrade gracefully if missing)
+
+| Component | Install | If missing |
+|---|---|---|
+| OCR text in screenshots | Tesseract binary (`winget install UB-Mannheim.TesseractOCR`) | OCR steps report unavailable |
+| Phone mirror / ADB control | `adb` + `scrcpy` on PATH, `ws-scrcpy/` folder | Phone panel reports unavailable |
+| Desktop app window | `npm run build`, then `npm run electron` (dev: backend + `npm run dev` + `npm run electron`) | Use the browser at `:3000` instead |
+
+All runtime folders (`work_files/`, `backend/data/`, `downloads/`) are **auto-created on first run** — there is nothing to copy from another machine, and nothing personal is required.
+
+### Troubleshooting a fresh clone
+
+- `vite` / `uvicorn` not recognized → virtualenv or `node_modules` step missed above.
+- Port `3000`/`8000` in use → stop the other copy; the ports are fixed (`vite.config.js`, `main.py`).
+- `python -m playwright install chromium` fixes "browser won't launch".
+- PowerShell blocks `.venv\Scripts\activate` → `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+- Blank AI answers with no keys → expected: you're in offline mode; add a Gemini key or link Google.
+
+---
+
 ## Running JARVIS
 
 The convenience launcher can start the backend and frontend:

@@ -37,14 +37,6 @@ def run_backend():
     return subprocess.Popen(cmd, env=os.environ.copy())
 
 
-def run_voice_service():
-    """Run voice service."""
-    os.chdir(BACKEND_DIR)
-    cmd = [VENV_PYTHON, "voice_service.py"]
-    print(f"[Start] Starting voice service: {' '.join(cmd)}")
-    return subprocess.Popen(cmd, env=os.environ.copy())
-
-
 def run_frontend_dev():
     """Run Vite dev server."""
     frontend_dir = BASE_DIR
