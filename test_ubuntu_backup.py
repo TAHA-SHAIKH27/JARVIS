@@ -457,6 +457,47 @@ def test_15_real_transport_scp_failure_is_transient(isolate, cfg, monkeypatch):
     assert result["status"] == "transient"
 
 
+def test_16_file_categorization_and_filtering(isolate, cfg):
+    assert ub.categorize_file("report.pdf") == "document"
+    assert ub.categorize_file("script.py") == "code"
+    assert ub.categorize_file("photo.png") == "media"
+    assert ub.categorize_file("backup.zip") == "archive"
+    assert ub.categorize_file("data.db") == "data"
+    assert ub.categorize_file("notes.unknown") == "other"
+
+    p1 = _write(cfg["roots"][0], "doc.pdf", "content")
+    p2 = _write(cfg["roots"][0], "app.py", "print(1)")
+    ub.enqueue_file(p1, cfg)
+    ub.enqueue_file(p2, cfg)
+
+    all_jobs = ub.list_jobs()
+    assert all_jobs["total"] == 2
+    docs = ub.list_jobs(category="document")
+    assert docs["total"] == 1
+    assert docs["jobs"][0]["category"] == "document"
+
+    search_py = ub.list_jobs(search="app.py")
+    assert search_py["total"] == 1
+    assert search_py["jobs"][0]["category"] == "code"
+
+
+def test_17_storage_telemetry_and_test_connection(isolate, cfg, remote):
+    ub.set_transport("check", remote.check)
+    p = _write(cfg["roots"][0], "sample.txt", "12345")
+    ub.enqueue_file(p, cfg)
+
+    status = ub.get_status()
+    assert status["total_jobs"] == 1
+    assert status["total_bytes"] == 5
+    assert "local_system" in status
+    assert status["local_system"]["platform"] == "Windows 11"
+
+    test_res = ub.test_connection()
+    assert test_res["status"] == "success"
+    assert test_res["reachable"] is True
+    assert "latency_ms" in test_res
+
+
 # ── real-server e2e (opt-in, honest reporting) ───────────────────────────────
 @pytest.mark.e2e
 def test_e2e_real_server(tmp_path):

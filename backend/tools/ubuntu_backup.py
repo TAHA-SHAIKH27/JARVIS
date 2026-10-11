@@ -69,11 +69,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "client_secret.json", "config.json",
     ],
     "max_file_bytes": 500 * 1024 * 1024,  # skip single files larger than this
-    "stable_seconds": 5.0,      # mtime must be this old before upload
+    "stable_seconds": 2.0,      # mtime must be this old before upload (faster for small files)
     "scan_interval_seconds": 300.0,
-    "tick_seconds": 5.0,
-    "ssh_timeout_seconds": 15,
-    "transfer_timeout_seconds": 600,
+    "tick_seconds": 2.0,        # worker polls more frequently
+    "ssh_timeout_seconds": 10,
+    "transfer_timeout_seconds": 120,
     "retry_base_seconds": 30.0,
     "retry_max_seconds": 3600.0,
     "retry_jitter_seconds": 10.0,
@@ -416,9 +416,60 @@ def scan_and_enqueue(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 # ── OpenSSH transport ───────────────────────────────────────────────────────
 def _ssh_base(cfg: Dict[str, Any]) -> List[str]:
-    return ["ssh", "-i", cfg["key_path"], "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={int(cfg.get('ssh_timeout_seconds') or 15)}",
-            f"{cfg['user']}@{cfg['host']}"]
+    """Base SSH command with performance optimizations."""
+    # Performance options:
+    # -o AddressFamily=inet        Force IPv4 (avoid IPv6 fallback delays)
+    # -o Ciphers=...               Fastest AEAD ciphers (hardware-accelerated on modern CPUs)
+    # -o MACs=...                  Fastest MACs (encrypt-then-MAC)
+    # -o Compression=yes           Enable compression (helps text/code/docs)
+    # -o TCPKeepAlive=yes          Keep connection alive
+    # -o ServerAliveInterval=15    Detect dead connections faster
+    # -o ServerAliveCountMax=3
+    # -o ControlMaster=auto        Connection multiplexing (Unix only, disabled on Windows)
+    # -o ControlPath=~/.ssh/cm-%r@%h:%p
+    # -o ControlPersist=60         Keep master open 60s after last use
+    base = ["ssh", "-i", cfg["key_path"],
+            "-o", "BatchMode=yes",
+            "-o", "AddressFamily=inet",
+            "-o", "Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr",
+            "-o", "MACs=hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com",
+            "-o", "Compression=yes",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", f"ConnectTimeout={int(cfg.get('ssh_timeout_seconds') or 15)}"]
+    # ControlMaster only works on Unix (requires Unix domain sockets)
+    if os.name != "nt":
+        base += [
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-%r@%h:%p",
+            "-o", "ControlPersist=60",
+        ]
+    base.append(f"{cfg['user']}@{cfg['host']}")
+    return base
+
+
+def _scp_base(cfg: Dict[str, Any]) -> List[str]:
+    """Base SCP command with performance optimizations (inherits SSH options)."""
+    # SCP doesn't support all SSH options directly, but passes -o flags through
+    base = ["scp", "-i", cfg["key_path"],
+            "-o", "BatchMode=yes",
+            "-o", "AddressFamily=inet",
+            "-o", "Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr",
+            "-o", "MACs=hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com",
+            "-o", "Compression=yes",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", f"ConnectTimeout={int(cfg.get('ssh_timeout_seconds') or 15)}"]
+    # ControlMaster only works on Unix (requires Unix domain sockets)
+    if os.name != "nt":
+        base += [
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={os.path.expanduser('~')}/.ssh/cm-%r@%h:%p",
+            "-o", "ControlPersist=60",
+        ]
+    return base
 
 
 def _sh_quote(text: str) -> str:
@@ -459,6 +510,7 @@ def _openssh_check(cfg: Dict[str, Any]) -> Dict[str, Any]:
         trial = dict(cfg)
         trial["host"] = host
         try:
+            # Use optimized SSH base for health check too (fast connection reuse via ControlMaster)
             proc = subprocess.run(
                 _ssh_base(trial) + ["echo", "jarvis-backup-ok"],
                 capture_output=True, text=True,
@@ -504,7 +556,7 @@ def _openssh_upload(cfg: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
         remote_dir, remote_final, remote_tmp = _remote_paths(cfg, job["rel"], job["id"])
     except ValueError as exc:
         return {"status": "error", "message": str(exc)}
-    timeout = int(cfg.get("transfer_timeout_seconds") or 600)
+    timeout = int(cfg.get("transfer_timeout_seconds") or 120)
     last_host = ""
     last_err = ""
     for host in candidate_hosts(cfg):
@@ -513,22 +565,18 @@ def _openssh_upload(cfg: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
         trial["host"] = host
         try:
             # Ensure remote directory exists before scp (scp cannot create dirs)
-            mkdir_before = ["ssh"] + _ssh_base(trial)[1:] + ["mkdir", "-p", remote_dir]
-            # Actually we need ssh command with proper args; build simpler
-            mkdir_cmd = ["ssh", "-i", trial["key_path"], "-o", "BatchMode=yes",
-                         "-o", f"ConnectTimeout={int(trial.get('ssh_timeout_seconds') or 15)}",
-                         f"{trial['user']}@{host}", "mkdir", "-p", remote_dir]
+            mkdir_cmd = _ssh_base(trial) + ["mkdir", "-p", remote_dir]
             mkdir = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=timeout)
             if mkdir.returncode != 0:
                 last_err = (mkdir.stderr or mkdir.stdout or f"mkdir exit {mkdir.returncode}").strip()[:200]
                 continue
-            scp_cmd = ["scp", "-i", trial["key_path"], "-o", "BatchMode=yes",
-                       "-o", f"ConnectTimeout={int(trial.get('ssh_timeout_seconds') or 15)}",
-                       source, f"{trial['user']}@{host}:{remote_tmp}"]
+            # Use optimized SCP base command
+            scp_cmd = _scp_base(trial) + [source, f"{trial['user']}@{host}:{remote_tmp}"]
             scp = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
             if scp.returncode != 0:
                 last_err = (scp.stderr or scp.stdout or f"scp exit {scp.returncode}").strip()[:200]
                 continue
+            # Atomic commit + checksum verification on remote
             commit = ("mkdir -p {d} && if [ -e {f} ]; then mv -f {f} {f}.bak-$(date +%Y%m%d%H%M%S); fi"
                       " && mv -f {t} {f} && sha256sum {f}").format(
                           d=_sh_quote(remote_dir), f=_sh_quote(remote_final), t=_sh_quote(remote_tmp))
@@ -543,9 +591,6 @@ def _openssh_upload(cfg: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             if remote_sha.lower() != local_sha.lower():
                 last_err = "checksum mismatch"
-                # Do not retry blindly on the same job state: report mismatch
-                # so the worker backs off; the good previous version (if any)
-                # was preserved as .bak before the move.
                 return {"status": "mismatch", "message": "checksum mismatch",
                         "local_sha": local_sha, "remote_sha": remote_sha, "host": host}
             return {"status": "success", "local_sha": local_sha,
@@ -775,17 +820,64 @@ def shutdown_worker(timeout: float = 10.0) -> Dict[str, Any]:
 
 
 # ── status / actions (for API + UI) ─────────────────────────────────────────
+def categorize_file(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    if ext in ("pdf", "docx", "doc", "txt", "md", "pptx", "xlsx", "xls", "csv", "rtf", "odt"):
+        return "document"
+    if ext in ("py", "js", "jsx", "ts", "tsx", "html", "css", "json", "sh", "cpp", "c", "h", "java", "sql", "yaml", "yml"):
+        return "code"
+    if ext in ("png", "jpg", "jpeg", "gif", "svg", "webp", "mp4", "webm", "mp3", "wav", "m4a", "ogg"):
+        return "media"
+    if ext in ("zip", "tar", "gz", "7z", "rar", "bz2"):
+        return "archive"
+    if ext in ("db", "sqlite", "parquet", "bin"):
+        return "data"
+    return "other"
+
+
 def get_status(refresh_server: bool = False) -> Dict[str, Any]:
     cfg = load_config()
     with _LOCK:
         state = _read_queue()
         jobs = list(state["jobs"].values())
     counts = {name: 0 for name in ("pending", "uploading", "retrying", "completed", "failed")}
+    total_bytes = 0
+    verified_bytes = 0
+    pending_bytes = 0
+    failed_bytes = 0
+    active_transfer = None
+
     for job in jobs:
         status = job.get("status")
+        sz = int(job.get("size") or 0)
+        total_bytes += sz
         if status in counts:
             counts[status] += 1
+        if status == "completed":
+            verified_bytes += sz
+        elif status in ACTIVE_STATUSES:
+            pending_bytes += sz
+            if status == "uploading" and active_transfer is None:
+                active_transfer = {
+                    "id": job.get("id"),
+                    "rel": job.get("rel"),
+                    "size": sz,
+                    "updated_at": job.get("updated_at"),
+                }
+        elif status == "failed":
+            failed_bytes += sz
+
     server = check_server(cfg, force=refresh_server)
+
+    disk_total = 0
+    disk_free = 0
+    try:
+        du = shutil.disk_usage(BASE_DIR)
+        disk_total = du.total
+        disk_free = du.free
+    except Exception:
+        pass
+
     return {
         "enabled": bool(cfg.get("enabled")),
         "paused": bool(state.get("paused")),
@@ -796,19 +888,62 @@ def get_status(refresh_server: bool = False) -> Dict[str, Any]:
         "server": server,
         "counts": counts,
         "total_jobs": len(jobs),
+        "total_bytes": total_bytes,
+        "verified_bytes": verified_bytes,
+        "pending_bytes": pending_bytes,
+        "failed_bytes": failed_bytes,
+        "active_transfer": active_transfer,
+        "local_system": {
+            "platform": "Windows 11",
+            "hostname": os.environ.get("COMPUTERNAME", "JARVIS-LAPTOP"),
+            "disk_total": disk_total,
+            "disk_free": disk_free,
+            "disk_used": max(0, disk_total - disk_free),
+        },
         "last_success": state.get("last_success"),
         "last_scan": state.get("last_scan"),
         "note": state.get("note", ""),
     }
 
 
-def list_jobs(status: str = "", limit: int = 100) -> Dict[str, Any]:
+def list_jobs(status: str = "", limit: int = 100, search: str = "", category: str = "") -> Dict[str, Any]:
     with _LOCK:
-        jobs = sorted(_read_queue()["jobs"].values(),
-                      key=lambda j: j.get("updated_at") or 0, reverse=True)
+        raw_jobs = list(_read_queue()["jobs"].values())
+    
+    jobs = []
+    for j in raw_jobs:
+        job_copy = dict(j)
+        cat = categorize_file(job_copy.get("rel") or job_copy.get("source") or "")
+        job_copy["category"] = cat
+        jobs.append(job_copy)
+
+    jobs.sort(key=lambda j: j.get("updated_at") or 0, reverse=True)
+
     if status:
         jobs = [j for j in jobs if j.get("status") == status]
+    if category:
+        jobs = [j for j in jobs if j.get("category") == category]
+    if search:
+        s = search.lower()
+        jobs = [j for j in jobs if s in (j.get("rel") or "").lower() or s in (j.get("source") or "").lower()]
+
     return {"jobs": jobs[:max(1, min(int(limit or 100), 500))], "total": len(jobs)}
+
+
+def test_connection() -> Dict[str, Any]:
+    """Test remote server connection immediately and return probe metrics."""
+    cfg = load_config()
+    t0 = time.time()
+    server = check_server(cfg, force=True)
+    latency_ms = round((time.time() - t0) * 1000, 1)
+    return {
+        "status": "success" if server.get("reachable") else "unreachable",
+        "reachable": bool(server.get("reachable")),
+        "latency_ms": latency_ms,
+        "host": server.get("host") or cfg.get("host"),
+        "user": cfg.get("user"),
+        "message": server.get("message", ""),
+    }
 
 
 def set_paused(paused: bool) -> Dict[str, Any]:
@@ -887,11 +1022,10 @@ def restore_file(job_id: str, dest_dir: str = "") -> Dict[str, Any]:
         trial = dict(cfg)
         trial["host"] = host
         try:
-            scp_cmd = ["scp", "-i", trial["key_path"], "-o", "BatchMode=yes",
-                       "-o", f"ConnectTimeout={int(trial.get('ssh_timeout_seconds') or 15)}",
-                       f"{trial['user']}@{host}:{_sh_quote(remote_final)}", candidate]
+            # Use optimized SCP base command for restore too
+            scp_cmd = _scp_base(trial) + [f"{trial['user']}@{host}:{_sh_quote(remote_final)}", candidate]
             proc = subprocess.run(scp_cmd, capture_output=True, text=True,
-                                  timeout=int(cfg.get("transfer_timeout_seconds") or 600))
+                                  timeout=int(cfg.get("transfer_timeout_seconds") or 120))
             if proc.returncode == 0 and os.path.isfile(candidate):
                 if job.get("sha256") and sha256_of(candidate) != job["sha256"]:
                     try:

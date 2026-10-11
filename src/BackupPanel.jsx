@@ -6,7 +6,7 @@ import React, { useState, useEffect, useCallback } from 'react'
  * watcher section. Only "completed" jobs passed SHA-256 verification;
  * a reachable server alone never marks files backed up.
  */
-export default function BackupPanel({ visible }) {
+export default function BackupPanel({ visible, onOpenBackupCore }) {
   const [backup, setBackup] = useState(null)
   const [jobs, setJobs] = useState([])
   const [busy, setBusy] = useState(false)
@@ -56,7 +56,19 @@ export default function BackupPanel({ visible }) {
 
   return (
     <div className="field">
-      <label>Ubuntu Backups (local-first automatic backup)</label>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <label>Ubuntu Backups (local-first automatic backup)</label>
+        {onOpenBackupCore && (
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ color: 'var(--cyan)', borderColor: 'var(--cyan)', fontSize: '11px', padding: '3px 8px' }}
+            onClick={onOpenBackupCore}
+          >
+            Launch 3D Core ↗
+          </button>
+        )}
+      </div>
       <div className="oauth-row">
         <div className="oauth-status">
           <span className={`oauth-dot ${server.reachable ? 'linked' : ''}`} />
@@ -87,6 +99,11 @@ export default function BackupPanel({ visible }) {
           ? <button className="btn-secondary" onClick={() => post('/api/backup/pause', { paused: false })} disabled={busy}>Resume</button>
           : <button className="btn-secondary" onClick={() => post('/api/backup/pause', { paused: true })} disabled={busy}>Pause</button>}
         <button className="btn-secondary" onClick={() => post('/api/backup/retry', { all_failed: true })} disabled={busy}>Retry failed</button>
+        {onOpenBackupCore && (
+          <button className="btn-secondary" onClick={onOpenBackupCore}>
+            Open 3D Core
+          </button>
+        )}
       </div>
       {msg && <div className="save-note" style={{ color: 'var(--cyan)' }}>{msg}</div>}
       <p className="oauth-hint">Files save on this laptop first; verified SHA-256 copies go to the Ubuntu backup root. Local deletes never remove remote copies.</p>

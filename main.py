@@ -65,6 +65,7 @@ import google_oauth
 import phone_control
 import whatsapp_ops
 import code_core
+from backend.tools import ubuntu_backup
 from backend.startup_engine import get_startup_engine
 
 from backend.agent.core import AgentCore
@@ -81,6 +82,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _start_backup_worker():
+    """Start the Ubuntu backup background worker."""
+    try:
+        ubuntu_backup.ensure_worker()
+        print("[backup] Worker started")
+    except Exception as e:
+        print(f"[backup] Worker failed to start: {e}")
 
 
 @app.on_event("startup")
@@ -115,6 +126,17 @@ def _start_ws_scrcpy():
 # After boot, a background worker performs a zero-mutation source scan (AST +
 # py_compile - no Nemotron) and publishes the report so the UI can notify the
 # user about problem files (with line ranges) and ask whether to apply fixes.
+
+
+@app.on_event("shutdown")
+def _shutdown_backup_worker():
+    """Gracefully stop the Ubuntu backup background worker."""
+    try:
+        result = ubuntu_backup.shutdown_worker(timeout=10.0)
+        print(f"[backup] Worker stopped: {result.get('status')}, pending preserved: {result.get('pending_preserved')}")
+    except Exception as e:
+        print(f"[backup] Worker shutdown error: {e}")
+
 
 _STARTUP_AUDIT_LOCK = threading.Lock()
 _startup_audit_report = None
@@ -1107,10 +1129,10 @@ def backup_status(refresh: int = 0):
 
 
 @app.get("/api/backup/jobs")
-def backup_jobs(status: str = "", limit: int = 100):
+def backup_jobs(status: str = "", limit: int = 100, search: str = "", category: str = ""):
     try:
         from backend.tools import ubuntu_backup as _backup
-        res = _backup.list_jobs(status=status.strip(), limit=limit)
+        res = _backup.list_jobs(status=status.strip(), limit=limit, search=search.strip(), category=category.strip())
         return {"status": "success", **res}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)[:200])
@@ -1167,6 +1189,17 @@ def backup_post_config(req: dict):
     try:
         from backend.tools import ubuntu_backup as _backup
         return {"status": "success", "config": _backup.save_config(req or {})}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/test")
+@app.get("/api/backup/test")
+def backup_test_connection():
+    """Test remote server connection directly and return latency & reachability."""
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return _backup.test_connection()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)[:200])
 

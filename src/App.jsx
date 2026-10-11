@@ -10,7 +10,7 @@ import {
 
   Lock, Moon, Battery, Wifi, Cloud, Clock, Smartphone, Power, RefreshCw, MessageSquare, ImagePlus,
 
-  Mic, MicOff, Brain, Terminal
+  Mic, MicOff, Brain, Terminal, HardDrive
 
 } from 'lucide-react'
 
@@ -30,6 +30,7 @@ import PhoneMirrorPage from './PhoneMirrorPage';
 import GalleryPage from './GalleryPage';
 
 import CodeCorePage from './CodeCorePage';
+import BackupCorePage from './BackupCorePage';
 
 import StartupAuditBanner from './StartupAuditBanner';
 
@@ -1631,6 +1632,9 @@ export default function App() {
       {activeView === 'code' && (
         <CodeCorePage setActiveView={setActiveView} />
       )}
+      {activeView === 'backup' && (
+        <BackupCorePage setActiveView={setActiveView} />
+      )}
 
       {/* â”€â”€ Core view (hidden when phone/files active) â”€â”€ */}
       <div className={agentMode ? 'agent-mode' : ''} style={{ display: activeView === 'core' ? 'contents' : 'none' }}>
@@ -1665,6 +1669,7 @@ export default function App() {
         <button className={activeView === 'code' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('code')}><Terminal size={16} /><span>CODE CORE</span></button>
         <button className={activeView === 'files' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('files')}><Folder size={16} /><span>FILES</span></button>
         <button className={activeView === 'phone' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('phone')}><Smartphone size={16} /><span>PHONE</span></button>
+        <button className={activeView === 'backup' ? 'rail-btn active' : 'rail-btn'} onClick={() => setActiveView('backup')}><HardDrive size={16} /><span>BACKUP</span></button>
       </nav>
       <div className="hud-grid">
 
@@ -1954,7 +1959,13 @@ export default function App() {
             </div>
 
             {/* Ubuntu backups (local-first automatic backup to home server) */}
-            <BackupPanel visible={settingsOpen} />
+            <BackupPanel
+              visible={settingsOpen}
+              onOpenBackupCore={() => {
+                setSettingsOpen(false);
+                setActiveView('backup');
+              }}
+            />
 
             <div className="field">
               <label>Gemini API Key</label>
