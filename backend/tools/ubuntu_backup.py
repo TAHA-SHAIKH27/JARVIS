@@ -524,7 +524,7 @@ def _openssh_upload(cfg: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             scp_cmd = ["scp", "-i", trial["key_path"], "-o", "BatchMode=yes",
                        "-o", f"ConnectTimeout={int(trial.get('ssh_timeout_seconds') or 15)}",
-                       source, f"{trial['user']}@{host}:{_sh_quote(remote_tmp)}"]
+                       source, f"{trial['user']}@{host}:{remote_tmp}"]
             scp = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
             if scp.returncode != 0:
                 last_err = (scp.stderr or scp.stdout or f"scp exit {scp.returncode}").strip()[:200]
