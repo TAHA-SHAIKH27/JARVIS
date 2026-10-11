@@ -35,6 +35,7 @@ Thumbs.db
 # Misc
 .cache/
 .parcel-cache/
+.pytest_cache/
 
 
 whisper.cpp/
@@ -72,6 +73,10 @@ backend/data/conversation_context.json
 backend/data/persistent_memory.json
 backend/data/last_audit.json
 backend/agent/model_registry_store.json
+
+# Ubuntu backup runtime data (local queue survives restarts, never commit)
+backend/data/ubuntu_backup_queue.json
+backend/data/ubuntu_backup_config.json
 
 # Personal notes/todos panels (local runtime data, survives restarts)
 notes.json

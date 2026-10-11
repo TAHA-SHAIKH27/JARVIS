@@ -1067,6 +1067,126 @@ def _ensure_scheduler_worker() -> None:
 
 _ensure_scheduler_worker()
 
+
+def _ensure_backup_worker() -> None:
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        _backup.ensure_worker()
+    except Exception as exc:
+        print(f"[backup] worker failed to start: {exc}")
+
+
+_ensure_backup_worker()
+
+
+# ΓöÇΓöÇ Ubuntu backup (local-first automatic backups) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# Every file is saved on this laptop FIRST; the Ubuntu server only receives
+# verified copies. Endpoints never claim a file is backed up from a mere
+# connectivity probe ΓÇö only "completed" jobs passed SHA-256 verification.
+class BackupPauseRequest(BaseModel):
+    paused: bool = False
+
+
+class BackupRetryRequest(BaseModel):
+    job_id: str = ""
+    all_failed: bool = False
+
+
+class BackupRestoreRequest(BaseModel):
+    job_id: str = ""
+    dest_dir: str = ""
+
+
+@app.get("/api/backup/status")
+def backup_status(refresh: int = 0):
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return {"status": "success", "backup": _backup.get_status(refresh_server=bool(refresh))}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.get("/api/backup/jobs")
+def backup_jobs(status: str = "", limit: int = 100):
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        res = _backup.list_jobs(status=status.strip(), limit=limit)
+        return {"status": "success", **res}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/scan")
+def backup_scan():
+    """Trigger a reconciliation scan now (discovers files missed offline)."""
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return _backup.scan_and_enqueue()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/retry")
+def backup_retry(req: BackupRetryRequest):
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        if req.all_failed:
+            return _backup.retry_all_failed()
+        if not req.job_id.strip():
+            raise HTTPException(status_code=400, detail="job_id or all_failed required.")
+        res = _backup.retry_job(req.job_id.strip())
+        if res.get("status") != "success":
+            raise HTTPException(status_code=404, detail=res.get("message", "Retry failed."))
+        return res
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/pause")
+def backup_pause(req: BackupPauseRequest):
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return _backup.set_paused(req.paused)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.get("/api/backup/config")
+def backup_get_config():
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return {"status": "success", "config": _backup.sanitized_config()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/config")
+def backup_post_config(req: dict):
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        return {"status": "success", "config": _backup.save_config(req or {})}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
+
+@app.post("/api/backup/restore")
+def backup_restore(req: BackupRestoreRequest):
+    """Restore a verified backup from Ubuntu without overwriting local files."""
+    if not req.job_id.strip():
+        raise HTTPException(status_code=400, detail="job_id required.")
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        res = _backup.restore_file(req.job_id.strip(), (req.dest_dir or "").strip())
+        if res.get("status") != "success":
+            raise HTTPException(status_code=400, detail=res.get("message", "Restore failed."))
+        return res
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:200])
+
 @app.get("/api/status")
 async def read_status():
     return {"status": "online", "system": "J.A.R.V.I.S.", "message": "All systems operational, sir."}

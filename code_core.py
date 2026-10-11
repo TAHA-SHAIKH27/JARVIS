@@ -1238,6 +1238,11 @@ def write_fixed_artifact(filepath: str, fixed_content: str) -> tuple[str, str]:
     out_path = os.path.join(DOWNLOADS_DIR, out_filename)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(fixed_content)
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        _backup.notify_file_saved(out_path)
+    except Exception:
+        pass
     log_codecore_event(
         "AUDIT_FIX_ARTIFACT",
         f"Saved fixed artifact for {filepath} as {out_filename}",

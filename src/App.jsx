@@ -33,6 +33,8 @@ import CodeCorePage from './CodeCorePage';
 
 import StartupAuditBanner from './StartupAuditBanner';
 
+import BackupPanel from './BackupPanel';
+
 import ReminderBar from './components/ReminderBar';
 import NotificationCenter from './components/NotificationCenter';
 import { detectLang, pickBrowserVoice, voiceGender } from './langDetect';
@@ -1950,6 +1952,9 @@ export default function App() {
               {gmailMsg && <div className="save-note" style={{ color: 'var(--cyan)' }}>{gmailMsg}</div>}
               <p className="oauth-hint">Read + send. Jarvis checks on restart + every 30 min and speaks + toasts VIP/urgent mail. VIP senders list: backend/data/gmail_watch.json</p>
             </div>
+
+            {/* Ubuntu backups (local-first automatic backup to home server) */}
+            <BackupPanel visible={settingsOpen} />
 
             <div className="field">
               <label>Gemini API Key</label>

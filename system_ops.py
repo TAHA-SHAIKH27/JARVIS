@@ -13,6 +13,18 @@ WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "work_files")
 if not os.path.exists(WORK_DIR):
     os.makedirs(WORK_DIR)
 
+def _notify_backup_saved(path: str) -> None:
+    """Best-effort: queue an already-saved local file for Ubuntu backup.
+
+    Local-first: the file is fully written to the laptop before this runs.
+    Any backup problem is swallowed here so JARVIS work is never blocked
+    and the local file is never at risk. Never raises."""
+    try:
+        from backend.tools import ubuntu_backup as _backup
+        _backup.notify_file_saved(path)
+    except Exception:
+        pass
+
 def get_system_stats():
     """Retrieve current system resource utilization."""
     try:
@@ -146,6 +158,7 @@ def write_file(filename: str, content: str) -> dict:
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
+        _notify_backup_saved(path)
         return {"status": "success", "message": f"Successfully wrote file: {filename}", "path": path}
     except Exception as e:
         return {"status": "error", "message": f"Failed to write file: {str(e)}"}
@@ -397,6 +410,7 @@ def mirror_into_gallery(src_path: str) -> str:
             dest = f"{base}_{i}{ext}"
         import shutil
         shutil.copy2(norm_src, dest)
+        _notify_backup_saved(dest)
         return dest
     except Exception:
         return ""
@@ -1609,6 +1623,7 @@ def archive_document_artifact(file_path: str) -> str:
 
         # If already inside WORK_DIR, no need to copy
         if norm_file.startswith(norm_work):
+            _notify_backup_saved(norm_file)
             return norm_file
 
         ext = os.path.splitext(norm_file)[1].lower()
@@ -1620,6 +1635,7 @@ def archive_document_artifact(file_path: str) -> str:
         os.makedirs(target_dir, exist_ok=True)
         dest_path = os.path.join(target_dir, os.path.basename(norm_file))
         shutil.copy2(norm_file, dest_path)
+        _notify_backup_saved(dest_path)
         return dest_path
     except Exception as e:
         print(f"[archive_document_artifact] Error archiving {file_path}: {e}")
